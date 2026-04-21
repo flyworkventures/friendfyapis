@@ -2,6 +2,43 @@ const routes = require('express').Router();
 const middleware = require('../middleware/checkAuth')
 const { getQuery , query} = require('../db')
 
+function toPhotoUrlArray(rawValue) {
+    if (Array.isArray(rawValue)) {
+        return rawValue.filter((v) => typeof v === 'string' && v.trim() !== '');
+    }
+    if (typeof rawValue !== 'string') {
+        return [];
+    }
+    const trimmed = rawValue.trim();
+    if (!trimmed) {
+        return [];
+    }
+    if (trimmed.startsWith('[')) {
+        try {
+            const parsed = JSON.parse(trimmed);
+            if (Array.isArray(parsed)) {
+                return parsed.filter((v) => typeof v === 'string' && v.trim() !== '');
+            }
+        } catch (_) {
+            // JSON parse edilemezse tek URL gibi davran
+        }
+    }
+    return [trimmed];
+}
+
+function attachPhotoUrls(agent) {
+    const photoURLs = toPhotoUrlArray(agent.photoURL);
+    return {
+        ...agent,
+        photoURLs
+    };
+}
+
+function serializePhotoUrlsFromBody(body) {
+    const incomingList = body.photoURLs ?? body.photos ?? body.photoURL;
+    const normalized = toPhotoUrlArray(incomingList);
+    return JSON.stringify(normalized);
+}
 
 
 
@@ -23,7 +60,7 @@ routes.post('/get-user-agents',middleware,async (req,res)=>{
             return res.status(200).json([]);
         }
         
-        return res.status(200).json(userAgents);
+        return res.status(200).json(userAgents.map(attachPhotoUrls));
         
     } catch (error) {
         console.log("Error getting user agents:", error);
@@ -47,7 +84,7 @@ if (agents.length === 0) {
         "success": false
     })
 }else{
-return res.json(agents)
+return res.json(agents.map(attachPhotoUrls))
 }
 
 })
@@ -65,7 +102,7 @@ try {
    } else {
         res.status(200).json({
         "success": true,
-        "agent": agents[0]
+        "agent": attachPhotoUrls(agents[0])
     })
    }
 } catch (error) {
@@ -89,6 +126,7 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             interests,
             interestsType,
             photoURL,
+            photoURLs,
             characterTags,
             speakingStyle,
             voiceId,
@@ -119,7 +157,7 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             gender,
             interests || '[]',
             interestsType || '[]',
-            photoURL || '',
+            serializePhotoUrlsFromBody({ photoURL, photoURLs }),
             characterTags || '',
             speakingStyle || '',
             voiceId || '',
@@ -180,7 +218,7 @@ routes.post('/get-recent-bots', middleware, async (req, res) => {
             "msg": "Son 15 günde eklenen botlar başarıyla getirildi",
             "success": true,
             "count": recentBots.length,
-            "data": recentBots
+            "data": recentBots.map(attachPhotoUrls)
         });
         
     } catch (error) {

@@ -165,7 +165,7 @@ router.post('/send-message',middleware,async (req,res)=>{
    const id = guidGenerator();
   var result = await query("INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`) VALUES (?, ?, ?, ?);",[conversationId,"user",message,null]);
   if (sender === 'user') {
-await axios.post("http://89.252.179.227:5678/webhook/start-chat",{
+await axios.post("https://n8n.srv1548849.hstgr.cloud/webhook/start-chat",{
     sender: "user",
     message: message,
     conversation: conversationId
@@ -264,7 +264,7 @@ router.post('/send-audio-message', upload.single('file'), async (req, res) => {
 
     // 🔁 6. Webhook’a sonucu gönder
     await axios.post(
-      'http://89.252.179.227:5678/webhook/voice-message',
+      'https://n8n.srv1548849.hstgr.cloud/webhook/voice-message',
       {
         voiceText: text,
         conversationId: conversation,

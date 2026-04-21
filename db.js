@@ -2,11 +2,11 @@ const mysql = require('mysql2/promise');
 
 // 🧠 "conntection" yazım hatası düzeltildi -> "connection"
 const connection = mysql.createPool({
-    host: "89.252.187.162",
+    host: "5.39.8.160",
     port: 3306,
-    user: "semengin_ffuser",
-    password: "mz*Y_8N!^HTm",
-    database: "semengin_fakefriend"
+    user: "flywork1_friendifyUser",
+    password: "vBSBW.bMKkY}$TEo",
+    database: "flywork1_friendify"
 });
 
 async function getQuery(sql,values){
