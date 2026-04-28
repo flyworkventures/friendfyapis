@@ -76,7 +76,7 @@ routes.post('/get-user-agents',middleware,async (req,res)=>{
 
 routes.post('/get-system-agents',middleware,async (req,res)=>{
 console.log("middleware working");
-const agents = await getQuery("SELECT * FROM `bots` WHERE system = ?",[1]);
+const agents = await getQuery("SELECT * FROM `bots` WHERE system = ? AND system != 2",[1]);
 console.log(agents)
 if (agents.length === 0) {
     res.status(404).json({
@@ -93,7 +93,7 @@ return res.json(agents.map(attachPhotoUrls))
 routes.post('/get-agent-data',middleware,async( req ,res )=>{
 try {
        const { id }  = req.body;
-   const agents = await getQuery("SELECT * FROM `bots` WHERE id = ?",[id]); 
+   const agents = await getQuery("SELECT * FROM `bots` WHERE id = ? AND system != 2",[id]); 
    if (agents.length === 0) {
     res.status(404).json({
         "msg": "Agent not found",
@@ -202,7 +202,7 @@ routes.post('/get-recent-bots', middleware, async (req, res) => {
         // Son 15 gün içerisinde eklenen botları çek
         // Not: Eğer created_at kolonu yoksa, created, date_created vb. kolon ismini kullanın
         const recentBots = await getQuery(
-            "SELECT * FROM `bots` WHERE created_at >= ? ORDER BY created_at DESC", 
+            "SELECT * FROM `bots` WHERE created_at >= ? AND system != 2 ORDER BY created_at DESC", 
             [dateString]
         );
         
@@ -227,6 +227,61 @@ routes.post('/get-recent-bots', middleware, async (req, res) => {
             "msg": "Server error",
             "success": false,
             "error": error.message
+        });
+    }
+});
+
+routes.post('/delete-agent', middleware, async (req, res) => {
+    try {
+        const { agentId, ownerId } = req.body;
+
+        if (!agentId) {
+            return res.status(400).json({
+                msg: 'agentId is required',
+                success: false
+            });
+        }
+
+        if (!ownerId) {
+            return res.status(400).json({
+                msg: 'ownerId is required',
+                success: false
+            });
+        }
+
+        const existing = await getQuery(
+            'SELECT id FROM `bots` WHERE id = ? AND creatorId = ? AND system = 0 LIMIT 1',
+            [agentId, ownerId]
+        );
+
+        if (!existing || existing.length === 0) {
+            return res.status(404).json({
+                msg: 'Agent not found',
+                success: false
+            });
+        }
+
+        const deleted = await query(
+            'DELETE FROM `bots` WHERE id = ? AND creatorId = ? AND system = 0 LIMIT 1',
+            [agentId, ownerId]
+        );
+
+        if (!deleted) {
+            return res.status(500).json({
+                msg: 'Failed to delete agent',
+                success: false
+            });
+        }
+
+        return res.status(200).json({
+            msg: 'Agent deleted successfully',
+            success: true
+        });
+    } catch (error) {
+        console.log('Error deleting agent:', error);
+        return res.status(500).json({
+            msg: 'Server error',
+            success: false
         });
     }
 });

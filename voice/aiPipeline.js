@@ -21,8 +21,32 @@ function normalizeMessageText(raw) {
   return trimmed;
 }
 
-async function fetchConversationContext(conversationId) {
-  if (!conversationId) return { history: [], botPersona: null };
+async function fetchUserProfileByUserId(userId) {
+  if (userId == null || userId === '') return null;
+  const raw = String(userId).trim();
+  if (!raw) return null;
+
+  let rows = [];
+  if (raw.includes('@')) {
+    rows = await getQuery(
+      'SELECT id, username, email FROM `users` WHERE email = ? LIMIT 1',
+      [raw]
+    );
+  } else {
+    rows = await getQuery(
+      'SELECT id, username, email FROM `users` WHERE id = ? LIMIT 1',
+      [raw]
+    );
+  }
+
+  return rows?.[0] || null;
+}
+
+async function fetchConversationContext(conversationId, userId) {
+  if (!conversationId) {
+    const fallbackUser = await fetchUserProfileByUserId(userId);
+    return { history: [], botPersona: null, userProfile: fallbackUser };
+  }
 
   const rows = await getQuery(
     'SELECT sender, message FROM `messages` WHERE conversationId = ? ORDER BY id DESC LIMIT 10',
@@ -41,11 +65,23 @@ async function fetchConversationContext(conversationId) {
     .filter((m) => m.content);
 
   const botRows = await getQuery(
-    'SELECT b.name, b.character, b.speakingStyle FROM `coversations` c JOIN `bots` b ON c.botId = b.id WHERE c.id = ? LIMIT 1',
+    'SELECT b.name, b.character, b.speakingStyle, u.username AS userName, u.email AS userEmail FROM `coversations` c JOIN `bots` b ON c.botId = b.id LEFT JOIN `users` u ON c.userId = u.id WHERE c.id = ? LIMIT 1',
     [conversationId]
   );
-  const botPersona = botRows[0] || null;
-  return { history, botPersona };
+  const botPersona = botRows?.[0] || null;
+  const userProfileFromConversation = botPersona
+    ? {
+        username: botPersona.userName || null,
+        email: botPersona.userEmail || null
+      }
+    : null;
+  const fallbackUser = userProfileFromConversation?.username
+    ? null
+    : await fetchUserProfileByUserId(userId);
+  const userProfile = userProfileFromConversation?.username
+    ? userProfileFromConversation
+    : fallbackUser;
+  return { history, botPersona, userProfile };
 }
 
 async function callOpenAIChat({ transcript, conversationId, userId, sessionId }) {
@@ -54,13 +90,16 @@ async function callOpenAIChat({ transcript, conversationId, userId, sessionId })
     throw new VoiceStreamError('OPENAI_API_KEY_MISSING', 'OPENAI_API_KEY tanımlı değil', { recoverable: false });
   }
   const model = process.env.OPENAI_CHAT_MODEL || 'gpt-4o';
-  const { history, botPersona } = await fetchConversationContext(conversationId);
+  const { history, botPersona, userProfile } = await fetchConversationContext(conversationId, userId);
   const temperatureRaw = Number(process.env.OPENAI_CHAT_TEMPERATURE);
   const temperature = Number.isFinite(temperatureRaw) ? temperatureRaw : 0.2;
+  const resolvedUserName = String(
+    userProfile?.username || userProfile?.email || 'kullanici'
+  ).trim();
 
   const systemContent = botPersona
-    ? `Sen ${botPersona.name || 'Friendify botu'} isimli bir yapay zeka arkadaşsın. Karakterin: ${botPersona.character || ''}. Konuşma tarzın: ${botPersona.speakingStyle || ''}. Cevaplarını Türkçe, doğal, kısa-orta uzunlukta ver. Kullanıcının söylemediği bilgi ve detayları uydurma. Deşifre belirsizse kısa bir netleştirme sorusu sor.`
-    : 'Sen Friendify içinde çalışan bir yapay zeka arkadaşsın. Cevaplarını Türkçe, doğal ve kısa-orta uzunlukta ver. Kullanıcının söylemediği bilgi ve detayları uydurma. Deşifre belirsizse kısa bir netleştirme sorusu sor.';
+    ? `Sen ${botPersona.name || 'Friendify botu'} isimli bir yapay zeka arkadaşsın. Konustugun kullanicinin adi: ${resolvedUserName}. Karakterin: ${botPersona.character || ''}. Konuşma tarzın: ${botPersona.speakingStyle || ''}. Cevaplarını Türkçe, doğal, kısa-orta uzunlukta ver. Kullanıcının söylemediği bilgi ve detayları uydurma. Deşifre belirsizse kısa bir netleştirme sorusu sor.`
+    : `Sen Friendify içinde çalışan bir yapay zeka arkadaşsın. Konustugun kullanicinin adi: ${resolvedUserName}. Cevaplarını Türkçe, doğal ve kısa-orta uzunlukta ver. Kullanıcının söylemediği bilgi ve detayları uydurma. Deşifre belirsizse kısa bir netleştirme sorusu sor.`;
 
   const messages = [
     { role: 'system', content: systemContent },

@@ -163,14 +163,22 @@ if (credential == "email") {
 
 
 router.post('/verify-token', async (req, res) => {
-    const { token } = req.body;
+    const token = req.body?.token || req.header('x-auth-token') || null;
+    const refreshToken = req.body?.refreshToken || req.header('x-refresh-token') || req.header('refresh-token') || null;
+    if (!token) {
+        return res.status(400).json({
+            msg: "Token is required",
+            code: "TOKEN_MISSING"
+        });
+    }
     try {
         let user = await JWT.verify(token, "key");
         let userModel = await getUserData(user["email"]);
         if (user) {
             return res.status(200).json({
                 msg: "Valid Token",
-                user: userModel
+                user: userModel,
+                token
             });
         }
         return res.status(400).json({
@@ -178,6 +186,46 @@ router.post('/verify-token', async (req, res) => {
         });
     } catch (err) {
         if (err.name === 'TokenExpiredError') {
+            // Otomatik yenileme: verify-token isteğinde refresh token varsa yeni access token üret.
+            if (refreshToken) {
+                try {
+                    const refreshPayload = JWT.verify(refreshToken, "key");
+                    if (refreshPayload.type !== 'refresh') {
+                        return res.status(401).json({
+                            msg: "Invalid refresh token.",
+                            code: "INVALID_REFRESH_TOKEN"
+                        });
+                    }
+
+                    const userModel = await getUserData(refreshPayload.email);
+                    if (!userModel) {
+                        return res.status(401).json({
+                            msg: "User not found",
+                            code: "USER_NOT_FOUND"
+                        });
+                    }
+
+                    const renewedToken = JWT.sign({ email: refreshPayload.email }, "key", { expiresIn: ACCESS_TOKEN_EXPIRY });
+                    return res.status(200).json({
+                        msg: "Token renewed",
+                        code: "TOKEN_RENEWED",
+                        token: renewedToken,
+                        user: userModel
+                    });
+                } catch (refreshErr) {
+                    if (refreshErr.name === 'TokenExpiredError') {
+                        return res.status(401).json({
+                            msg: "Refresh token expired. Please login again.",
+                            code: "REFRESH_TOKEN_EXPIRED"
+                        });
+                    }
+                    return res.status(401).json({
+                        msg: "Invalid refresh token.",
+                        code: "INVALID_REFRESH_TOKEN"
+                    });
+                }
+            }
+
             return res.status(401).json({
                 msg: "Token expired. Please login again.",
                 code: "TOKEN_EXPIRED",

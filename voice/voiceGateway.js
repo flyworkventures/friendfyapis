@@ -6,7 +6,8 @@ const { runAiPipeline } = require('./aiPipeline');
 const { VoiceStreamError, isRecoverableError } = require('./errors');
 const { retryWithBackoff } = require('./retry');
 const { createSessionState, markChunkProcessed, isChunkProcessed, clearVadTimer } = require('./sessionState');
-const { streamElevenLabsTts } = require('./elevenlabsTts');
+const { streamElevenLabsTts, buildVisemesFromElevenLabsAlignment } = require('./elevenlabsTts');
+const { generateVisemesFromAudioBuffer, isVisemeEnabled } = require('./viseme');
 const { WebRtcTransport, hasWebRtcRuntime } = require('./webrtcTransport');
 const { getQuery, query } = require('../db');
 
@@ -51,6 +52,48 @@ function getDefaultAudioConfig() {
 
 function isWebRtcEnabled() {
   return String(process.env.WEBRTC_ENABLED || 'false').toLowerCase() === 'true';
+}
+
+function isVoiceChatPersistenceEnabled() {
+  // Voice/Video call konusmalari varsayilan olarak chat mesajlarina yazilmaz.
+  return String(process.env.VOICE_PERSIST_TO_CHAT || 'false').toLowerCase() === 'true';
+}
+
+function getVisemeProvider() {
+  return String(process.env.VISEME_PROVIDER || 'rhubarb').toLowerCase();
+}
+
+function isVisemeBlockingEnabled() {
+  return String(process.env.VISEME_BLOCKING || 'true').toLowerCase() === 'true';
+}
+
+function stabilizeVisemeTimeline(input) {
+  const minGapSecRaw = Number(process.env.VISEME_MIN_GAP_SEC);
+  const minGapSec = Number.isFinite(minGapSecRaw) ? minGapSecRaw : 0.04;
+  const list = Array.isArray(input) ? input : [];
+  const sorted = [...list]
+    .map((v) => ({
+      id: Number(v?.id || 0),
+      time: Number(v?.time || 0)
+    }))
+    .filter((v) => Number.isFinite(v.time) && v.time >= 0 && Number.isFinite(v.id))
+    .sort((a, b) => a.time - b.time);
+
+  const stabilized = [];
+  for (const item of sorted) {
+    const current = { id: item.id, time: Number(item.time.toFixed(3)) };
+    const prev = stabilized[stabilized.length - 1];
+    if (!prev) {
+      stabilized.push(current);
+      continue;
+    }
+    if (current.time - prev.time < minGapSec) continue;
+    if (current.id === prev.id) continue;
+    stabilized.push(current);
+  }
+  if (stabilized.length === 0) return [{ id: 0, time: 0 }];
+  if (stabilized[0].time > 0) stabilized.unshift({ id: 0, time: 0 });
+  return stabilized;
 }
 
 function parseMessage(raw) {
@@ -111,6 +154,59 @@ function normalizeChunkPayload(payload) {
   };
 }
 
+async function emitVisemeTimeline(ws, utteranceId, audioBytes, options = {}) {
+  if (!utteranceId) return;
+
+  if (!isVisemeEnabled()) {
+    sendEvent(ws, 'viseme.unavailable', {
+      utteranceId,
+      reason: 'provider_no_viseme'
+    });
+    return;
+  }
+
+  try {
+    let visemes = [];
+    if (getVisemeProvider() === 'elevenlabs') {
+      visemes = await buildVisemesFromElevenLabsAlignment({
+        text: options.text || '',
+        voiceId: options.voiceId || null,
+        modelId: options.modelId || null
+      });
+    } else {
+      const result = await generateVisemesFromAudioBuffer(audioBytes, 'mp3');
+      visemes = Array.isArray(result?.visemes) ? result.visemes : [];
+    }
+    visemes = stabilizeVisemeTimeline(visemes);
+    const first = visemes[0] || null;
+    const last = visemes.length > 0 ? visemes[visemes.length - 1] : null;
+    console.log(
+      `[VOICE] viseme.generated | utteranceId=${utteranceId} count=${visemes.length} first=${first ? `${first.time}:${first.id}` : 'null'} last=${last ? `${last.time}:${last.id}` : 'null'}`
+    );
+    console.log(
+      `[VOICE] viseme.sent | ${JSON.stringify({
+        utteranceId,
+        visemes,
+        isLast: true
+      })}`
+    );
+
+    sendEvent(ws, 'viseme.timeline', {
+      utteranceId,
+      visemes,
+      isLast: true
+    });
+  } catch (error) {
+    console.log(
+      `[VOICE] viseme.error | utteranceId=${utteranceId} message=${error?.message || 'unknown'}`
+    );
+    sendEvent(ws, 'viseme.unavailable', {
+      utteranceId,
+      reason: 'provider_no_viseme'
+    });
+  }
+}
+
 async function handleTtsRequest(ws, context, payload) {
   const text = payload?.text || '';
   const utteranceId = payload?.utteranceId || context.session.activeUtteranceId || randomUUID();
@@ -140,6 +236,7 @@ async function handleTtsRequest(ws, context, payload) {
   let chunkSeq = 0;
   let sentChunkCount = 0;
   let sentBytes = 0;
+  const ttsAudioChunks = [];
   await new Promise((resolve, reject) => {
     context.session.ttsStream = stream;
     stream.on('data', (buf) => {
@@ -147,6 +244,7 @@ async function handleTtsRequest(ws, context, payload) {
         try { stream.destroy(); } catch (_) {}
         return;
       }
+      ttsAudioChunks.push(Buffer.from(buf));
       sentBytes += Buffer.byteLength(buf);
       sendEvent(ws, 'tts.chunk', {
         utteranceId,
@@ -157,7 +255,7 @@ async function handleTtsRequest(ws, context, payload) {
       chunkSeq += 1;
       sentChunkCount += 1;
     });
-    stream.on('end', () => {
+    stream.on('end', async () => {
       // Mobile tarafının finalize tetiklemesi için explicit last marker
       sendEvent(ws, 'tts.chunk', {
         utteranceId,
@@ -165,7 +263,29 @@ async function handleTtsRequest(ws, context, payload) {
         audioBase64: '',
         isLast: true
       });
-      sendEvent(ws, 'tts.end', { utteranceId });
+
+      if (isVisemeBlockingEnabled()) {
+        await emitVisemeTimeline(ws, utteranceId, Buffer.concat(ttsAudioChunks), {
+          text,
+          voiceId,
+          modelId: payload?.modelId || null
+        });
+        sendEvent(ws, 'tts.end', { utteranceId });
+      } else {
+        sendEvent(ws, 'tts.end', { utteranceId });
+        // viseme uretimini tts.end'i bekletmeden arka planda calistir.
+        Promise.resolve()
+          .then(() => emitVisemeTimeline(ws, utteranceId, Buffer.concat(ttsAudioChunks), {
+            text,
+            voiceId,
+            modelId: payload?.modelId || null
+          }))
+          .catch((err) => {
+            console.log(
+              `[VOICE] viseme.background.error | utteranceId=${utteranceId} message=${err?.message || 'unknown'}`
+            );
+          });
+      }
       context.session.aiSpeaking = false;
       context.session.currentAiUtteranceId = null;
       context.session.ttsStream = null;
@@ -301,8 +421,9 @@ function setupProviderListeners(ws, context) {
   context.provider.on('final', async (data) => {
     const transcript = String(data?.transcript || '').trim();
     const noSpeech = data?.noSpeech === true || !transcript;
+    const shouldPersistToChat = isVoiceChatPersistenceEnabled();
 
-    if (context.session.conversationId) {
+    if (shouldPersistToChat && context.session.conversationId) {
       await query(
         'INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`) VALUES (?, ?, ?, NOW())',
         [context.session.conversationId, 'user', transcript]
@@ -341,7 +462,7 @@ function setupProviderListeners(ws, context) {
         source: aiResult.source
       });
 
-      if (context.session.conversationId && aiResult.text) {
+      if (shouldPersistToChat && context.session.conversationId && aiResult.text) {
         await query(
           'INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`) VALUES (?, ?, ?, NOW())',
           [context.session.conversationId, 'assistant', aiResult.text]
@@ -647,7 +768,7 @@ function createVoiceGateway(httpServer) {
   httpServer.on('upgrade', (request, socket, head) => {
     const parsedUrl = new URL(request.url, 'http://localhost');
     if (parsedUrl.pathname !== '/ws/voice') {
-      socket.destroy();
+      // Not our route; let other upgrade handlers (e.g. /ws/video) process it.
       return;
     }
 
