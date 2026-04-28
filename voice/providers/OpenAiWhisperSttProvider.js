@@ -116,16 +116,29 @@ class OpenAiWhisperSttProvider extends SttProvider {
 
     const minAudioBytes = Number(process.env.STT_MIN_AUDIO_BYTES || 3200);
     const totalAudioBytes = state.chunks.reduce((sum, chunk) => sum + (chunk?.length || 0), 0);
+    const hintsText = state.hints.join(' ').trim();
+
+    console.log(
+      `[STT] finalize.start | utteranceId=${utteranceId} chunks=${state.chunks.length} totalAudioBytes=${totalAudioBytes} minAudioBytes=${minAudioBytes} hintsLen=${hintsText.length}`
+    );
 
     let transcript = '';
     if (state.chunks.length > 0 && totalAudioBytes >= minAudioBytes) {
       transcript = await this._transcribeWithOpenAI(state);
+      // OpenAI boş metin döndürürse textHint'e düş.
+      if (!String(transcript || '').trim() && hintsText) {
+        transcript = hintsText;
+      }
     } else {
-      transcript = state.hints.join(' ').trim();
+      transcript = hintsText;
     }
     const cleaned = String(transcript || '').trim();
     const minChars = Number(process.env.STT_MIN_TRANSCRIPT_CHARS || 2);
     const noSpeech = !cleaned || cleaned.length < minChars;
+
+    console.log(
+      `[STT] finalize.result | utteranceId=${utteranceId} transcriptLen=${cleaned.length} noSpeech=${noSpeech} language=${state.language || this.config.language || 'tr-TR'}`
+    );
 
     this.emit('final', {
       utteranceId,

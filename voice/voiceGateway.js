@@ -422,6 +422,9 @@ function setupProviderListeners(ws, context) {
     const transcript = String(data?.transcript || '').trim();
     const noSpeech = data?.noSpeech === true || !transcript;
     const shouldPersistToChat = isVoiceChatPersistenceEnabled();
+    console.log(
+      `[VOICE] stt.final.received | sessionId=${context.session.sessionId} utteranceId=${data?.utteranceId || 'n/a'} transcriptLen=${transcript.length} noSpeech=${noSpeech}`
+    );
 
     if (shouldPersistToChat && context.session.conversationId) {
       await query(
@@ -438,6 +441,9 @@ function setupProviderListeners(ws, context) {
 
     if (noSpeech) {
       context.session.turnState = 'listening';
+      console.log(
+        `[VOICE] stt.no_speech | sessionId=${context.session.sessionId} utteranceId=${data?.utteranceId || 'n/a'}`
+      );
       sendEvent(ws, 'turn.state', {
         sessionId: context.session.sessionId,
         state: context.session.turnState,
