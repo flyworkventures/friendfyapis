@@ -59,7 +59,7 @@ class OpenAiWhisperSttProvider extends SttProvider {
       return new VoiceStreamError('STT_TIMEOUT', 'STT timeout', { recoverable: true });
     }
     return new VoiceStreamError('STT_TRANSCRIBE_FAILED', 'STT transcribe failed', {
-      recoverable: false,
+      recoverable: true,
       details: error?.response?.data || error?.message || null
     });
   }

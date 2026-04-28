@@ -8,8 +8,11 @@ const BUNNY_PULL_ZONE_BASE = 'https://fakefriend.b-cdn.net';
 const BUNNY_STORAGE_BASE = `https://storage.bunnycdn.com/${BUNNY_STORAGE_ZONE}`;
 const BUNNY_ACCESS_KEY = '68664abb-b19e-47e7-acd67dba78a5-e90a-4386';
 
-const CHARACTER_ROOT = path.join(__dirname, '..', 'database', 'friendify_yeni_karakterler');
-const UPLOAD_PREFIX = 'friendify-yeni-karakterler';
+const args = process.argv.slice(2);
+const CHARACTER_ROOT = args[0]
+  ? path.resolve(args[0])
+  : path.join(__dirname, '..', 'database', 'friendify_yeni_karakterler');
+const UPLOAD_PREFIX = args[1] || 'friendify-yeni-karakterler';
 
 const INTERESTS_POOL = [
   'video oyunları (pc/steam)',
@@ -62,6 +65,19 @@ const NAME_POOL = [
   'Alin'
 ];
 
+const MALE_NAME_POOL = [
+  'Kuzey',
+  'Eren',
+  'Doruk',
+  'Baris',
+  'Arin',
+  'Mert',
+  'Tuna',
+  'Deniz',
+  'Kaan',
+  'Arel'
+];
+
 function pickFromPool(pool, count, seed) {
   const chosen = [];
   for (let i = 0; i < count; i += 1) {
@@ -85,7 +101,10 @@ async function uploadToBunny(localFilePath, remotePath, contentType) {
 }
 
 function inferGenderFromFileName(fileName) {
-  return fileName.toLowerCase().includes('female') ? 'Kadın' : 'Erkek';
+  const lower = fileName.toLowerCase();
+  if (lower.includes('female')) return 'Kadın';
+  if (lower.includes('male')) return 'Erkek';
+  return 'Erkek';
 }
 
 async function getVoiceIdByGender(gender) {
@@ -100,9 +119,14 @@ async function getVoiceIdByGender(gender) {
 async function run() {
   const dirEntries = await fs.readdir(CHARACTER_ROOT, { withFileTypes: true });
   const charDirs = dirEntries
-    .filter((entry) => entry.isDirectory() && entry.name.startsWith('char'))
+    .filter((entry) => entry.isDirectory())
+    .filter((entry) => entry.name.startsWith('char') || entry.name.startsWith('male_') || entry.name.startsWith('female_'))
     .map((entry) => entry.name)
-    .sort((a, b) => Number(a.replace('char', '')) - Number(b.replace('char', '')));
+    .sort((a, b) => {
+      const ai = Number((a.match(/\d+/) || ['0'])[0]);
+      const bi = Number((b.match(/\d+/) || ['0'])[0]);
+      return ai - bi;
+    });
 
   const results = [];
 
@@ -139,7 +163,8 @@ async function run() {
     const interestsType = pickFromPool(INTEREST_TYPES_POOL, 3, i + 2);
     const tags = pickFromPool(TAG_POOL, 4, i + 1);
     const age = 21 + (i % 7);
-    const name = NAME_POOL[i % NAME_POOL.length];
+    const namePool = gender === 'Erkek' ? MALE_NAME_POOL : NAME_POOL;
+    const name = namePool[i % namePool.length];
 
     const insertSql = `
       INSERT INTO bots

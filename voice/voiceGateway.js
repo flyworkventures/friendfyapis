@@ -506,19 +506,52 @@ async function finalizeUtterance(ws, context, utteranceId, reason = 'manual') {
   context.session.finalizingUtterances?.add(utteranceId);
   context.session.activeUtteranceId = utteranceId;
   try {
-    await retryWithBackoff(() => context.provider.finalizeUtterance(utteranceId), {
-      retries: 2,
-      baseDelayMs: 120
-    });
-    context.session.finalizedUtterances?.add(utteranceId);
-    console.log(
-      `[VOICE] utterance.finalized | userId=${context.session.userId} sessionId=${context.session.sessionId} utteranceId=${utteranceId} reason=${reason}`
-    );
-    sendEvent(ws, 'ack', {
-      ackType: 'utterance.finalized',
-      utteranceId,
-      reason
-    });
+    try {
+      await retryWithBackoff(() => context.provider.finalizeUtterance(utteranceId), {
+        retries: 2,
+        baseDelayMs: 120
+      });
+      context.session.finalizedUtterances?.add(utteranceId);
+      console.log(
+        `[VOICE] utterance.finalized | userId=${context.session.userId} sessionId=${context.session.sessionId} utteranceId=${utteranceId} reason=${reason}`
+      );
+      sendEvent(ws, 'ack', {
+        ackType: 'utterance.finalized',
+        utteranceId,
+        reason
+      });
+      return;
+    } catch (error) {
+      const isSttStageError = String(error?.code || '').startsWith('STT_');
+      if (!isSttStageError) {
+        throw error;
+      }
+
+      // STT hatasinda session'i kapatma; sadece ilgili utterance'i fail et.
+      context.session.finalizedUtterances?.add(utteranceId);
+      context.session.turnState = 'listening';
+      console.log(
+        `[VOICE] utterance.finalize.failed | userId=${context.session.userId} sessionId=${context.session.sessionId} utteranceId=${utteranceId} reason=${reason} code=${error.code || 'STT_ERROR'}`
+      );
+      sendEvent(ws, 'error', {
+        code: error.code || 'STT_TRANSCRIBE_FAILED',
+        message: error.message || 'STT transcribe failed',
+        retryable: true,
+        stage: 'stt'
+      });
+      sendEvent(ws, 'ack', {
+        ackType: 'utterance.failed',
+        utteranceId,
+        reason,
+        errorCode: error.code || 'STT_TRANSCRIBE_FAILED'
+      });
+      sendEvent(ws, 'turn.state', {
+        sessionId: context.session.sessionId,
+        state: context.session.turnState,
+        reason: 'stt_failed'
+      });
+      return;
+    }
   } finally {
     context.session.finalizingUtterances?.delete(utteranceId);
   }
@@ -803,7 +836,11 @@ function createVoiceGateway(httpServer) {
       userId: request.user?.id || request.user?.userId || request.user?.email || null,
       session: null,
       provider: null,
-      webrtcTransport: null
+      webrtcTransport: null,
+      closeMeta: {
+        serverInitiated: false,
+        reason: null
+      }
     };
     clientContexts.set(ws, context);
     console.log(`[VOICE] websocket connected | userId=${context.userId || 'unknown'}`);
@@ -836,17 +873,26 @@ function createVoiceGateway(httpServer) {
           requestId: parsed?.requestId || null
         });
         if (!retryable && ws.readyState === WebSocket.OPEN) {
+          context.closeMeta.serverInitiated = true;
+          context.closeMeta.reason = error.code || 'non_recoverable_error';
           ws.close(1011, 'non_recoverable_error');
         }
       }
     });
 
-    ws.on('close', async () => {
+    ws.on('close', async (code, reasonBuffer) => {
+      const reason = Buffer.isBuffer(reasonBuffer)
+        ? reasonBuffer.toString('utf8')
+        : String(reasonBuffer || '');
       await cleanupContext(context);
       if (context.session?.sessionId) {
-        console.log(`[VOICE] websocket closed | userId=${context.userId || 'unknown'} sessionId=${context.session.sessionId}`);
+        console.log(
+          `[VOICE] websocket closed | userId=${context.userId || 'unknown'} sessionId=${context.session.sessionId} code=${code} reason=${reason || 'n/a'} serverInitiated=${context.closeMeta.serverInitiated} serverReason=${context.closeMeta.reason || 'n/a'}`
+        );
       } else {
-        console.log(`[VOICE] websocket closed | userId=${context.userId || 'unknown'}`);
+        console.log(
+          `[VOICE] websocket closed | userId=${context.userId || 'unknown'} code=${code} reason=${reason || 'n/a'} serverInitiated=${context.closeMeta.serverInitiated} serverReason=${context.closeMeta.reason || 'n/a'}`
+        );
       }
       clientContexts.delete(ws);
     });
