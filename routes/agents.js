@@ -40,6 +40,25 @@ function serializePhotoUrlsFromBody(body) {
     return JSON.stringify(normalized);
 }
 
+function normalizeArrayLike(value) {
+    if (value == null) return [];
+    if (Array.isArray(value)) return value;
+    if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (!trimmed) return [];
+        if (trimmed.startsWith('[')) {
+            try {
+                const parsed = JSON.parse(trimmed);
+                return Array.isArray(parsed) ? parsed : [];
+            } catch (_) {
+                return [trimmed];
+            }
+        }
+        return [trimmed];
+    }
+    return [];
+}
+
 
 
 routes.post('/get-user-agents',middleware,async (req,res)=>{
@@ -75,19 +94,46 @@ routes.post('/get-user-agents',middleware,async (req,res)=>{
 
 
 routes.post('/get-system-agents',middleware,async (req,res)=>{
-console.log("middleware working");
-const agents = await getQuery("SELECT * FROM `bots` WHERE system = ? AND system != 2",[1]);
-console.log(agents)
-if (agents.length === 0) {
-    res.status(404).json({
-        "msg": "Agents is empty",
-        "success": false
-    })
-}else{
-return res.json(agents.map(attachPhotoUrls))
+try {
+    const agents = await getQuery("SELECT * FROM `bots` WHERE system IN (1, 2)",[]);
+    return res.status(200).json(agents.map(attachPhotoUrls));
+} catch (error) {
+    console.log("get-system-agents error:", error);
+    return res.status(500).json({
+        success: false,
+        code: "SERVER_ERROR",
+        msg: "Server error"
+    });
 }
 
 })
+
+routes.post('/get-random-template-agent', middleware, async (req, res) => {
+    try {
+        const rows = await getQuery(
+            "SELECT * FROM `bots` WHERE system = 2 ORDER BY RAND() LIMIT 1",
+            []
+        );
+        if (!rows || rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                code: "TEMPLATE_NOT_FOUND",
+                msg: "No template agent found for system=2"
+            });
+        }
+        return res.status(200).json({
+            success: true,
+            agent: attachPhotoUrls(rows[0])
+        });
+    } catch (error) {
+        console.log("get-random-template-agent error:", error);
+        return res.status(500).json({
+            success: false,
+            code: "SERVER_ERROR",
+            msg: "Server error"
+        });
+    }
+});
 
 
 routes.post('/get-agent-data',middleware,async( req ,res )=>{
@@ -135,12 +181,17 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
         } = req.body;
 
         // Validate required fields
-        if (!name || !character || !age || !gender || !ownerId) {
+        if (!name || !voiceId || !ownerId) {
             return res.status(400).json({
-                "msg": "Missing required fields",
-                "success": false
+                success: false,
+                code: "INVALID_PAYLOAD",
+                msg: "name, voiceId and ownerId are required"
             });
         }
+
+        const normalizedInterests = JSON.stringify(normalizeArrayLike(interests));
+        const normalizedInterestsType = JSON.stringify(normalizeArrayLike(interestsType));
+        const normalizedCharacterTags = JSON.stringify(normalizeArrayLike(characterTags));
 
         // Insert the new custom agent into the database
         const insertQuery = `
@@ -152,15 +203,15 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
 
         const values = [
             name,
-            character,
-            age,
-            gender,
-            interests || '[]',
-            interestsType || '[]',
+            character || '',
+            Number(age) || 18,
+            gender || 'female',
+            normalizedInterests,
+            normalizedInterestsType,
             serializePhotoUrlsFromBody({ photoURL, photoURLs }),
-            characterTags || '',
+            normalizedCharacterTags,
             speakingStyle || '',
-            voiceId || '',
+            voiceId,
             country || '',
             ownerId,
             0  // system = 0 means it's a user-created agent
@@ -169,23 +220,24 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
         const result = await query(insertQuery, values);
 
         if (result) {
-            res.status(200).json({
-                "msg": "Custom agent created successfully",
-                "success": true
+            return res.status(200).json({
+                success: true,
+                msg: "Custom agent created successfully"
             });
         } else {
-            res.status(500).json({
-                "msg": "Failed to create custom agent",
-                "success": false
+            return res.status(500).json({
+                success: false,
+                code: "CREATE_AGENT_FAILED",
+                msg: "Failed to create custom agent"
             });
         }
 
     } catch (error) {
         console.log('Error creating custom agent:', error);
-        res.status(500).json({
-            "msg": "Server error",
-            "success": false,
-            "error": error.message
+        return res.status(500).json({
+            success: false,
+            code: "SERVER_ERROR",
+            msg: "Server error"
         });
     }
 });
