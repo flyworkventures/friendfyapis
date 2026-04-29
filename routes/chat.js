@@ -161,27 +161,56 @@ router.post('/search-conversations', middleware, async (req, res) => {
 
 
 router.post('/send-message',middleware,async (req,res)=>{
-   const {   sender, message, conversationId, botId} = req.body;
-   const id = guidGenerator();
-  var result = await query("INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`) VALUES (?, ?, ?, ?);",[conversationId,"user",message,null]);
-  if (sender === 'user') {
-await axios.post("https://n8n.srv1548849.hstgr.cloud/webhook/start-chat",{
-    sender: "user",
-    message: message,
-    conversation: conversationId
-    })
-  }
+   try {
+    const { sender, message, conversationId } = req.body;
+    const id = guidGenerator();
 
-  if (result === true) {
-    res.status(200).json({
-        "msg": "sent",
-        "id": id
+    if (!conversationId || message == null) {
+      return res.status(400).json({
+        msg: "conversationId and message are required",
+        success: false
+      });
+    }
+
+    const result = await query(
+      "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`) VALUES (?, ?, ?, ?);",
+      [conversationId, "user", message, null]
+    );
+
+    if (result !== true) {
+      return res.status(500).json({
+        msg: "SQL",
+        success: false
+      });
+    }
+
+    if (sender === 'user') {
+      try {
+        await axios.post("https://n8n.srv1548849.hstgr.cloud/webhook/start-chat", {
+          sender: "user",
+          message: message,
+          conversation: conversationId
+        }, {
+          timeout: 15000
+        });
+      } catch (webhookError) {
+        // Webhook hata verse bile mesaj kaydi basariliysa 200 donelim.
+        console.error("send-message webhook error:", webhookError?.message || webhookError);
+      }
+    }
+
+    return res.status(200).json({
+      msg: "sent",
+      id: id,
+      success: true
     });
-  } else {
-        res.status(500).json({
-        "msg": "SQL"
+   } catch (error) {
+    console.error("send-message error:", error);
+    return res.status(500).json({
+      msg: "Server error",
+      success: false
     });
-  }
+   }
 })
 
 

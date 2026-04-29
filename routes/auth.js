@@ -10,6 +10,13 @@ const { getQuery , query} = require('../db')
 const ACCESS_TOKEN_EXPIRY = '365d';   // 1 yıl
 const REFRESH_TOKEN_EXPIRY = '365d';  // 1 yıl
 
+function guidGenerator() {
+  const S4 = function() {
+    return (((1 + Math.random()) * 0x10000) | 0).toString(16).substring(1);
+  };
+  return (S4() + S4() + "-" + S4() + "-" + S4() + "-" + S4() + "-" + S4() + S4() + S4());
+}
+
 
 router.post('/signup', [
     check("email").isEmail(),
@@ -20,12 +27,12 @@ router.post('/signup', [
     const { password, email, credential } = req.body;
 
     if (credential == null) {
-      return  res.status(400).json({
-            "msg": "Credential is not null"
+      return res.status(400).json({
+            "msg": "Credential is required"
         })
-    }else{
+    }
 
-    if (credential == "email") {
+    if (credential === "email") {
 
         const errors = validationResult(req)
 
@@ -40,13 +47,13 @@ router.post('/signup', [
 
         if (sqlQuery.length > 0) {
             console.log("User var");
-            res.status(400).json({
+            return res.status(400).json({
                 "error": "User exists"
             })
 
         } else {
             let hashedPassword = await bcrypt.hash(password, 10);
-            query("INSERT INTO `users` (`email`, `password`, `token`, `accountCreatedDate`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`) VALUES ( ?,?,?,?,?,?,?,?,?,?,?);",[ email,hashedPassword, null, null, null, null, null, credential, null, null, null])
+            await query("INSERT INTO `users` (`email`, `password`, `token`, `accountCreatedDate`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`) VALUES ( ?,?,?,?,?,?,?,?,?,?,?);",[ email,hashedPassword, null, null, null, null, null, credential, null, null, null])
             
 
             const token = await JWT.sign({ email }, "key", { expiresIn: ACCESS_TOKEN_EXPIRY });
@@ -56,11 +63,10 @@ router.post('/signup', [
                 refreshToken
             })
         }
-    }else if(credential == "google"){
+    } else if (credential === "google" || credential === "apple") {
        const { userModel } = req.body;
-       const user = userModel;
         try {
-            // Ensure userModel is a JSON object (parse if it's a string)
+            // userModel string gelebilir, parse ediyoruz.
             let parsedUser = userModel;
             if (typeof parsedUser === 'string') {
                 parsedUser = JSON.parse(parsedUser);
@@ -68,30 +74,35 @@ router.post('/signup', [
             console.log("Parsed User: ", parsedUser);
 
             const userEmail = parsedUser.email || email;
+            if (!userEmail) {
+                return res.status(400).json({ msg: "Email is required for social signup" });
+            }
+
+            const existingUser = await getQuery("SELECT * FROM `users` WHERE email = ?", [userEmail]);
+            const token = JWT.sign({ email: userEmail }, "key", { expiresIn: ACCESS_TOKEN_EXPIRY });
+            const refreshToken = JWT.sign({ email: userEmail, type: 'refresh' }, "key", { expiresIn: REFRESH_TOKEN_EXPIRY });
+
+            if (existingUser.length > 0) {
+                return res.json({ token, refreshToken });
+            }
+
             const birthdate = formatDateForMySQL(parsedUser.birthdate);
-            const hashedPassword = null; // Google users won't have a local password
-             const token = JWT.sign({ email: userEmail }, "key", { expiresIn: ACCESS_TOKEN_EXPIRY });
-             const refreshToken = JWT.sign({ email: userEmail, type: 'refresh' }, "key", { expiresIn: REFRESH_TOKEN_EXPIRY });
+            const hashedPassword = null; // Social users local password kullanmaz
 
-     
-
-            // Insert the Google user into the DB
             await query(
                 "INSERT INTO `users` (`username`, `email`, `password`, `token`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `country`, `gender` , `birthdate`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                 [parsedUser.username,userEmail, hashedPassword, token,  null, null, "1", credential, null, null, null,parsedUser.counrty || null,parsedUser.gender  , birthdate ]
             );
 
-            // Sign and return tokens
-                   return res.json({ token, refreshToken });
+            return res.json({ token, refreshToken });
            
         } catch (err) {
             console.error(err);
             return res.status(500).json({ msg: "Server error" });
         }
-          query("INSERT INTO `users` (`email`, `password`, `token`, `accountCreatedDate`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`) VALUES ( ?,?,?,?,?,?,?,?,?,?,?);",[ email,hashedPassword, null, null, null, null, null, credential, null, null, null])
     }
-    }
-
+    
+    return res.status(400).json({ msg: "Unsupported credential type" });
 
 
 })
@@ -160,6 +171,66 @@ if (credential == "email") {
 
 
 }),
+
+router.post('/guest-login', async (req, res) => {
+    try {
+        const guestId = guidGenerator().replace(/-/g, '').slice(0, 16);
+        const email = `guest_${guestId}@guest.local`;
+        const username = `Guest${guestId.slice(0, 6)}`;
+        const nowIso = new Date().toISOString();
+        const defaultBirthdateIso = new Date('1970-01-01T00:00:00.000Z').toISOString();
+
+        const token = JWT.sign({ email }, "key", { expiresIn: ACCESS_TOKEN_EXPIRY });
+        const refreshToken = JWT.sign({ email, type: 'refresh' }, "key", { expiresIn: REFRESH_TOKEN_EXPIRY });
+
+        await query(
+            "INSERT INTO `users` (`username`, `email`, `password`, `token`, `accountCreatedDate`, `birthdate`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `gender`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            [username, email, null, token, nowIso, defaultBirthdateIso, null, null, 1, "guest", refreshToken, null, null, 'male']
+        );
+
+        const createdUserRows = await getQuery("SELECT * FROM `users` WHERE email = ? LIMIT 1", [email]);
+        const createdUser = createdUserRows?.[0];
+
+        if (!createdUser) {
+            return res.status(500).json({
+                msg: "Guest user could not be created",
+                success: false
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            user: {
+                id: createdUser.id,
+                username: createdUser.username || username,
+                email: createdUser.email || email,
+                token,
+                refreshToken,
+                accountCreatedDate: createdUser.accountCreatedDate
+                    ? new Date(createdUser.accountCreatedDate).toISOString()
+                    : nowIso,
+                birthdate: createdUser.birthdate
+                    ? new Date(createdUser.birthdate).toISOString()
+                    : defaultBirthdateIso,
+                memberships: createdUser.memberships ?? null,
+                ownAgents: createdUser.ownAgents ? createdUser.ownAgents : [],
+                verificated: Number(createdUser.verificated ?? 1),
+                credential: createdUser.credential || 'guest',
+                lastLogins: createdUser.lastLogins ?? null,
+                counrty: createdUser.counrty ?? null,
+                gender: createdUser.gender || 'male',
+                hobbies: createdUser.hobbies ?? null,
+                photoURL: createdUser.photoURL ?? null
+            }
+        });
+    } catch (error) {
+        console.error("guest-login error:", error);
+        return res.status(500).json({
+            msg: "Server error",
+            success: false
+        });
+    }
+});
 
 
 router.post('/verify-token', async (req, res) => {

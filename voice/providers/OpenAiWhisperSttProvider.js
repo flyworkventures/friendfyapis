@@ -64,6 +64,31 @@ class OpenAiWhisperSttProvider extends SttProvider {
     });
   }
 
+  async _transcribeWithModel({ wav, apiKey, model, language, transcriptionPrompt, sttTemperature }) {
+    const form = new FormData();
+    form.append('file', wav, {
+      filename: 'audio.wav',
+      contentType: 'audio/wav'
+    });
+    form.append('model', model);
+    if (language) form.append('language', language);
+    form.append('prompt', transcriptionPrompt);
+    form.append('temperature', String(sttTemperature));
+
+    const response = await retryWithBackoff(async () => {
+      return axios.post('https://api.openai.com/v1/audio/transcriptions', form, {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          ...form.getHeaders()
+        },
+        timeout: 20000,
+        maxBodyLength: Infinity
+      });
+    }, { retries: 2, baseDelayMs: 250 });
+
+    return String(response.data?.text || '').trim();
+  }
+
   async _transcribeWithOpenAI(state) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
@@ -78,31 +103,33 @@ class OpenAiWhisperSttProvider extends SttProvider {
     const sttTemperatureRaw = Number(process.env.OPENAI_STT_TEMPERATURE);
     const sttTemperature = Number.isFinite(sttTemperatureRaw) ? sttTemperatureRaw : 0;
 
-    const form = new FormData();
-    form.append('file', wav, {
-      filename: 'audio.wav',
-      contentType: 'audio/wav'
-    });
-    form.append('model', model);
-    if (language) form.append('language', language);
-    form.append('prompt', transcriptionPrompt);
-    form.append('temperature', String(sttTemperature));
-
     try {
-      const response = await retryWithBackoff(async () => {
-        return axios.post('https://api.openai.com/v1/audio/transcriptions', form, {
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            ...form.getHeaders()
-          },
-          timeout: 20000,
-          maxBodyLength: Infinity
-        });
-      }, { retries: 2, baseDelayMs: 250 });
-
-      return String(response.data?.text || '').trim();
+      return await this._transcribeWithModel({
+        wav,
+        apiKey,
+        model,
+        language,
+        transcriptionPrompt,
+        sttTemperature
+      });
     } catch (error) {
-      throw this._mapAxiosError(error);
+      const mapped = this._mapAxiosError(error);
+      if (mapped.code === 'STT_TRANSCRIBE_FAILED' && model !== 'whisper-1') {
+        try {
+          console.log(`[STT] primary model failed, fallback to whisper-1 | primary=${model}`);
+          return await this._transcribeWithModel({
+            wav,
+            apiKey,
+            model: 'whisper-1',
+            language,
+            transcriptionPrompt,
+            sttTemperature
+          });
+        } catch (fallbackError) {
+          throw this._mapAxiosError(fallbackError);
+        }
+      }
+      throw mapped;
     }
   }
 

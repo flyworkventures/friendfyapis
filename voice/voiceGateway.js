@@ -513,10 +513,10 @@ async function finalizeUtterance(ws, context, utteranceId, reason = 'manual') {
   context.session.activeUtteranceId = utteranceId;
   try {
     try {
-      await retryWithBackoff(() => context.provider.finalizeUtterance(utteranceId), {
-        retries: 2,
-        baseDelayMs: 120
-      });
+      // Provider icinde zaten retry/backoff var. Burada tekrar retry yapmak
+      // ayni utterance'in ikinci kez finalize edilmesine ve bos transcript'e
+      // dusmesine neden olabiliyor.
+      await context.provider.finalizeUtterance(utteranceId);
       context.session.finalizedUtterances?.add(utteranceId);
       console.log(
         `[VOICE] utterance.finalized | userId=${context.session.userId} sessionId=${context.session.sessionId} utteranceId=${utteranceId} reason=${reason}`
@@ -537,7 +537,7 @@ async function finalizeUtterance(ws, context, utteranceId, reason = 'manual') {
       context.session.finalizedUtterances?.add(utteranceId);
       context.session.turnState = 'listening';
       console.log(
-        `[VOICE] utterance.finalize.failed | userId=${context.session.userId} sessionId=${context.session.sessionId} utteranceId=${utteranceId} reason=${reason} code=${error.code || 'STT_ERROR'}`
+        `[VOICE] utterance.finalize.failed | userId=${context.session.userId} sessionId=${context.session.sessionId} utteranceId=${utteranceId} reason=${reason} code=${error.code || 'STT_ERROR'} details=${JSON.stringify(error?.details || null)}`
       );
       sendEvent(ws, 'error', {
         code: error.code || 'STT_TRANSCRIBE_FAILED',
