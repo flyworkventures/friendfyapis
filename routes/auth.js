@@ -9,6 +9,8 @@ const { getQuery , query} = require('../db')
 // Token süreleri: access uzun (uygulama güncellemesine kadar sorunsuz kullanım)
 const ACCESS_TOKEN_EXPIRY = '365d';   // 1 yıl
 const REFRESH_TOKEN_EXPIRY = '365d';  // 1 yıl
+// checkAuth ile aynı sır: ortamda JWT_SECRET yoksa 'key' (eski davranış)
+const JWT_SECRET = process.env.JWT_SECRET || 'key';
 
 function guidGenerator() {
   const S4 = function() {
@@ -56,8 +58,8 @@ router.post('/signup', [
             await query("INSERT INTO `users` (`email`, `password`, `token`, `accountCreatedDate`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`) VALUES ( ?,?,?,?,?,?,?,?,?,?,?);",[ email,hashedPassword, null, null, null, null, null, credential, null, null, null])
             
 
-            const token = await JWT.sign({ email }, "key", { expiresIn: ACCESS_TOKEN_EXPIRY });
-            const refreshToken = await JWT.sign({ email, type: 'refresh' }, "key", { expiresIn: REFRESH_TOKEN_EXPIRY });
+            const token = await JWT.sign({ email }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
+            const refreshToken = await JWT.sign({ email, type: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY });
             return res.json({
                 token,
                 refreshToken
@@ -79,8 +81,8 @@ router.post('/signup', [
             }
 
             const existingUser = await getQuery("SELECT * FROM `users` WHERE email = ?", [userEmail]);
-            const token = JWT.sign({ email: userEmail }, "key", { expiresIn: ACCESS_TOKEN_EXPIRY });
-            const refreshToken = JWT.sign({ email: userEmail, type: 'refresh' }, "key", { expiresIn: REFRESH_TOKEN_EXPIRY });
+            const token = JWT.sign({ email: userEmail }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
+            const refreshToken = JWT.sign({ email: userEmail, type: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY });
 
             if (existingUser.length > 0) {
                 return res.json({ token, refreshToken });
@@ -130,47 +132,63 @@ function formatDateForMySQL(dateString) {
 
 
 router.post('/login', async (req, res) => {
- const { credential , password, email} = req.body;
- if (credential == null) {
-    return   res.status(400).json({
-            "msg": "Credential is not null",
-        })
- }else{
-if (credential == "email") {
-        let sqlQuery = await getQuery("SELECT * FROM `users` WHERE email = ?", [email]);
-        if (sqlQuery.length === 0) {
-                 res.status(404).json({
-             "msg": "Invalid "
-        })
-        }else{
+    const { credential, password, email } = req.body;
+    if (credential == null) {
+        return res.status(400).json({
+            msg: 'Credential is required'
+        });
+    }
 
-             console.log("User Query: ", sqlQuery)
-        let user = sqlQuery[0];
-        console.log("User: ", user)
-        let isMatch = await bcrypt.compare(password,user["password"]);
-        if (!isMatch) {
-            res.status(404).json({
-                "msg": "Invalid credentials"
-            })
-        } 
-        const token = await JWT.sign({ email }, "key", { expiresIn: ACCESS_TOKEN_EXPIRY });
-        const refreshToken = await JWT.sign({ email, type: 'refresh' }, "key", { expiresIn: REFRESH_TOKEN_EXPIRY });
-        return res.json({
-            token,
-            refreshToken
-        })   
+    try {
+        if (credential === 'email') {
+            if (!email) {
+                return res.status(400).json({ msg: 'Email is required' });
+            }
+            const sqlQuery = await getQuery('SELECT * FROM `users` WHERE email = ?', [email]);
+            if (sqlQuery.length === 0) {
+                return res.status(404).json({ msg: 'Invalid credentials' });
+            }
+            const user = sqlQuery[0];
+            if (!user.password) {
+                return res.status(404).json({ msg: 'Invalid credentials' });
+            }
+            const isMatch = await bcrypt.compare(password, user.password);
+            if (!isMatch) {
+                return res.status(404).json({ msg: 'Invalid credentials' });
+            }
+            const token = JWT.sign({ email }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
+            const refreshToken = JWT.sign({ email, type: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY });
+            return res.json({ token, refreshToken });
         }
-   
-     
-  
-}
- }
 
-   
+        if (credential === 'google' || credential === 'apple') {
+            const { userModel } = req.body;
+            let parsedUser = userModel;
+            if (typeof parsedUser === 'string') {
+                parsedUser = JSON.parse(parsedUser);
+            }
+            const userEmail = parsedUser?.email || email;
+            if (!userEmail) {
+                return res.status(400).json({ msg: 'Email is required for social login' });
+            }
+            const rows = await getQuery('SELECT * FROM `users` WHERE email = ?', [userEmail]);
+            if (rows.length === 0) {
+                return res.status(404).json({
+                    msg: 'User not found',
+                    code: 'USER_NOT_FOUND'
+                });
+            }
+            const token = JWT.sign({ email: userEmail }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
+            const refreshToken = JWT.sign({ email: userEmail, type: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY });
+            return res.json({ token, refreshToken });
+        }
 
-
-
-}),
+        return res.status(400).json({ msg: 'Unsupported credential type' });
+    } catch (err) {
+        console.error('login error:', err);
+        return res.status(500).json({ msg: 'Server error' });
+    }
+});
 
 router.post('/guest-login', async (req, res) => {
     try {
@@ -180,8 +198,8 @@ router.post('/guest-login', async (req, res) => {
         const nowIso = new Date().toISOString();
         const defaultBirthdateIso = new Date('1970-01-01T00:00:00.000Z').toISOString();
 
-        const token = JWT.sign({ email }, "key", { expiresIn: ACCESS_TOKEN_EXPIRY });
-        const refreshToken = JWT.sign({ email, type: 'refresh' }, "key", { expiresIn: REFRESH_TOKEN_EXPIRY });
+        const token = JWT.sign({ email }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
+        const refreshToken = JWT.sign({ email, type: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY });
 
         await query(
             "INSERT INTO `users` (`username`, `email`, `password`, `token`, `accountCreatedDate`, `birthdate`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `gender`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
@@ -243,7 +261,7 @@ router.post('/verify-token', async (req, res) => {
         });
     }
     try {
-        let user = await JWT.verify(token, "key");
+        let user = await JWT.verify(token, JWT_SECRET);
         let userModel = await getUserData(user["email"]);
         if (user) {
             return res.status(200).json({
@@ -260,7 +278,7 @@ router.post('/verify-token', async (req, res) => {
             // Otomatik yenileme: verify-token isteğinde refresh token varsa yeni access token üret.
             if (refreshToken) {
                 try {
-                    const refreshPayload = JWT.verify(refreshToken, "key");
+                    const refreshPayload = JWT.verify(refreshToken, JWT_SECRET);
                     if (refreshPayload.type !== 'refresh') {
                         return res.status(401).json({
                             msg: "Invalid refresh token.",
@@ -276,7 +294,7 @@ router.post('/verify-token', async (req, res) => {
                         });
                     }
 
-                    const renewedToken = JWT.sign({ email: refreshPayload.email }, "key", { expiresIn: ACCESS_TOKEN_EXPIRY });
+                    const renewedToken = JWT.sign({ email: refreshPayload.email }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
                     return res.status(200).json({
                         msg: "Token renewed",
                         code: "TOKEN_RENEWED",
@@ -326,7 +344,7 @@ router.post('/refresh-token', async (req, res) => {
                 code: "REFRESH_TOKEN_MISSING"
             });
         }
-        const payload = JWT.verify(refreshToken, "key");
+        const payload = JWT.verify(refreshToken, JWT_SECRET);
         if (payload.type !== 'refresh') {
             return res.status(401).json({
                 msg: "Invalid refresh token",
@@ -342,7 +360,7 @@ router.post('/refresh-token', async (req, res) => {
                 code: "USER_NOT_FOUND"
             });
         }
-        const token = JWT.sign({ email: payload.email }, "key", { expiresIn: ACCESS_TOKEN_EXPIRY });
+        const token = JWT.sign({ email: payload.email }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
         return res.status(200).json({
             msg: "Token renewed",
             success: true,
