@@ -162,7 +162,7 @@ router.post('/search-conversations', middleware, async (req, res) => {
 
 router.post('/send-message',middleware,async (req,res)=>{
    try {
-    const { sender, message, conversationId } = req.body;
+    const { sender, message, conversationId, messageType } = req.body;
     const id = guidGenerator();
 
     if (!conversationId || message == null) {
@@ -172,9 +172,11 @@ router.post('/send-message',middleware,async (req,res)=>{
       });
     }
 
+    const resolvedType = messageType || 'text';
+
     const result = await query(
-      "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`) VALUES (?, ?, ?, ?);",
-      [conversationId, "user", message, null]
+      "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
+      [conversationId, "user", message, resolvedType]
     );
 
     if (result !== true) {
@@ -184,17 +186,30 @@ router.post('/send-message',middleware,async (req,res)=>{
       });
     }
 
+    if (resolvedType === 'pdf') {
+      analyzePdfAndReply(conversationId, message).catch((err) => {
+        console.error('analyzePdfAndReply background error:', err?.message || err);
+      });
+
+      return res.status(200).json({
+        msg: "sent",
+        id,
+        success: true,
+        messageType: resolvedType
+      });
+    }
+
     if (sender === 'user') {
       try {
         await axios.post("https://n8n.srv1548849.hstgr.cloud/webhook/start-chat", {
           sender: "user",
           message: message,
-          conversation: conversationId
+          conversation: conversationId,
+          messageType: resolvedType
         }, {
           timeout: 15000
         });
       } catch (webhookError) {
-        // Webhook hata verse bile mesaj kaydi basariliysa 200 donelim.
         console.error("send-message webhook error:", webhookError?.message || webhookError);
       }
     }
@@ -202,7 +217,8 @@ router.post('/send-message',middleware,async (req,res)=>{
     return res.status(200).json({
       msg: "sent",
       id: id,
-      success: true
+      success: true,
+      messageType: resolvedType
     });
    } catch (error) {
     console.error("send-message error:", error);
@@ -212,6 +228,75 @@ router.post('/send-message',middleware,async (req,res)=>{
     });
    }
 })
+
+async function analyzePdfAndReply(conversationId, rawMessage) {
+  const lines = rawMessage.split('\n');
+  const pdfUrl = lines.find((l) => l.startsWith('http')) || '';
+  const fileName = (lines[0] || '').replace(/^\[PDF\]\s*/, '').trim();
+
+  if (!pdfUrl) {
+    console.error('[analyzePdf] URL bulunamadı, rawMessage:', rawMessage);
+    return;
+  }
+
+  const pdfResp = await axios.get(pdfUrl, { responseType: 'arraybuffer', timeout: 30000 });
+  const base64Pdf = Buffer.from(pdfResp.data).toString('base64');
+
+  const convRows = await getQuery('SELECT botId FROM `coversations` WHERE id = ? LIMIT 1', [conversationId]);
+  let systemPrompt = 'Sen yardımcı bir asistansın. Kullanıcı sana bir PDF dosyası gönderdi. İçeriğini analiz et ve Türkçe olarak özetle.';
+  if (convRows?.[0]?.botId) {
+    const botRows = await getQuery('SELECT name, `character`, speakingStyle FROM `bots` WHERE id = ? LIMIT 1', [convRows[0].botId]);
+    const bot = botRows?.[0];
+    if (bot) {
+      systemPrompt = `Sen ${bot.name} adlı bir karaktersin. ${bot.character || ''} ${bot.speakingStyle ? 'Konuşma tarzın: ' + bot.speakingStyle : ''} Kullanıcı sana bir PDF dosyası gönderdi. İçeriğini analiz et ve karakterine uygun şekilde yanıtla.`;
+    }
+  }
+
+  const openaiResp = await axios.post(
+    'https://api.openai.com/v1/chat/completions',
+    {
+      model: process.env.OPENAI_CHAT_MODEL || 'gpt-4o',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'file',
+              file: {
+                filename: fileName || 'document.pdf',
+                file_data: `data:application/pdf;base64,${base64Pdf}`
+              }
+            },
+            {
+              type: 'text',
+              text: `Bu PDF dosyasını analiz et: ${fileName}`
+            }
+          ]
+        }
+      ],
+      temperature: parseFloat(process.env.OPENAI_CHAT_TEMPERATURE) || 0.4
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 60000
+    }
+  );
+
+  const aiReply = openaiResp.data?.choices?.[0]?.message?.content || '';
+  if (!aiReply) {
+    console.error('[analyzePdf] OpenAI boş yanıt döndü');
+    return;
+  }
+
+  await query(
+    "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
+    [conversationId, 'bot', aiReply, 'text']
+  );
+}
 
 
 function getRandomName () {
