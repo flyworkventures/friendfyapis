@@ -7,7 +7,7 @@ const { VoiceStreamError, isRecoverableError } = require('./errors');
 const { retryWithBackoff } = require('./retry');
 const { createSessionState, markChunkProcessed, isChunkProcessed, clearVadTimer } = require('./sessionState');
 const { streamElevenLabsTts, buildVisemesFromElevenLabsAlignment } = require('./elevenlabsTts');
-const { generateVisemesFromAudioBuffer, isVisemeEnabled } = require('./viseme');
+const { generateVisemesFromAudioBuffer, isVisemeEnabled, finalizeVisemeTimelineForClient } = require('./viseme');
 const { WebRtcTransport, hasWebRtcRuntime } = require('./webrtcTransport');
 const { getQuery, query } = require('../db');
 
@@ -65,35 +65,6 @@ function getVisemeProvider() {
 
 function isVisemeBlockingEnabled() {
   return String(process.env.VISEME_BLOCKING || 'true').toLowerCase() === 'true';
-}
-
-function stabilizeVisemeTimeline(input) {
-  const minGapSecRaw = Number(process.env.VISEME_MIN_GAP_SEC);
-  const minGapSec = Number.isFinite(minGapSecRaw) ? minGapSecRaw : 0.04;
-  const list = Array.isArray(input) ? input : [];
-  const sorted = [...list]
-    .map((v) => ({
-      id: Number(v?.id || 0),
-      time: Number(v?.time || 0)
-    }))
-    .filter((v) => Number.isFinite(v.time) && v.time >= 0 && Number.isFinite(v.id))
-    .sort((a, b) => a.time - b.time);
-
-  const stabilized = [];
-  for (const item of sorted) {
-    const current = { id: item.id, time: Number(item.time.toFixed(3)) };
-    const prev = stabilized[stabilized.length - 1];
-    if (!prev) {
-      stabilized.push(current);
-      continue;
-    }
-    if (current.time - prev.time < minGapSec) continue;
-    if (current.id === prev.id) continue;
-    stabilized.push(current);
-  }
-  if (stabilized.length === 0) return [{ id: 0, time: 0 }];
-  if (stabilized[0].time > 0) stabilized.unshift({ id: 0, time: 0 });
-  return stabilized;
 }
 
 function parseMessage(raw) {
@@ -177,7 +148,7 @@ async function emitVisemeTimeline(ws, utteranceId, audioBytes, options = {}) {
       const result = await generateVisemesFromAudioBuffer(audioBytes, 'mp3');
       visemes = Array.isArray(result?.visemes) ? result.visemes : [];
     }
-    visemes = stabilizeVisemeTimeline(visemes);
+    visemes = finalizeVisemeTimelineForClient(visemes);
     const first = visemes[0] || null;
     const last = visemes.length > 0 ? visemes[visemes.length - 1] : null;
     console.log(

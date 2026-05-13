@@ -51,6 +51,48 @@ function isVisemeEnabled() {
   return String(process.env.VISEME_ENABLED || 'false').toLowerCase() === 'true';
 }
 
+/**
+ * Ses / dudak senkronu: uygulama tarafında animasyon kısaldığında API zaman damgalarını sıkıştırır.
+ * Varsayılan 1.35 ≈ %35 daha hızlı zaman çizelgesi (time /= speedup, minGap de aynı oranda küçülür).
+ */
+function getVisemePlaybackSpeedup() {
+  const raw = Number(process.env.VISEME_PLAYBACK_SPEEDUP);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return 1.35;
+}
+
+function finalizeVisemeTimelineForClient(input) {
+  const speedup = getVisemePlaybackSpeedup();
+  const minGapSecRaw = Number(process.env.VISEME_MIN_GAP_SEC);
+  const baseMinGap = Number.isFinite(minGapSecRaw) ? minGapSecRaw : 0.04;
+  const minGapSec = baseMinGap / speedup;
+
+  const list = Array.isArray(input) ? input : [];
+  const sorted = [...list]
+    .map((v) => ({
+      id: Number(v?.id || 0),
+      time: Number(((Number(v?.time || 0)) / speedup).toFixed(3))
+    }))
+    .filter((v) => Number.isFinite(v.time) && v.time >= 0 && Number.isFinite(v.id))
+    .sort((a, b) => a.time - b.time);
+
+  const stabilized = [];
+  for (const item of sorted) {
+    const current = { id: item.id, time: Number(item.time.toFixed(3)) };
+    const prev = stabilized[stabilized.length - 1];
+    if (!prev) {
+      stabilized.push(current);
+      continue;
+    }
+    if (current.time - prev.time < minGapSec) continue;
+    if (current.id === prev.id) continue;
+    stabilized.push(current);
+  }
+  if (stabilized.length === 0) return [{ id: 0, time: 0 }];
+  if (stabilized[0].time > 0) stabilized.unshift({ id: 0, time: 0 });
+  return stabilized;
+}
+
 function execFilePromise(file, args) {
   return new Promise((resolve, reject) => {
     execFile(file, args, (err) => (err ? reject(err) : resolve()));
@@ -128,8 +170,8 @@ function createVisemeRouter() {
     const { audioUrl } = req.body || {};
     try {
       const result = await generateVisemesFromAudioUrl(audioUrl);
-      // Response format korunuyor: { visemes: [...] }
-      return res.json({ visemes: result.visemes || [] });
+      const visemes = finalizeVisemeTimelineForClient(result.visemes || []);
+      return res.json({ visemes });
     } catch (err) {
       if (err?.statusCode === 400) {
         return res.status(400).json({ error: 'audioUrl is required' });
@@ -146,5 +188,7 @@ module.exports = {
   createVisemeRouter,
   generateVisemesFromAudioUrl,
   generateVisemesFromAudioBuffer,
-  isVisemeEnabled
+  isVisemeEnabled,
+  finalizeVisemeTimelineForClient,
+  getVisemePlaybackSpeedup
 };

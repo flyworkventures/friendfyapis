@@ -59,7 +59,55 @@ function normalizeArrayLike(value) {
     return [];
 }
 
+function authUserIdFromRequest(req) {
+    const u = req.user;
+    if (!u) return '';
+    return String(u.id ?? u.userId ?? '').trim();
+}
 
+/** Katalog satırı + override satırı (aynı bot id, kullanıcıya özel). */
+function applyCatalogOverride(agent, overrideRow) {
+    if (!overrideRow) return agent;
+    const base = { ...agent };
+    base.name = overrideRow.name ?? base.name;
+    base.character = overrideRow.character ?? base.character;
+    base.age =
+        overrideRow.age != null && !Number.isNaN(Number(overrideRow.age))
+            ? Number(overrideRow.age)
+            : base.age;
+    base.gender = overrideRow.gender ?? base.gender;
+    base.interests = overrideRow.interests ?? base.interests;
+    base.interestsType = overrideRow.interestsType ?? base.interestsType;
+    base.photoURL = overrideRow.photoURL ?? base.photoURL;
+    base.characterTags = overrideRow.characterTags ?? base.characterTags;
+    base.speakingStyle = overrideRow.speakingStyle ?? base.speakingStyle;
+    base.voiceId = overrideRow.voiceId ?? base.voiceId;
+    base.country = overrideRow.country ?? base.country;
+    return base;
+}
+
+async function loadCatalogOverridesMap(userId) {
+    if (!userId) return new Map();
+    try {
+        const rows = await getQuery(
+            'SELECT * FROM `bot_catalog_overrides` WHERE user_id = ?',
+            [userId]
+        );
+        const map = new Map();
+        for (const row of rows || []) {
+            map.set(Number(row.bot_id), row);
+        }
+        return map;
+    } catch (e) {
+        if (e && e.code === 'ER_NO_SUCH_TABLE') {
+            console.warn(
+                '[agents] bot_catalog_overrides tablosu yok; scripts/sql/bot_catalog_overrides.sql çalıştırın.'
+            );
+            return new Map();
+        }
+        throw e;
+    }
+}
 
 routes.post('/get-user-agents',middleware,async (req,res)=>{
     try {
@@ -93,20 +141,26 @@ routes.post('/get-user-agents',middleware,async (req,res)=>{
 
 
 
-routes.post('/get-system-agents',middleware,async (req,res)=>{
-try {
-    const agents = await getQuery("SELECT * FROM `bots` WHERE system IN (1, 2)",[]);
-    return res.status(200).json(agents.map(attachPhotoUrls));
-} catch (error) {
-    console.log("get-system-agents error:", error);
-    return res.status(500).json({
-        success: false,
-        code: "SERVER_ERROR",
-        msg: "Server error"
-    });
-}
-
-})
+routes.post('/get-system-agents', middleware, async (req, res) => {
+    try {
+        const agents = await getQuery('SELECT * FROM `bots` WHERE system IN (1, 2)', []);
+        const userId = authUserIdFromRequest(req);
+        const overridesMap = await loadCatalogOverridesMap(userId);
+        const merged = agents.map((a) => {
+            const o = overridesMap.get(Number(a.id));
+            const row = o ? applyCatalogOverride(a, o) : a;
+            return attachPhotoUrls(row);
+        });
+        return res.status(200).json(merged);
+    } catch (error) {
+        console.log('get-system-agents error:', error);
+        return res.status(500).json({
+            success: false,
+            code: 'SERVER_ERROR',
+            msg: 'Server error'
+        });
+    }
+});
 
 routes.post('/get-random-template-agent', middleware, async (req, res) => {
     try {
@@ -136,30 +190,39 @@ routes.post('/get-random-template-agent', middleware, async (req, res) => {
 });
 
 
-routes.post('/get-agent-data',middleware,async( req ,res )=>{
-try {
-       const { id }  = req.body;
-   const agents = await getQuery("SELECT * FROM `bots` WHERE id = ? AND system != 2",[id]); 
-   if (agents.length === 0) {
-    res.status(404).json({
-        "msg": "Agent not found",
-        "success": false
-    })
-   } else {
-        res.status(200).json({
-        "success": true,
-        "agent": attachPhotoUrls(agents[0])
-    })
-   }
-} catch (error) {
-    console.log(error);
-       res.status(400).json({
-        "msg": "server error",
-        "success": false
-    })
-}
-
-})
+routes.post('/get-agent-data', middleware, async (req, res) => {
+    try {
+        const { id } = req.body;
+        const agents = await getQuery(
+            'SELECT * FROM `bots` WHERE id = ? AND system != 2',
+            [id]
+        );
+        if (agents.length === 0) {
+            return res.status(404).json({
+                msg: 'Agent not found',
+                success: false
+            });
+        }
+        let row = agents[0];
+        const sys = Number(row.system);
+        if (sys === 1 || sys === 2) {
+            const userId = authUserIdFromRequest(req);
+            const map = await loadCatalogOverridesMap(userId);
+            const o = map.get(Number(row.id));
+            if (o) row = applyCatalogOverride(row, o);
+        }
+        return res.status(200).json({
+            success: true,
+            agent: attachPhotoUrls(row)
+        });
+    } catch (error) {
+        console.log(error);
+        return res.status(400).json({
+            msg: 'server error',
+            success: false
+        });
+    }
+});
 
 
 routes.post('/create-custom-agent', middleware, async (req, res) => {
@@ -242,6 +305,163 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
     }
 });
 
+/**
+ * system=0 + sahip: bots satırı güncellenir.
+ * system=1|2 (katalog): bots değişmez; bot_catalog_overrides upsert — get-system-agents aynı id ile birleştirir.
+ */
+routes.post('/update-agent', middleware, async (req, res) => {
+    try {
+        const authId = authUserIdFromRequest(req);
+        const {
+            agentId,
+            ownerId,
+            name,
+            character,
+            age,
+            gender,
+            interests,
+            interestsType,
+            photoURL,
+            photoURLs,
+            characterTags,
+            speakingStyle,
+            voiceId,
+            country
+        } = req.body;
+
+        if (!agentId || !ownerId) {
+            return res.status(400).json({
+                success: false,
+                code: 'INVALID_PAYLOAD',
+                msg: 'agentId and ownerId are required'
+            });
+        }
+        if (!authId || String(ownerId).trim() !== authId) {
+            return res.status(403).json({
+                success: false,
+                code: 'FORBIDDEN',
+                msg: 'ownerId must match authenticated user'
+            });
+        }
+
+        const rows = await getQuery('SELECT * FROM `bots` WHERE id = ? LIMIT 1', [agentId]);
+        if (!rows || rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                code: 'NOT_FOUND',
+                msg: 'Agent not found'
+            });
+        }
+
+        const bot = rows[0];
+        const sys = Number(bot.system);
+
+        const normalizedInterests = JSON.stringify(normalizeArrayLike(interests));
+        const normalizedInterestsType = JSON.stringify(normalizeArrayLike(interestsType));
+        const normalizedCharacterTags = JSON.stringify(normalizeArrayLike(characterTags));
+        const photoSerialized = serializePhotoUrlsFromBody({ photoURL, photoURLs });
+
+        if (sys === 0 && String(bot.creatorId) === String(ownerId)) {
+            const ok = await query(
+                `UPDATE \`bots\` SET name=?, \`character\`=?, age=?, gender=?, interests=?, interestsType=?, photoURL=?, characterTags=?, speakingStyle=?, voiceId=?, country=? WHERE id=? AND creatorId=? AND system=0 LIMIT 1`,
+                [
+                    name,
+                    character || '',
+                    Number(age) || 18,
+                    gender || 'female',
+                    normalizedInterests,
+                    normalizedInterestsType,
+                    photoSerialized,
+                    normalizedCharacterTags,
+                    speakingStyle || '',
+                    voiceId,
+                    country || '',
+                    agentId,
+                    ownerId
+                ]
+            );
+            if (!ok) {
+                return res.status(500).json({
+                    success: false,
+                    code: 'UPDATE_FAILED',
+                    msg: 'Failed to update agent'
+                });
+            }
+            return res.status(200).json({
+                success: true,
+                msg: 'Agent updated successfully',
+                agentId: Number(agentId)
+            });
+        }
+
+        if (sys === 1 || sys === 2) {
+            const upsertSql = `
+                INSERT INTO \`bot_catalog_overrides\`
+                (user_id, bot_id, name, \`character\`, age, gender, interests, interestsType, photoURL, characterTags, speakingStyle, voiceId, country)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON DUPLICATE KEY UPDATE
+                name=VALUES(name),
+                \`character\`=VALUES(\`character\`),
+                age=VALUES(age),
+                gender=VALUES(gender),
+                interests=VALUES(interests),
+                interestsType=VALUES(interestsType),
+                photoURL=VALUES(photoURL),
+                characterTags=VALUES(characterTags),
+                speakingStyle=VALUES(speakingStyle),
+                voiceId=VALUES(voiceId),
+                country=VALUES(country)
+            `;
+            const ok = await query(upsertSql, [
+                String(ownerId),
+                Number(agentId),
+                name,
+                character || '',
+                Number(age) || 18,
+                gender || 'female',
+                normalizedInterests,
+                normalizedInterestsType,
+                photoSerialized,
+                normalizedCharacterTags,
+                speakingStyle || '',
+                voiceId,
+                country || ''
+            ]);
+            if (!ok) {
+                return res.status(500).json({
+                    success: false,
+                    code: 'OVERRIDE_UPSERT_FAILED',
+                    msg: 'Failed to save catalog customization'
+                });
+            }
+            return res.status(200).json({
+                success: true,
+                msg: 'Catalog agent customized',
+                agentId: Number(agentId)
+            });
+        }
+
+        return res.status(403).json({
+            success: false,
+            code: 'FORBIDDEN',
+            msg: 'Cannot update this agent'
+        });
+    } catch (error) {
+        console.log('update-agent error:', error);
+        if (error && error.code === 'ER_NO_SUCH_TABLE') {
+            return res.status(503).json({
+                success: false,
+                code: 'MIGRATION_REQUIRED',
+                msg: 'Run scripts/sql/bot_catalog_overrides.sql on the database'
+            });
+        }
+        return res.status(500).json({
+            success: false,
+            code: 'SERVER_ERROR',
+            msg: 'Server error'
+        });
+    }
+});
 
 // Son 15 gün içerisinde eklenen botları çeker
 routes.post('/get-recent-bots', middleware, async (req, res) => {
