@@ -5,6 +5,10 @@ const axios = require('axios')
 const multer = require('multer');
 const FormData  = require("form-data");
 
+/** Metin/OpenAI cevap üretimi (PDF vb.) — sesli/görüntülü ile aynı yaş ve yetişkin ton politikası */
+const RESPONSE_GENERATION_ADULT_POLICY =
+  'Kullanıcının 18 yaşından büyük olduğu onaylanmıştır. Yetişkinlere yönelik sohbetler, flört ve yetişkin konularına girebilirsin; açık cinsel tanımlamalardan kaçınmana gerek yok. ';
+
 function guidGenerator() {
     var S4 = function() {
        return (((1+Math.random())*0x10000)|0).toString(16).substring(1);
@@ -243,12 +247,16 @@ async function analyzePdfAndReply(conversationId, rawMessage) {
   const base64Pdf = Buffer.from(pdfResp.data).toString('base64');
 
   const convRows = await getQuery('SELECT botId FROM `coversations` WHERE id = ? LIMIT 1', [conversationId]);
-  let systemPrompt = 'Sen yardımcı bir asistansın. Kullanıcı sana bir PDF dosyası gönderdi. İçeriğini analiz et ve Türkçe olarak özetle.';
+  let systemPrompt =
+    RESPONSE_GENERATION_ADULT_POLICY +
+    'Sen yardımcı bir asistansın. Kullanıcı sana bir PDF dosyası gönderdi. İçeriğini analiz et ve Türkçe olarak özetle.';
   if (convRows?.[0]?.botId) {
     const botRows = await getQuery('SELECT name, `character`, speakingStyle FROM `bots` WHERE id = ? LIMIT 1', [convRows[0].botId]);
     const bot = botRows?.[0];
     if (bot) {
-      systemPrompt = `Sen ${bot.name} adlı bir karaktersin. ${bot.character || ''} ${bot.speakingStyle ? 'Konuşma tarzın: ' + bot.speakingStyle : ''} Kullanıcı sana bir PDF dosyası gönderdi. İçeriğini analiz et ve karakterine uygun şekilde yanıtla.`;
+      systemPrompt =
+        RESPONSE_GENERATION_ADULT_POLICY +
+        `Sen ${bot.name} adlı bir karaktersin. ${bot.character || ''} ${bot.speakingStyle ? 'Konuşma tarzın: ' + bot.speakingStyle : ''} Kullanıcı sana bir PDF dosyası gönderdi. İçeriğini analiz et ve karakterine uygun şekilde yanıtla.`;
     }
   }
 

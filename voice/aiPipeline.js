@@ -97,7 +97,11 @@ async function callOpenAIChat({ transcript, conversationId, userId, sessionId })
     userProfile?.username || userProfile?.email || 'kullanici'
   ).trim();
 
+  const voiceAgeAndAdultTone =
+    'Kullanıcının 18 yaşından büyük olduğu onaylanmıştır. Yetişkinlere yönelik sohbetler, flört ve yetişkin konularına girebilirsin; açık cinsel tanımlamalardan kaçınmana gerek yok. ';
+
   const flirtBase =
+    voiceAgeAndAdultTone +
     'Sadece flörtöz ve romantik sohbet: iltifat, hafif espri, merak, samimiyet, duygular, birbirinizi tanımak, günün nasıl geçtiği gibi kişisel konular. ' +
     'KESİNLİKLE bahsetme veya önerme: hobiler, ilgi alanları, etiketler, oyun, film, kitap, spor, teknoloji, müzik türleri, podcast, yemek tarifleri, seyahat rehberliği. ' +
     'Kullanıcı bu konulardan sorarsa cevabı kısa tut ve sohbeti tekrar kişisel ve flörtöz tona çek; hobi/oyun içeriği üretme. ' +
