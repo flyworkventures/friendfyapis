@@ -78,6 +78,28 @@ function getBodyOwnerOrUserId(body) {
     return normalizeAgentUserId(body.ownerId ?? body.userId);
 }
 
+/**
+ * İstemci hem ownerId hem userId gönderdiyse (katalog dalı) aynı olmalı.
+ * @returns {{ ok: true, combined: string } | { ok: false, status: number, json: object }}
+ */
+function assertOwnerAndUserIdBodyConsistent(body) {
+    if (!body || typeof body !== 'object') return { ok: true, combined: '' };
+    const o = normalizeAgentUserId(body.ownerId);
+    const u = normalizeAgentUserId(body.userId);
+    if (o && u && o !== u) {
+        return {
+            ok: false,
+            status: 400,
+            json: {
+                success: false,
+                code: 'OWNER_USER_ID_MISMATCH',
+                msg: 'ownerId and userId must match when both are sent'
+            }
+        };
+    }
+    return { ok: true, combined: o || u };
+}
+
 function logOwnerJwtMismatch(route, req, jwtNorm, bodyNorm) {
     const u = req.user || {};
     console.error(`[${route}] ownerId/userId JWT ile eşleşmiyor`, {
@@ -96,25 +118,51 @@ function logOwnerJwtMismatch(route, req, jwtNorm, bodyNorm) {
 }
 
 /**
- * Gövdedeki ownerId veya userId, JWT öznesi ile aynı olmalı (şablon creatorId ile ilgisi yok).
- * @returns {{ ok: true, jwtUserId: string, bodyUserId: string } | { ok: false, status: number, json: object }}
+ * JWT id/userId; yoksa email ile users tablosundan (geçici uyumluluk).
  */
-function assertJwtMatchesBodyOwner(req, routeLabel) {
-    const jwtUserId = getJwtSubjectUserId(req);
-    const bodyUserId = getBodyOwnerOrUserId(req.body);
+async function resolveJwtSubjectUserId(req) {
+    const direct = getJwtSubjectUserId(req);
+    if (direct) return direct;
+    const u = req.user;
+    if (!u) return '';
+    const email = typeof u.email === 'string' ? u.email.trim() : '';
+    if (!email) return '';
+    try {
+        const rows = await getQuery('SELECT id FROM `users` WHERE email = ? LIMIT 1', [email]);
+        if (!rows?.length) return '';
+        return normalizeAgentUserId(rows[0].id);
+    } catch (e) {
+        console.error('[agents] resolveJwtSubjectUserId email lookup failed', e);
+        return '';
+    }
+}
+
+/**
+ * Gövdedeki ownerId veya userId, çözümlenen oturum kullanıcısı ile aynı olmalı.
+ * Token geçerli ama özne yok: 403 (iş kuralı); geçersiz token middleware 401.
+ */
+async function assertJwtMatchesBodyOwner(req, routeLabel) {
+    const bodyGate = assertOwnerAndUserIdBodyConsistent(req.body);
+    if (!bodyGate.ok) {
+        return bodyGate;
+    }
+    const bodyUserId = bodyGate.combined || getBodyOwnerOrUserId(req.body);
+
+    const jwtUserId = await resolveJwtSubjectUserId(req);
 
     if (!jwtUserId) {
-        console.error(`[${routeLabel}] JWT içinde id/userId yok`, {
+        console.error(`[${routeLabel}] Oturum kullanıcı id çözülemedi (JWT id/userId yok, email ile DB bulunamadı)`, {
             route: routeLabel,
-            reqUserKeys: req.user ? Object.keys(req.user) : []
+            reqUserKeys: req.user ? Object.keys(req.user) : [],
+            jwtEmail: req.user?.email
         });
         return {
             ok: false,
-            status: 401,
+            status: 403,
             json: {
                 success: false,
-                code: 'AUTH_SUBJECT_MISSING',
-                msg: 'Authenticated user id missing in token'
+                code: 'ACCESS_TOKEN_SUBJECT_MISSING',
+                msg: 'Token missing user id; please login again or renew tokens'
             }
         };
     }
@@ -147,6 +195,7 @@ function assertJwtMatchesBodyOwner(req, routeLabel) {
     return { ok: true, jwtUserId, bodyUserId };
 }
 
+/** Senkron: yalnızca JWT claim (email fallback yok). Katalog birleştirme için async resolveJwtSubjectUserId tercih edin. */
 function authUserIdFromRequest(req) {
     return getJwtSubjectUserId(req);
 }
@@ -195,16 +244,35 @@ async function loadCatalogOverridesMap(userId) {
     }
 }
 
+async function fetchFriendCreateUserAgents(creatorId) {
+    try {
+        return await getQuery(
+            'SELECT * FROM `bots` WHERE system = ? AND creatorId = ? AND user_agent_origin = ?',
+            [0, creatorId, 'friend_create']
+        );
+    } catch (e) {
+        if (e && e.code === 'ER_BAD_FIELD_ERROR') {
+            console.warn(
+                '[agents] user_agent_origin kolonu yok; scripts/sql/bots_user_agent_origin.sql çalıştırın — geçici olarak tüm custom botlar listeleniyor.'
+            );
+            return await getQuery('SELECT * FROM `bots` WHERE system = ? AND creatorId = ?', [
+                0,
+                creatorId
+            ]);
+        }
+        throw e;
+    }
+}
+
 routes.post('/get-user-agents',middleware,async (req,res)=>{
     try {
-        const gate = assertJwtMatchesBodyOwner(req, 'get-user-agents');
+        const gate = await assertJwtMatchesBodyOwner(req, 'get-user-agents');
         if (!gate.ok) {
             return res.status(gate.status).json(gate.json);
         }
         const userId = gate.jwtUserId;
-        
-        // Get user's custom agents (system = 0 and creatorId matches)
-        const userAgents = await getQuery("SELECT * FROM `bots` WHERE system = ? AND creatorId = ?", [0, userId]);
+
+        const userAgents = await fetchFriendCreateUserAgents(userId);
         
         if (userAgents.length === 0) {
             return res.status(200).json([]);
@@ -227,7 +295,7 @@ routes.post('/get-user-agents',middleware,async (req,res)=>{
 routes.post('/get-system-agents', middleware, async (req, res) => {
     try {
         const agents = await getQuery('SELECT * FROM `bots` WHERE system IN (1, 2)', []);
-        const userId = authUserIdFromRequest(req);
+        const userId = await resolveJwtSubjectUserId(req);
         const overridesMap = await loadCatalogOverridesMap(userId);
         const merged = agents.map((a) => {
             const o = overridesMap.get(Number(a.id));
@@ -289,7 +357,7 @@ routes.post('/get-agent-data', middleware, async (req, res) => {
         let row = agents[0];
         const sys = Number(row.system);
         if (sys === 1 || sys === 2) {
-            const userId = authUserIdFromRequest(req);
+            const userId = await resolveJwtSubjectUserId(req);
             const map = await loadCatalogOverridesMap(userId);
             const o = map.get(Number(row.id));
             if (o) row = applyCatalogOverride(row, o);
@@ -310,7 +378,7 @@ routes.post('/get-agent-data', middleware, async (req, res) => {
 
 routes.post('/create-custom-agent', middleware, async (req, res) => {
     try {
-        const gate = assertJwtMatchesBodyOwner(req, 'create-custom-agent');
+        const gate = await assertJwtMatchesBodyOwner(req, 'create-custom-agent');
         if (!gate.ok) {
             return res.status(gate.status).json(gate.json);
         }
@@ -344,12 +412,12 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
         const normalizedInterestsType = JSON.stringify(normalizeArrayLike(interestsType));
         const normalizedCharacterTags = JSON.stringify(normalizeArrayLike(characterTags));
 
-        // Insert the new custom agent into the database
+        // Insert: yalnızca "Arkadaş oluştur" — user_agent_origin = friend_create (get-user-agents ile uyum)
         const insertQuery = `
             INSERT INTO bots 
             (name, \`character\`, age, gender, interests, interestsType, photoURL, 
-             characterTags, speakingStyle, voiceId, country, creatorId, system)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             characterTags, speakingStyle, voiceId, country, creatorId, system, user_agent_origin)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
         const values = [
@@ -365,7 +433,8 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             voiceId,
             country || '',
             actorId,
-            0  // system = 0 means it's a user-created agent
+            0,
+            'friend_create'
         ];
 
         const result = await query(insertQuery, values);
@@ -399,7 +468,7 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
  */
 routes.post('/update-agent', middleware, async (req, res) => {
     try {
-        const gate = assertJwtMatchesBodyOwner(req, 'update-agent');
+        const gate = await assertJwtMatchesBodyOwner(req, 'update-agent');
         if (!gate.ok) {
             return res.status(gate.status).json(gate.json);
         }
@@ -591,7 +660,7 @@ routes.post('/get-recent-bots', middleware, async (req, res) => {
 
 routes.post('/delete-agent', middleware, async (req, res) => {
     try {
-        const gate = assertJwtMatchesBodyOwner(req, 'delete-agent');
+        const gate = await assertJwtMatchesBodyOwner(req, 'delete-agent');
         if (!gate.ok) {
             return res.status(gate.status).json(gate.json);
         }

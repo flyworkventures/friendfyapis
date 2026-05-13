@@ -3,6 +3,7 @@ const JWT = require('jsonwebtoken');
 const { getQuery, query } = require('../db');
 const middleware = require('../middleware/checkAuth');
 
+const JWT_SECRET = process.env.JWT_SECRET || 'key';
 const ACCESS_TOKEN_EXPIRY = '365d'; // access token süresi (config yenilemede kullanılıyor)
 
 // Config bilgilerini getir. Token süresi dolmuşsa refreshToken ile yenileyip yeni token da döner.
@@ -15,18 +16,29 @@ router.post('/config', async (req, res) => {
         // Token varsa kontrol et; süresi dolmuşsa refresh token ile yenile
         if (accessToken) {
             try {
-                JWT.verify(accessToken, 'key');
+                JWT.verify(accessToken, JWT_SECRET);
                 // Token geçerli, ek işlem yok
             } catch (err) {
                 if (err.name === 'TokenExpiredError' && refreshToken) {
                     try {
-                        const payload = JWT.verify(refreshToken, 'key');
+                        const payload = JWT.verify(refreshToken, JWT_SECRET);
                         if (payload.type === 'refresh' && payload.email) {
-                            newToken = JWT.sign(
-                                { email: payload.email },
-                                'key',
-                                { expiresIn: ACCESS_TOKEN_EXPIRY }
+                            const users = await getQuery(
+                                'SELECT id, email FROM `users` WHERE email = ? LIMIT 1',
+                                [payload.email]
                             );
+                            const row = users?.[0];
+                            if (row) {
+                                const idNum = Number(row.id);
+                                const claims = { email: row.email };
+                                if (!Number.isNaN(idNum)) {
+                                    claims.id = idNum;
+                                    claims.userId = idNum;
+                                }
+                                newToken = JWT.sign(claims, JWT_SECRET, {
+                                    expiresIn: ACCESS_TOKEN_EXPIRY
+                                });
+                            }
                         }
                     } catch (refreshErr) {
                         // Refresh token geçersiz veya süresi dolmuş, config yine döner, token yenilenmez

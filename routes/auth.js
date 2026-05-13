@@ -12,6 +12,29 @@ const REFRESH_TOKEN_EXPIRY = '365d';  // 1 yıl
 // checkAuth ile aynı sır: ortamda JWT_SECRET yoksa 'key' (eski davranış)
 const JWT_SECRET = process.env.JWT_SECRET || 'key';
 
+/** Access JWT: id + userId (sayı) + email — agent rotaları req.user.id için gerekli. */
+function signAccessTokenForUser(userRow) {
+    if (!userRow || !userRow.email) return null;
+    const idNum = Number(userRow.id);
+    const payload = { email: userRow.email };
+    if (!Number.isNaN(idNum)) {
+        payload.id = idNum;
+        payload.userId = idNum;
+    }
+    return JWT.sign(payload, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
+}
+
+function signRefreshTokenForUser(userRow) {
+    if (!userRow || !userRow.email) return null;
+    const idNum = Number(userRow.id);
+    const payload = { email: userRow.email, type: 'refresh' };
+    if (!Number.isNaN(idNum)) {
+        payload.id = idNum;
+        payload.userId = idNum;
+    }
+    return JWT.sign(payload, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY });
+}
+
 function guidGenerator() {
   const S4 = function() {
     return (((1 + Math.random()) * 0x10000) | 0).toString(16).substring(1);
@@ -57,9 +80,10 @@ router.post('/signup', [
             let hashedPassword = await bcrypt.hash(password, 10);
             await query("INSERT INTO `users` (`email`, `password`, `token`, `accountCreatedDate`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`) VALUES ( ?,?,?,?,?,?,?,?,?,?,?);",[ email,hashedPassword, null, null, null, null, null, credential, null, null, null])
             
-
-            const token = await JWT.sign({ email }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
-            const refreshToken = await JWT.sign({ email, type: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY });
+            const insertedRows = await getQuery('SELECT id, email FROM `users` WHERE email = ? LIMIT 1', [email]);
+            const newUser = insertedRows[0];
+            const token = signAccessTokenForUser(newUser);
+            const refreshToken = signRefreshTokenForUser(newUser);
             return res.json({
                 token,
                 refreshToken
@@ -81,10 +105,10 @@ router.post('/signup', [
             }
 
             const existingUser = await getQuery("SELECT * FROM `users` WHERE email = ?", [userEmail]);
-            const token = JWT.sign({ email: userEmail }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
-            const refreshToken = JWT.sign({ email: userEmail, type: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY });
-
             if (existingUser.length > 0) {
+                const u = existingUser[0];
+                const token = signAccessTokenForUser(u);
+                const refreshToken = signRefreshTokenForUser(u);
                 return res.json({ token, refreshToken });
             }
 
@@ -93,9 +117,13 @@ router.post('/signup', [
 
             await query(
                 "INSERT INTO `users` (`username`, `email`, `password`, `token`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `country`, `gender` , `birthdate`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-                [parsedUser.username,userEmail, hashedPassword, token,  null, null, "1", credential, null, null, null,parsedUser.counrty || null,parsedUser.gender  , birthdate ]
+                [parsedUser.username,userEmail, hashedPassword, null,  null, null, "1", credential, null, null, null,parsedUser.counrty || null,parsedUser.gender  , birthdate ]
             );
 
+            const insertedRows = await getQuery('SELECT id, email FROM `users` WHERE email = ? LIMIT 1', [userEmail]);
+            const newUser = insertedRows[0];
+            const token = signAccessTokenForUser(newUser);
+            const refreshToken = signRefreshTokenForUser(newUser);
             return res.json({ token, refreshToken });
            
         } catch (err) {
@@ -156,8 +184,8 @@ router.post('/login', async (req, res) => {
             if (!isMatch) {
                 return res.status(404).json({ msg: 'Invalid credentials' });
             }
-            const token = JWT.sign({ email }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
-            const refreshToken = JWT.sign({ email, type: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY });
+            const token = signAccessTokenForUser(user);
+            const refreshToken = signRefreshTokenForUser(user);
             return res.json({ token, refreshToken });
         }
 
@@ -178,8 +206,9 @@ router.post('/login', async (req, res) => {
                     code: 'USER_NOT_FOUND'
                 });
             }
-            const token = JWT.sign({ email: userEmail }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
-            const refreshToken = JWT.sign({ email: userEmail, type: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY });
+            const u = rows[0];
+            const token = signAccessTokenForUser(u);
+            const refreshToken = signRefreshTokenForUser(u);
             return res.json({ token, refreshToken });
         }
 
@@ -198,12 +227,9 @@ router.post('/guest-login', async (req, res) => {
         const nowIso = new Date().toISOString();
         const defaultBirthdateIso = new Date('1970-01-01T00:00:00.000Z').toISOString();
 
-        const token = JWT.sign({ email }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
-        const refreshToken = JWT.sign({ email, type: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY });
-
         await query(
             "INSERT INTO `users` (`username`, `email`, `password`, `token`, `accountCreatedDate`, `birthdate`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `gender`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-            [username, email, null, token, nowIso, defaultBirthdateIso, null, null, 1, "guest", refreshToken, null, null, 'male']
+            [username, email, null, null, nowIso, defaultBirthdateIso, null, null, 1, "guest", null, null, null, 'male']
         );
 
         const createdUserRows = await getQuery("SELECT * FROM `users` WHERE email = ? LIMIT 1", [email]);
@@ -214,6 +240,16 @@ router.post('/guest-login', async (req, res) => {
                 msg: "Guest user could not be created",
                 success: false
             });
+        }
+
+        const token = signAccessTokenForUser(createdUser);
+        const refreshToken = signRefreshTokenForUser(createdUser);
+        if (token && refreshToken) {
+            await query('UPDATE `users` SET `token` = ?, `refreshToken` = ? WHERE id = ? LIMIT 1', [
+                token,
+                refreshToken,
+                createdUser.id
+            ]);
         }
 
         return res.status(200).json({
@@ -294,7 +330,13 @@ router.post('/verify-token', async (req, res) => {
                         });
                     }
 
-                    const renewedToken = JWT.sign({ email: refreshPayload.email }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
+                    const renewedToken = signAccessTokenForUser(userModel);
+                    if (!renewedToken) {
+                        return res.status(500).json({
+                            msg: 'Could not issue access token',
+                            code: 'TOKEN_ISSUE_FAILED'
+                        });
+                    }
                     return res.status(200).json({
                         msg: "Token renewed",
                         code: "TOKEN_RENEWED",
@@ -360,7 +402,14 @@ router.post('/refresh-token', async (req, res) => {
                 code: "USER_NOT_FOUND"
             });
         }
-        const token = JWT.sign({ email: payload.email }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
+        const token = signAccessTokenForUser(user);
+        if (!token) {
+            return res.status(500).json({
+                msg: 'Could not issue access token',
+                success: false,
+                code: 'TOKEN_ISSUE_FAILED'
+            });
+        }
         return res.status(200).json({
             msg: "Token renewed",
             success: true,

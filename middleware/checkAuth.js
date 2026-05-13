@@ -4,10 +4,19 @@ const JWT_SECRET = process.env.JWT_SECRET || 'key';
 const ACCESS_TOKEN_EXPIRY = process.env.ACCESS_TOKEN_EXPIRY || '365d';
 
 function issueAccessToken(payload) {
-  // Refresh token payload'undaki "type" alanını access token'a taşımıyoruz.
+  // Refresh token payload'undaki "type" access token'a taşınmaz.
   const nextPayload = { email: payload.email };
-  if (payload.id) nextPayload.id = payload.id;
-  if (payload.userId) nextPayload.userId = payload.userId;
+  const raw = payload.id ?? payload.userId;
+  if (raw != null && raw !== '') {
+    const n = Number(raw);
+    if (!Number.isNaN(n)) {
+      nextPayload.id = n;
+      nextPayload.userId = n;
+    } else {
+      nextPayload.id = raw;
+      nextPayload.userId = raw;
+    }
+  }
   return JWT.sign(nextPayload, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
 }
 
