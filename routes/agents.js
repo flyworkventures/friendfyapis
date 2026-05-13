@@ -59,10 +59,96 @@ function normalizeArrayLike(value) {
     return [];
 }
 
-function authUserIdFromRequest(req) {
+/** İstemci ve JWT id karşılaştırması (string | number). */
+function normalizeAgentUserId(value) {
+    if (value === null || value === undefined) return '';
+    const s = String(value).trim();
+    return s === 'undefined' || s === 'null' ? '' : s;
+}
+
+/** Oturumdaki kullanıcı: yalnızca JWT (id veya userId claim). */
+function getJwtSubjectUserId(req) {
     const u = req.user;
     if (!u) return '';
-    return String(u.id ?? u.userId ?? '').trim();
+    return normalizeAgentUserId(u.id ?? u.userId);
+}
+
+function getBodyOwnerOrUserId(body) {
+    if (!body || typeof body !== 'object') return '';
+    return normalizeAgentUserId(body.ownerId ?? body.userId);
+}
+
+function logOwnerJwtMismatch(route, req, jwtNorm, bodyNorm) {
+    const u = req.user || {};
+    console.error(`[${route}] ownerId/userId JWT ile eşleşmiyor`, {
+        route,
+        bodyOwnerId: req.body?.ownerId,
+        bodyOwnerIdType: typeof req.body?.ownerId,
+        bodyUserId: req.body?.userId,
+        bodyUserIdType: typeof req.body?.userId,
+        bodyNormalized: bodyNorm || '(boş)',
+        jwtId: u.id,
+        jwtIdType: typeof u.id,
+        jwtUserIdClaim: u.userId,
+        jwtUserIdClaimType: typeof u.userId,
+        jwtNormalized: jwtNorm || '(boş)'
+    });
+}
+
+/**
+ * Gövdedeki ownerId veya userId, JWT öznesi ile aynı olmalı (şablon creatorId ile ilgisi yok).
+ * @returns {{ ok: true, jwtUserId: string, bodyUserId: string } | { ok: false, status: number, json: object }}
+ */
+function assertJwtMatchesBodyOwner(req, routeLabel) {
+    const jwtUserId = getJwtSubjectUserId(req);
+    const bodyUserId = getBodyOwnerOrUserId(req.body);
+
+    if (!jwtUserId) {
+        console.error(`[${routeLabel}] JWT içinde id/userId yok`, {
+            route: routeLabel,
+            reqUserKeys: req.user ? Object.keys(req.user) : []
+        });
+        return {
+            ok: false,
+            status: 401,
+            json: {
+                success: false,
+                code: 'AUTH_SUBJECT_MISSING',
+                msg: 'Authenticated user id missing in token'
+            }
+        };
+    }
+
+    if (!bodyUserId) {
+        return {
+            ok: false,
+            status: 400,
+            json: {
+                success: false,
+                code: 'INVALID_PAYLOAD',
+                msg: 'ownerId or userId is required'
+            }
+        };
+    }
+
+    if (jwtUserId !== bodyUserId) {
+        logOwnerJwtMismatch(routeLabel, req, jwtUserId, bodyUserId);
+        return {
+            ok: false,
+            status: 403,
+            json: {
+                success: false,
+                code: 'FORBIDDEN',
+                msg: 'ownerId (or userId) must match authenticated user'
+            }
+        };
+    }
+
+    return { ok: true, jwtUserId, bodyUserId };
+}
+
+function authUserIdFromRequest(req) {
+    return getJwtSubjectUserId(req);
 }
 
 /** Katalog satırı + override satırı (aynı bot id, kullanıcıya özel). */
@@ -111,14 +197,11 @@ async function loadCatalogOverridesMap(userId) {
 
 routes.post('/get-user-agents',middleware,async (req,res)=>{
     try {
-        const { userId } = req.body;
-        
-        if (!userId) {
-            return res.status(400).json({
-                "msg": "User ID is required",
-                "success": false
-            });
+        const gate = assertJwtMatchesBodyOwner(req, 'get-user-agents');
+        if (!gate.ok) {
+            return res.status(gate.status).json(gate.json);
         }
+        const userId = gate.jwtUserId;
         
         // Get user's custom agents (system = 0 and creatorId matches)
         const userAgents = await getQuery("SELECT * FROM `bots` WHERE system = ? AND creatorId = ?", [0, userId]);
@@ -227,6 +310,12 @@ routes.post('/get-agent-data', middleware, async (req, res) => {
 
 routes.post('/create-custom-agent', middleware, async (req, res) => {
     try {
+        const gate = assertJwtMatchesBodyOwner(req, 'create-custom-agent');
+        if (!gate.ok) {
+            return res.status(gate.status).json(gate.json);
+        }
+        const actorId = gate.jwtUserId;
+
         const {
             name,
             character,
@@ -239,16 +328,15 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             characterTags,
             speakingStyle,
             voiceId,
-            country,
-            ownerId
+            country
         } = req.body;
 
         // Validate required fields
-        if (!name || !voiceId || !ownerId) {
+        if (!name || !voiceId) {
             return res.status(400).json({
                 success: false,
                 code: "INVALID_PAYLOAD",
-                msg: "name, voiceId and ownerId are required"
+                msg: "name and voiceId are required (ownerId or userId must match JWT)"
             });
         }
 
@@ -276,7 +364,7 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             speakingStyle || '',
             voiceId,
             country || '',
-            ownerId,
+            actorId,
             0  // system = 0 means it's a user-created agent
         ];
 
@@ -311,10 +399,14 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
  */
 routes.post('/update-agent', middleware, async (req, res) => {
     try {
-        const authId = authUserIdFromRequest(req);
+        const gate = assertJwtMatchesBodyOwner(req, 'update-agent');
+        if (!gate.ok) {
+            return res.status(gate.status).json(gate.json);
+        }
+        const actorId = gate.jwtUserId;
+
         const {
             agentId,
-            ownerId,
             name,
             character,
             age,
@@ -329,18 +421,11 @@ routes.post('/update-agent', middleware, async (req, res) => {
             country
         } = req.body;
 
-        if (!agentId || !ownerId) {
+        if (!agentId) {
             return res.status(400).json({
                 success: false,
                 code: 'INVALID_PAYLOAD',
-                msg: 'agentId and ownerId are required'
-            });
-        }
-        if (!authId || String(ownerId).trim() !== authId) {
-            return res.status(403).json({
-                success: false,
-                code: 'FORBIDDEN',
-                msg: 'ownerId must match authenticated user'
+                msg: 'agentId is required'
             });
         }
 
@@ -361,7 +446,8 @@ routes.post('/update-agent', middleware, async (req, res) => {
         const normalizedCharacterTags = JSON.stringify(normalizeArrayLike(characterTags));
         const photoSerialized = serializePhotoUrlsFromBody({ photoURL, photoURLs });
 
-        if (sys === 0 && String(bot.creatorId) === String(ownerId)) {
+        // Kendi custom agent (system=0): yalnızca şu anki kullanıcı (JWT) sahibi olmalı — şablon creatorId ile ilgisi yok
+        if (sys === 0 && normalizeAgentUserId(bot.creatorId) === actorId) {
             const ok = await query(
                 `UPDATE \`bots\` SET name=?, \`character\`=?, age=?, gender=?, interests=?, interestsType=?, photoURL=?, characterTags=?, speakingStyle=?, voiceId=?, country=? WHERE id=? AND creatorId=? AND system=0 LIMIT 1`,
                 [
@@ -377,7 +463,7 @@ routes.post('/update-agent', middleware, async (req, res) => {
                     voiceId,
                     country || '',
                     agentId,
-                    ownerId
+                    actorId
                 ]
             );
             if (!ok) {
@@ -413,7 +499,7 @@ routes.post('/update-agent', middleware, async (req, res) => {
                 country=VALUES(country)
             `;
             const ok = await query(upsertSql, [
-                String(ownerId),
+                actorId,
                 Number(agentId),
                 name,
                 character || '',
@@ -505,7 +591,13 @@ routes.post('/get-recent-bots', middleware, async (req, res) => {
 
 routes.post('/delete-agent', middleware, async (req, res) => {
     try {
-        const { agentId, ownerId } = req.body;
+        const gate = assertJwtMatchesBodyOwner(req, 'delete-agent');
+        if (!gate.ok) {
+            return res.status(gate.status).json(gate.json);
+        }
+        const actorId = gate.jwtUserId;
+
+        const { agentId } = req.body;
 
         if (!agentId) {
             return res.status(400).json({
@@ -514,16 +606,9 @@ routes.post('/delete-agent', middleware, async (req, res) => {
             });
         }
 
-        if (!ownerId) {
-            return res.status(400).json({
-                msg: 'ownerId is required',
-                success: false
-            });
-        }
-
         const existing = await getQuery(
             'SELECT id FROM `bots` WHERE id = ? AND creatorId = ? AND system = 0 LIMIT 1',
-            [agentId, ownerId]
+            [agentId, actorId]
         );
 
         if (!existing || existing.length === 0) {
@@ -535,7 +620,7 @@ routes.post('/delete-agent', middleware, async (req, res) => {
 
         const deleted = await query(
             'DELETE FROM `bots` WHERE id = ? AND creatorId = ? AND system = 0 LIMIT 1',
-            [agentId, ownerId]
+            [agentId, actorId]
         );
 
         if (!deleted) {
