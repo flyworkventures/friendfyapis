@@ -97,7 +97,11 @@ async function callOpenAIChat({ transcript, conversationId, userId, sessionId })
     userProfile?.username || userProfile?.email || 'kullanici'
   ).trim();
 
-  const flirtBase = 'Kullanıcıyla sıcak, ilgili ve hafif flörtöz bir şekilde konuş. Samimi ol, iltifat et, espri yap, ilgi göster. Oyun veya hobilerden bahsetme — sohbeti romantik ve kişisel tut. Kısa-orta uzunlukta, doğal ve akıcı cevaplar ver.';
+  const flirtBase =
+    'Sadece flörtöz ve romantik sohbet: iltifat, hafif espri, merak, samimiyet, duygular, birbirinizi tanımak, günün nasıl geçtiği gibi kişisel konular. ' +
+    'KESİNLİKLE bahsetme veya önerme: hobiler, ilgi alanları, etiketler, oyun, film, kitap, spor, teknoloji, müzik türleri, podcast, yemek tarifleri, seyahat rehberliği. ' +
+    'Kullanıcı bu konulardan sorarsa cevabı kısa tut ve sohbeti tekrar kişisel ve flörtöz tona çek; hobi/oyun içeriği üretme. ' +
+    'Cevaplar kısa-orta uzunlukta, doğal Türkçe olsun.';
 
   const systemContent = botPersona
     ? `Sen ${botPersona.name || 'Friendify botu'} isimli birisin. Konuştuğun kişinin adı: ${resolvedUserName}. ${botPersona.character || ''} ${botPersona.speakingStyle ? 'Konuşma tarzın: ' + botPersona.speakingStyle + '.' : ''} ${flirtBase} Kullanıcının söylemediği bilgi ve detayları uydurma. Deşifre belirsizse kısa bir netleştirme sorusu sor. Cevaplarını Türkçe ver.`
