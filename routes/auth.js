@@ -5,6 +5,11 @@ const UserModel = require('../models/user_model');
 const bcrypt = require('bcrypt')
 const JWT = require('jsonwebtoken')
 const { getQuery , query} = require('../db')
+const {
+    normalizeMembership,
+    mergeMembershipsDbWithClient
+} = require('./lib/membershipsSync');
+const { assertJwtMatchesUserId } = require('./lib/assertJwtUserId');
 
 // Token süreleri: access uzun (uygulama güncellemesine kadar sorunsuz kullanım)
 const ACCESS_TOKEN_EXPIRY = '365d';   // 1 yıl
@@ -541,6 +546,83 @@ router.post('/update-profile', middleware, async (req, res) => {
     }
 });
 
+
+router.post('/update-premium', middleware, async (req, res) => {
+    try {
+        const { userId, memberships } = req.body || {};
+
+        const gate = assertJwtMatchesUserId(req, userId);
+        if (!gate.ok) {
+            return res.status(gate.status).json(gate.json);
+        }
+
+        let arrRaw = memberships;
+        if (typeof memberships === 'string') {
+            try {
+                arrRaw = JSON.parse(memberships);
+            } catch {
+                return res.status(400).json({
+                    msg: 'memberships must be a valid JSON array',
+                    success: false
+                });
+            }
+        }
+
+        if (!Array.isArray(arrRaw)) {
+            return res.status(400).json({
+                msg: 'memberships must be an array',
+                success: false
+            });
+        }
+
+        const normalizedMemberships = [];
+        for (const membership of arrRaw) {
+            const normalized = normalizeMembership(membership);
+            if (normalized?.error) {
+                return res.status(400).json({
+                    msg: normalized.error,
+                    success: false
+                });
+            }
+            normalizedMemberships.push(normalized);
+        }
+
+        const existingUser = await getQuery('SELECT * FROM `users` WHERE id = ? LIMIT 1', [
+            userId
+        ]);
+        if (!existingUser || existingUser.length === 0) {
+            return res.status(404).json({
+                msg: 'User not found',
+                success: false
+            });
+        }
+
+        const merged = mergeMembershipsDbWithClient(
+            existingUser[0].memberships,
+            normalizedMemberships
+        );
+
+        await query('UPDATE `users` SET `memberships` = ? WHERE id = ? LIMIT 1', [
+            JSON.stringify(merged),
+            userId
+        ]);
+
+        const updatedUser = await getQuery('SELECT * FROM `users` WHERE id = ? LIMIT 1', [
+            userId
+        ]);
+
+        return res.status(200).json({
+            success: true,
+            user: updatedUser[0]
+        });
+    } catch (error) {
+        console.error('update-premium error:', error);
+        return res.status(500).json({
+            success: false,
+            msg: 'Server error'
+        });
+    }
+});
 
 router.post('/delete-account', middleware, async (req, res) => {
     try {
