@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS `bot_catalog_overrides` (
   `speakingStyle` TEXT NOT NULL,
   `voiceId` VARCHAR(255) NOT NULL,
   `country` VARCHAR(255) NOT NULL DEFAULT '',
+  `rive_avatar` VARCHAR(2048) NULL DEFAULT NULL COMMENT '.riv CDN URL',
   `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`user_id`, `bot_id`),
   KEY `idx_bot_catalog_overrides_bot` (`bot_id`)

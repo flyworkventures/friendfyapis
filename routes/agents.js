@@ -40,6 +40,20 @@ function serializePhotoUrlsFromBody(body) {
     return JSON.stringify(normalized);
 }
 
+/** İstemci: rive_avatar | riveAvatar. Gövdede yoksa existingRow.rive_avatar korunur. */
+function parseRiveAvatarFromBody(body, existingRow = null) {
+    if (!body || typeof body !== 'object') {
+        return existingRow != null ? existingRow.rive_avatar ?? null : null;
+    }
+    const raw = body.rive_avatar ?? body.riveAvatar;
+    if (raw === undefined) {
+        return existingRow != null ? existingRow.rive_avatar ?? null : null;
+    }
+    if (raw === null) return null;
+    const t = String(raw).trim();
+    return t === '' ? null : t;
+}
+
 function normalizeArrayLike(value) {
     if (value == null) return [];
     if (Array.isArray(value)) return value;
@@ -218,6 +232,12 @@ function applyCatalogOverride(agent, overrideRow) {
     base.speakingStyle = overrideRow.speakingStyle ?? base.speakingStyle;
     base.voiceId = overrideRow.voiceId ?? base.voiceId;
     base.country = overrideRow.country ?? base.country;
+    if (
+        overrideRow.rive_avatar != null &&
+        String(overrideRow.rive_avatar).trim() !== ''
+    ) {
+        base.rive_avatar = overrideRow.rive_avatar;
+    }
     return base;
 }
 
@@ -282,6 +302,33 @@ async function botsHasUserAgentOriginColumn() {
         return has;
     } catch (e) {
         console.warn('[agents] botsHasUserAgentOriginColumn check failed:', e?.message || e);
+        return false;
+    }
+}
+
+let _botCatalogOverridesRiveKnownTrue = false;
+
+async function botCatalogOverridesHasRiveAvatarColumn() {
+    if (_botCatalogOverridesRiveKnownTrue) {
+        return true;
+    }
+    try {
+        const r = await getQuery(
+            "SHOW COLUMNS FROM `bot_catalog_overrides` WHERE Field = 'rive_avatar'"
+        );
+        const has = Array.isArray(r) && r.length > 0;
+        if (has) {
+            _botCatalogOverridesRiveKnownTrue = true;
+        }
+        return has;
+    } catch (e) {
+        if (e && e.code === 'ER_NO_SUCH_TABLE') {
+            return false;
+        }
+        console.warn(
+            '[agents] botCatalogOverridesHasRiveAvatarColumn check failed:',
+            e?.message || e
+        );
         return false;
     }
 }
@@ -435,6 +482,7 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
         const normalizedCharacterTags = JSON.stringify(normalizeArrayLike(characterTags));
 
         const hasOriginCol = await botsHasUserAgentOriginColumn();
+        const riveVal = parseRiveAvatarFromBody(req.body, null);
 
         const baseValues = [
             name,
@@ -448,6 +496,7 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             speakingStyle || '',
             voiceId,
             country || '',
+            riveVal,
             actorId,
             0
         ];
@@ -458,8 +507,8 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             insertQuery = `
             INSERT INTO bots 
             (name, \`character\`, age, gender, interests, interestsType, photoURL, 
-             characterTags, speakingStyle, voiceId, country, creatorId, system, user_agent_origin)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             characterTags, speakingStyle, voiceId, country, rive_avatar, creatorId, system, user_agent_origin)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
             values = [...baseValues, 'friend_create'];
         } else {
@@ -469,8 +518,8 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             insertQuery = `
             INSERT INTO bots 
             (name, \`character\`, age, gender, interests, interestsType, photoURL, 
-             characterTags, speakingStyle, voiceId, country, creatorId, system)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             characterTags, speakingStyle, voiceId, country, rive_avatar, creatorId, system)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
             values = baseValues;
         }
@@ -552,11 +601,12 @@ routes.post('/update-agent', middleware, async (req, res) => {
         const normalizedInterestsType = JSON.stringify(normalizeArrayLike(interestsType));
         const normalizedCharacterTags = JSON.stringify(normalizeArrayLike(characterTags));
         const photoSerialized = serializePhotoUrlsFromBody({ photoURL, photoURLs });
+        const riveResolved = parseRiveAvatarFromBody(req.body, bot);
 
         // Kendi custom agent (system=0): yalnızca şu anki kullanıcı (JWT) sahibi olmalı — şablon creatorId ile ilgisi yok
         if (sys === 0 && normalizeAgentUserId(bot.creatorId) === actorId) {
             const ok = await query(
-                `UPDATE \`bots\` SET name=?, \`character\`=?, age=?, gender=?, interests=?, interestsType=?, photoURL=?, characterTags=?, speakingStyle=?, voiceId=?, country=? WHERE id=? AND creatorId=? AND system=0 LIMIT 1`,
+                `UPDATE \`bots\` SET name=?, \`character\`=?, age=?, gender=?, interests=?, interestsType=?, photoURL=?, characterTags=?, speakingStyle=?, voiceId=?, country=?, rive_avatar=? WHERE id=? AND creatorId=? AND system=0 LIMIT 1`,
                 [
                     name,
                     character || '',
@@ -569,6 +619,7 @@ routes.post('/update-agent', middleware, async (req, res) => {
                     speakingStyle || '',
                     voiceId,
                     country || '',
+                    riveResolved,
                     agentId,
                     actorId
                 ]
@@ -588,7 +639,50 @@ routes.post('/update-agent', middleware, async (req, res) => {
         }
 
         if (sys === 1 || sys === 2) {
-            const upsertSql = `
+            const riveForCatalog = parseRiveAvatarFromBody(req.body, bot);
+            const hasRiveOverrideCol = await botCatalogOverridesHasRiveAvatarColumn();
+            let upsertSql;
+            let upsertParams;
+            if (hasRiveOverrideCol) {
+                upsertSql = `
+                INSERT INTO \`bot_catalog_overrides\`
+                (user_id, bot_id, name, \`character\`, age, gender, interests, interestsType, photoURL, characterTags, speakingStyle, voiceId, country, rive_avatar)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON DUPLICATE KEY UPDATE
+                name=VALUES(name),
+                \`character\`=VALUES(\`character\`),
+                age=VALUES(age),
+                gender=VALUES(gender),
+                interests=VALUES(interests),
+                interestsType=VALUES(interestsType),
+                photoURL=VALUES(photoURL),
+                characterTags=VALUES(characterTags),
+                speakingStyle=VALUES(speakingStyle),
+                voiceId=VALUES(voiceId),
+                country=VALUES(country),
+                rive_avatar=VALUES(rive_avatar)
+            `;
+                upsertParams = [
+                    actorId,
+                    Number(agentId),
+                    name,
+                    character || '',
+                    Number(age) || 18,
+                    gender || 'female',
+                    normalizedInterests,
+                    normalizedInterestsType,
+                    photoSerialized,
+                    normalizedCharacterTags,
+                    speakingStyle || '',
+                    voiceId,
+                    country || '',
+                    riveForCatalog
+                ];
+            } else {
+                console.warn(
+                    '[agents] update-agent katalog: `bot_catalog_overrides.rive_avatar` yok — scripts/sql/bot_catalog_overrides_add_rive_avatar.sql çalıştırın.'
+                );
+                upsertSql = `
                 INSERT INTO \`bot_catalog_overrides\`
                 (user_id, bot_id, name, \`character\`, age, gender, interests, interestsType, photoURL, characterTags, speakingStyle, voiceId, country)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -605,21 +699,23 @@ routes.post('/update-agent', middleware, async (req, res) => {
                 voiceId=VALUES(voiceId),
                 country=VALUES(country)
             `;
-            const ok = await query(upsertSql, [
-                actorId,
-                Number(agentId),
-                name,
-                character || '',
-                Number(age) || 18,
-                gender || 'female',
-                normalizedInterests,
-                normalizedInterestsType,
-                photoSerialized,
-                normalizedCharacterTags,
-                speakingStyle || '',
-                voiceId,
-                country || ''
-            ]);
+                upsertParams = [
+                    actorId,
+                    Number(agentId),
+                    name,
+                    character || '',
+                    Number(age) || 18,
+                    gender || 'female',
+                    normalizedInterests,
+                    normalizedInterestsType,
+                    photoSerialized,
+                    normalizedCharacterTags,
+                    speakingStyle || '',
+                    voiceId,
+                    country || ''
+                ];
+            }
+            const ok = await query(upsertSql, upsertParams);
             if (!ok) {
                 return res.status(500).json({
                     success: false,
