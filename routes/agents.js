@@ -264,6 +264,28 @@ async function fetchFriendCreateUserAgents(creatorId) {
     }
 }
 
+/** Kolon bir kez görülünce true kalır; yoksa her seferinde SHOW (migration sonrası restart gerekmez). */
+let _botsUserAgentOriginKnownTrue = false;
+
+async function botsHasUserAgentOriginColumn() {
+    if (_botsUserAgentOriginKnownTrue) {
+        return true;
+    }
+    try {
+        const r = await getQuery(
+            "SHOW COLUMNS FROM `bots` WHERE Field = 'user_agent_origin'"
+        );
+        const has = Array.isArray(r) && r.length > 0;
+        if (has) {
+            _botsUserAgentOriginKnownTrue = true;
+        }
+        return has;
+    } catch (e) {
+        console.warn('[agents] botsHasUserAgentOriginColumn check failed:', e?.message || e);
+        return false;
+    }
+}
+
 routes.post('/get-user-agents',middleware,async (req,res)=>{
     try {
         const gate = await assertJwtMatchesBodyOwner(req, 'get-user-agents');
@@ -412,15 +434,9 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
         const normalizedInterestsType = JSON.stringify(normalizeArrayLike(interestsType));
         const normalizedCharacterTags = JSON.stringify(normalizeArrayLike(characterTags));
 
-        // Insert: yalnızca "Arkadaş oluştur" — user_agent_origin = friend_create (get-user-agents ile uyum)
-        const insertQuery = `
-            INSERT INTO bots 
-            (name, \`character\`, age, gender, interests, interestsType, photoURL, 
-             characterTags, speakingStyle, voiceId, country, creatorId, system, user_agent_origin)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `;
+        const hasOriginCol = await botsHasUserAgentOriginColumn();
 
-        const values = [
+        const baseValues = [
             name,
             character || '',
             Number(age) || 18,
@@ -433,9 +449,31 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             voiceId,
             country || '',
             actorId,
-            0,
-            'friend_create'
+            0
         ];
+
+        let insertQuery;
+        let values;
+        if (hasOriginCol) {
+            insertQuery = `
+            INSERT INTO bots 
+            (name, \`character\`, age, gender, interests, interestsType, photoURL, 
+             characterTags, speakingStyle, voiceId, country, creatorId, system, user_agent_origin)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+            values = [...baseValues, 'friend_create'];
+        } else {
+            console.warn(
+                '[agents] create-custom-agent: `user_agent_origin` kolonu yok — eski INSERT kullanılıyor. `scripts/sql/bots_user_agent_origin.sql` çalıştırın.'
+            );
+            insertQuery = `
+            INSERT INTO bots 
+            (name, \`character\`, age, gender, interests, interestsType, photoURL, 
+             characterTags, speakingStyle, voiceId, country, creatorId, system)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+            values = baseValues;
+        }
 
         const result = await query(insertQuery, values);
 
