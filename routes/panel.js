@@ -3,6 +3,15 @@ const panelAuth = require('../middleware/panelAuth');
 const { getQuery, query } = require('../db');
 const { buildAnalysePayload } = require('./lib/panelAnalytics');
 const { rowToPanelUser, panelPatchToDbFields } = require('./lib/panelUserMapper');
+const {
+    listAgents,
+    listAgentsByOwner,
+    fetchAgentWithOwner,
+    createAgent,
+    updateAgent,
+    deleteAgent
+} = require('./lib/panelAgentService');
+const { agentTypeToSystem } = require('./lib/panelAgentMapper');
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
@@ -13,7 +22,8 @@ router.get('/health', (req, res) => {
     res.status(200).json({
         ok: true,
         service: 'friendfy-panel-api',
-        contractVersion: '2'
+        contractVersion: '2',
+        features: ['users', 'agents', 'analyse']
     });
 });
 
@@ -81,6 +91,113 @@ router.get('/users', async (req, res) => {
             ok: false,
             msg: 'Server error'
         });
+    }
+});
+
+router.get('/agents', async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+        const limit = Math.min(
+            MAX_LIMIT,
+            Math.max(1, parseInt(String(req.query.limit || DEFAULT_LIMIT), 10) || DEFAULT_LIMIT)
+        );
+        const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+        let system = req.query.system;
+        if (req.query.agentType) {
+            const mapped = agentTypeToSystem(req.query.agentType);
+            if (mapped !== undefined) system = mapped;
+        }
+        const ownerId = req.query.ownerId ?? req.query.creatorId ?? '';
+
+        const { agents, total } = await listAgents({
+            page,
+            limit,
+            search,
+            system,
+            ownerId: ownerId ? String(ownerId) : undefined
+        });
+
+        return res.status(200).json({
+            contractVersion: '2',
+            agents,
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages: total === 0 ? 0 : Math.ceil(total / limit)
+            }
+        });
+    } catch (error) {
+        console.error('panel GET /agents error:', error);
+        return res.status(500).json({ ok: false, msg: 'Server error' });
+    }
+});
+
+router.post('/agents', async (req, res) => {
+    try {
+        const result = await createAgent(req.body || {});
+        return res.status(result.status).json(result.json);
+    } catch (error) {
+        console.error('panel POST /agents error:', error);
+        return res.status(500).json({ ok: false, msg: 'Server error' });
+    }
+});
+
+router.get('/agents/:id', async (req, res) => {
+    try {
+        const agent = await fetchAgentWithOwner(req.params.id);
+        if (!agent) {
+            return res.status(404).json({ ok: false, msg: 'Agent not found' });
+        }
+        return res.status(200).json({ contractVersion: '2', agent });
+    } catch (error) {
+        console.error('panel GET /agents/:id error:', error);
+        return res.status(500).json({ ok: false, msg: 'Server error' });
+    }
+});
+
+router.patch('/agents/:id', async (req, res) => {
+    try {
+        const result = await updateAgent(req.params.id, req.body || {});
+        return res.status(result.status).json(result.json);
+    } catch (error) {
+        console.error('panel PATCH /agents/:id error:', error);
+        return res.status(500).json({ ok: false, msg: 'Server error' });
+    }
+});
+
+router.delete('/agents/:id', async (req, res) => {
+    try {
+        const result = await deleteAgent(req.params.id);
+        return res.status(result.status).json(result.json);
+    } catch (error) {
+        console.error('panel DELETE /agents/:id error:', error);
+        return res.status(500).json({ ok: false, msg: 'Server error' });
+    }
+});
+
+router.get('/users/:id/agents', async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+        const limit = Math.min(
+            MAX_LIMIT,
+            Math.max(1, parseInt(String(req.query.limit || DEFAULT_LIMIT), 10) || DEFAULT_LIMIT)
+        );
+        const { agents, total } = await listAgentsByOwner(req.params.id, { page, limit });
+        return res.status(200).json({
+            contractVersion: '2',
+            userId: String(req.params.id),
+            agents,
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages: total === 0 ? 0 : Math.ceil(total / limit)
+            }
+        });
+    } catch (error) {
+        console.error('panel GET /users/:id/agents error:', error);
+        return res.status(500).json({ ok: false, msg: 'Server error' });
     }
 });
 

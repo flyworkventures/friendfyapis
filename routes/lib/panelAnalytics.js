@@ -1,5 +1,6 @@
 const { getQuery } = require('../../db');
 const { PANEL_TIMEZONE } = require('./panelUserMapper');
+const { buildAgentsAnalyseSummary } = require('./panelAgentService');
 
 const DAILY_RANGE_DAYS = Math.min(
     90,
@@ -110,6 +111,7 @@ async function buildAnalysePayload() {
     const newUsersMap = await fetchNewUsersDaily(days);
     const activityMap = await fetchActivityDaily(days);
     const daily = buildDailySeries(newUsersMap, activityMap, days);
+    const agentsSummary = await buildAgentsAnalyseSummary();
 
     return {
         contractVersion: '2',
@@ -120,6 +122,7 @@ async function buildAnalysePayload() {
             loginsToday,
             newUsersToday
         },
+        agentsSummary,
         metricsNotes: {
             loginsToday:
                 'Bugün sohbet aktivitesi olan benzersiz kullanıcı (coversations.last_message_at / started_at). lastLogins dolu olsa bile bu metrik aktivite tabanlıdır.',
