@@ -277,14 +277,17 @@ async function deleteAgent(agentId) {
 }
 
 async function buildAgentsAnalyseSummary() {
-    const [totalRow] = await getQuery('SELECT COUNT(*) AS total FROM `bots`', []);
-    const [bySystem] = await getQuery(
+    const totalRows = await getQuery('SELECT COUNT(*) AS total FROM `bots`', []);
+    const totalRow = Array.isArray(totalRows) ? totalRows[0] : totalRows;
+
+    const bySystemRows = await getQuery(
         'SELECT system, COUNT(*) AS cnt FROM `bots` GROUP BY system',
         []
     );
+    const bySystemList = Array.isArray(bySystemRows) ? bySystemRows : bySystemRows ? [bySystemRows] : [];
 
     const byType = { custom: 0, catalog: 0, template: 0, unknown: 0 };
-    for (const r of bySystem || []) {
+    for (const r of bySystemList) {
         const s = Number(r.system);
         if (s === 0) byType.custom = Number(r.cnt) || 0;
         else if (s === 1) byType.catalog = Number(r.cnt) || 0;
@@ -294,7 +297,7 @@ async function buildAgentsAnalyseSummary() {
 
     let newAgentsToday = 0;
     if (await botsHasCreatedAtColumn()) {
-        const [todayRow] = await getQuery(
+        const todayRows = await getQuery(
             `
             SELECT COUNT(*) AS cnt FROM \`bots\`
             WHERE created_at IS NOT NULL
@@ -304,13 +307,15 @@ async function buildAgentsAnalyseSummary() {
             `,
             []
         );
+        const todayRow = Array.isArray(todayRows) ? todayRows[0] : todayRows;
         newAgentsToday = Number(todayRow?.cnt) || 0;
     }
 
-    const [ownedRow] = await getQuery(
+    const ownedRows = await getQuery(
         `SELECT COUNT(*) AS cnt FROM \`bots\` WHERE system = 0 AND creatorId IS NOT NULL AND creatorId != '0'`,
         []
     );
+    const ownedRow = Array.isArray(ownedRows) ? ownedRows[0] : ownedRows;
 
     return {
         totalAgents: Number(totalRow?.total) || 0,
