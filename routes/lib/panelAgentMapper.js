@@ -281,6 +281,26 @@ function validatePanelAgentCreate(body) {
         return { ok: false, msg: 'ownerId is required for custom agents' };
     }
 
+    const photos = toPhotoUrlArray(
+        body.photoURLs ?? body.photoURL ?? body.extras?.photoURLs
+    );
+    if (photos.length !== 3) {
+        return {
+            ok: false,
+            code: 'PHOTOS_COUNT_REQUIRED',
+            msg: 'Her karakterin tam 3 fotoğrafı olmalıdır'
+        };
+    }
+
+    const rive = body.riveAvatar ?? body.rive_avatar ?? body.extras?.riveAvatar;
+    if (!rive || String(rive).trim() === '') {
+        return {
+            ok: false,
+            code: 'RIVE_REQUIRED',
+            msg: 'Her karakter için Rive (riveAvatar) gerekir'
+        };
+    }
+
     return { ok: true, system: sys };
 }
 

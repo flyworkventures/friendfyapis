@@ -12,6 +12,65 @@ const {
     deleteAgent
 } = require('./lib/panelAgentService');
 const { agentTypeToSystem } = require('./lib/panelAgentMapper');
+const panelAgentUpload = require('../middleware/panelAgentUpload');
+const {
+    uploadPanelAgentAssets,
+    parsePanelAgentFormBody,
+    hasAnyUploadedFiles,
+    makeAgentUploadSlug,
+    mapUploadErrorToResponse,
+    assertCreateMultipartMedia,
+    assertAgentMediaComplete,
+    assertPatchMediaIfProvided
+} = require('./lib/panelAgentUploads');
+
+/** Panel karakter ekleme: dosyalar Bunny CDN'e yüklenir, DB'ye public URL yazılır. */
+async function prepareCreateAgentBody(req, body) {
+    assertCreateMultipartMedia(req.files);
+    const slug = makeAgentUploadSlug();
+    const assets = await uploadPanelAgentAssets(req.files, {
+        slug,
+        requireThreePhotos: true
+    });
+    body.photoURLs = assets.photoURLs;
+    body.riveAvatar = assets.riveAvatarUrl;
+    body.rive_avatar = assets.riveAvatarUrl;
+    assertAgentMediaComplete(body);
+    return body;
+}
+
+async function preparePatchAgentBody(req, body) {
+    assertPatchMediaIfProvided(body, req.files);
+    if (!hasAnyUploadedFiles(req.files)) {
+        return body;
+    }
+    const slug = makeAgentUploadSlug();
+    const assets = await uploadPanelAgentAssets(req.files, { slug });
+    if (assets.photoURLs.length) {
+        body.photoURLs = assets.photoURLs;
+    }
+    if (assets.riveAvatarUrl) {
+        body.riveAvatar = assets.riveAvatarUrl;
+        body.rive_avatar = assets.riveAvatarUrl;
+    }
+    if (body.photoURLs) {
+        assertAgentMediaComplete(body);
+    }
+    return body;
+}
+
+function runPanelAgentUpload(req, res, next) {
+    panelAgentUpload(req, res, (err) => {
+        if (err) {
+            return res.status(400).json({
+                ok: false,
+                code: 'MULTIPART_ERROR',
+                msg: err.message
+            });
+        }
+        return next();
+    });
+}
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
@@ -133,12 +192,18 @@ router.get('/agents', async (req, res) => {
     }
 });
 
-router.post('/agents', async (req, res) => {
+router.post('/agents', runPanelAgentUpload, async (req, res) => {
     try {
-        const result = await createAgent(req.body || {});
+        let body = parsePanelAgentFormBody(req);
+        body = await prepareCreateAgentBody(req, body);
+        const result = await createAgent(body);
         return res.status(result.status).json(result.json);
     } catch (error) {
         console.error('panel POST /agents error:', error);
+        if (error?.code) {
+            const mapped = mapUploadErrorToResponse(error);
+            return res.status(mapped.status).json(mapped.json);
+        }
         return res.status(500).json({ ok: false, msg: 'Server error' });
     }
 });
@@ -156,12 +221,18 @@ router.get('/agents/:id', async (req, res) => {
     }
 });
 
-router.patch('/agents/:id', async (req, res) => {
+router.patch('/agents/:id', runPanelAgentUpload, async (req, res) => {
     try {
-        const result = await updateAgent(req.params.id, req.body || {});
+        let body = parsePanelAgentFormBody(req);
+        body = await preparePatchAgentBody(req, body);
+        const result = await updateAgent(req.params.id, body);
         return res.status(result.status).json(result.json);
     } catch (error) {
         console.error('panel PATCH /agents/:id error:', error);
+        if (error?.code) {
+            const mapped = mapUploadErrorToResponse(error);
+            return res.status(mapped.status).json(mapped.json);
+        }
         return res.status(500).json({ ok: false, msg: 'Server error' });
     }
 });

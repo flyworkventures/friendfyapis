@@ -126,7 +126,15 @@ async function listAgentsByOwner(userId, { page, limit }) {
 async function createAgent(body) {
     const validation = validatePanelAgentCreate(body);
     if (!validation.ok) {
-        return { ok: false, status: 400, json: { ok: false, msg: validation.msg } };
+        return {
+            ok: false,
+            status: 400,
+            json: {
+                ok: false,
+                msg: validation.msg,
+                code: validation.code || 'VALIDATION_ERROR'
+            }
+        };
     }
 
     const mapped = panelAgentBodyToDb(
