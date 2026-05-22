@@ -104,25 +104,60 @@ router.post('/signup', [
             }
             console.log("Parsed User: ", parsedUser);
 
-            const userEmail = parsedUser.email || email;
+            // Apple kullanıcısı bazen email yollamayabilir; userIdentifier'ı
+            // var → privaterelay pattern'iyle synthesize edip kullanıyoruz.
+            const appleUid =
+                parsedUser.appleUserIdentifier || parsedUser.userIdentifier || null;
+            const appleToken = parsedUser.appleToken || null;
+            let userEmail = parsedUser.email || email;
+            if (!userEmail && credential === 'apple' && appleUid) {
+                userEmail = `${appleUid}@privaterelay.appleid.com`;
+            }
             if (!userEmail) {
                 return res.status(400).json({ msg: "Email is required for social signup" });
             }
 
-            const existingUser = await getQuery("SELECT * FROM `users` WHERE email = ?", [userEmail]);
+            // Mevcut kullanıcıyı önce appleUserIdentifier (varsa), sonra email
+            // ile ara. Apple "Hide my email"den private'a, sonra yine de
+            // userIdentifier üzerinden bulunabilsin.
+            let existingUser = [];
+            if (credential === 'apple' && appleUid) {
+                existingUser = await getQuery(
+                    "SELECT * FROM `users` WHERE appleUserIdentifier = ? LIMIT 1",
+                    [appleUid]
+                );
+            }
+            if (existingUser.length === 0) {
+                existingUser = await getQuery(
+                    "SELECT * FROM `users` WHERE email = ? LIMIT 1",
+                    [userEmail]
+                );
+            }
             if (existingUser.length > 0) {
                 const u = existingUser[0];
                 const token = signAccessTokenForUser(u);
                 const refreshToken = signRefreshTokenForUser(u);
+                // Apple userIdentifier'ı eskiden boştuysa şimdi senkronla.
+                if (credential === 'apple' && appleUid && !u.appleUserIdentifier) {
+                    try {
+                        await query(
+                            'UPDATE `users` SET appleUserIdentifier = ?, appleToken = COALESCE(?, appleToken) WHERE id = ?',
+                            [appleUid, appleToken, u.id]
+                        );
+                    } catch (e) {
+                        console.warn('[signup] backfill appleUserIdentifier failed:', e.message);
+                    }
+                }
                 return res.json({ token, refreshToken });
             }
 
             const birthdate = formatDateForMySQL(parsedUser.birthdate);
             const hashedPassword = null; // Social users local password kullanmaz
 
+            const signupUsername = String(parsedUser.username || '').trim().slice(0, 20);
             await query(
-                "INSERT INTO `users` (`username`, `email`, `password`, `token`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `country`, `gender` , `birthdate`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-                [parsedUser.username,userEmail, hashedPassword, null,  null, null, "1", credential, null, null, null,parsedUser.counrty || null,parsedUser.gender  , birthdate ]
+                "INSERT INTO `users` (`username`, `email`, `password`, `token`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `country`, `gender` , `birthdate`, `appleUserIdentifier`, `appleToken`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                [signupUsername,userEmail, hashedPassword, null,  null, null, "1", credential, null, null, null,parsedUser.counrty || null,parsedUser.gender  , birthdate, appleUid, appleToken]
             );
 
             const insertedRows = await getQuery('SELECT id, email FROM `users` WHERE email = ? LIMIT 1', [userEmail]);
@@ -130,7 +165,7 @@ router.post('/signup', [
             const token = signAccessTokenForUser(newUser);
             const refreshToken = signRefreshTokenForUser(newUser);
             return res.json({ token, refreshToken });
-           
+
         } catch (err) {
             console.error(err);
             return res.status(500).json({ msg: "Server error" });
@@ -457,36 +492,94 @@ if (sqlQuery.length === 0) {
 
 
 
-router.post('/check-mail', async(req,res)=>{
-   const  {email} = req.body;
-       let sqlQuery = await getQuery("SELECT * FROM `users` WHERE email = ?", [email]);
+router.post('/check-mail', async (req, res) => {
+    const { email, appleUserIdentifier } = req.body;
 
-        if (sqlQuery.length > 0) {
+    // Apple login akışı: subsequent login'lerde Apple email yollamaz,
+    // sadece stabil `userIdentifier` döner. Bu yüzden lookup'ı önce
+    // appleUserIdentifier üzerinden yapıyoruz, sonra email'e düşüyoruz.
+    if (!email && !appleUserIdentifier) {
+        return res.status(400).json({ msg: 'Email or appleUserIdentifier is required' });
+    }
 
-            res.status(400).json({
-                "msg": "User exists",
-                "model": sqlQuery
-            })
-
-        }else{
-          res.status(200).json({
-            "msg": "Avaible"
-          })
+    let sqlQuery = [];
+    if (appleUserIdentifier) {
+        sqlQuery = await getQuery(
+            'SELECT * FROM `users` WHERE appleUserIdentifier = ? LIMIT 1',
+            [appleUserIdentifier]
+        );
+        // Eski Apple kullanıcısı; userIdentifier ile kayıtlı değilse
+        // privaterelay email pattern'inden de bul (geriye dönük uyum).
+        if (sqlQuery.length === 0) {
+            const fallbackEmail = `${appleUserIdentifier}@privaterelay.appleid.com`;
+            sqlQuery = await getQuery(
+                'SELECT * FROM `users` WHERE email = ? LIMIT 1',
+                [fallbackEmail]
+            );
+            // Bulunduysa appleUserIdentifier'ı senkronlayalım ki sonraki
+            // login'ler direkt eşleşsin.
+            if (sqlQuery.length > 0) {
+                try {
+                    await query(
+                        'UPDATE `users` SET appleUserIdentifier = ? WHERE id = ?',
+                        [appleUserIdentifier, sqlQuery[0].id]
+                    );
+                } catch (e) {
+                    console.warn('[check-mail] backfill appleUserIdentifier failed:', e.message);
+                }
+            }
         }
-})
+    } else if (email) {
+        sqlQuery = await getQuery(
+            'SELECT * FROM `users` WHERE email = ? LIMIT 1',
+            [email]
+        );
+    }
+
+    if (sqlQuery.length > 0) {
+        const u = sqlQuery[0];
+        const token = signAccessTokenForUser(u);
+        const refreshToken = signRefreshTokenForUser(u);
+
+        if (token && refreshToken) {
+            await query(
+                'UPDATE `users` SET token = ?, refreshToken = ? WHERE id = ?',
+                [token, refreshToken, u.id]
+            );
+        }
+
+        const userRow = { ...u, token, refreshToken };
+
+        return res.status(400).json({
+            msg: 'User exists',
+            model: [userRow],
+            token,
+            refreshToken,
+        });
+    }
+
+    return res.status(200).json({
+        msg: 'Avaible',
+    });
+});
 
 
 const middleware = require('../middleware/checkAuth');
 
 router.post('/update-profile', middleware, async (req, res) => {
     try {
-        const { userId, username, photoURL } = req.body;
+        const { userId, username, photoURL, birthdate, gender } = req.body;
 
         if (!userId) {
             return res.status(400).json({
                 msg: "User ID is required",
                 success: false
             });
+        }
+
+        const authCheck = assertJwtMatchesUserId(req, userId);
+        if (!authCheck.ok) {
+            return res.status(authCheck.status).json(authCheck.json);
         }
 
         // Kullanıcının var olup olmadığını kontrol et
@@ -505,13 +598,52 @@ router.post('/update-profile', middleware, async (req, res) => {
         let updateFields = [];
 
         if (username !== undefined && username !== null) {
+            const trimmed = String(username).trim();
+            if (trimmed.length > 20) {
+                return res.status(400).json({
+                    msg: "Username must be at most 20 characters",
+                    success: false,
+                    code: "USERNAME_TOO_LONG"
+                });
+            }
             updateFields.push("username = ?");
-            updateValues.push(username);
+            updateValues.push(trimmed);
         }
 
         if (photoURL !== undefined && photoURL !== null) {
             updateFields.push("photoURL = ?");
             updateValues.push(photoURL);
+        }
+
+        if (birthdate !== undefined && birthdate !== null) {
+            const parsedBirthdate = new Date(birthdate);
+            if (Number.isNaN(parsedBirthdate.getTime())) {
+                return res.status(400).json({
+                    msg: "Invalid birthdate",
+                    success: false,
+                    code: "INVALID_BIRTHDATE"
+                });
+            }
+            updateFields.push("birthdate = ?");
+            updateValues.push(formatDateForMySQL(birthdate));
+        }
+
+        if (gender !== undefined) {
+            if (gender === null) {
+                updateFields.push("gender = ?");
+                updateValues.push(null);
+            } else {
+                const normalizedGender = String(gender).trim().toLowerCase();
+                if (!['male', 'female'].includes(normalizedGender)) {
+                    return res.status(400).json({
+                        msg: "Invalid gender",
+                        success: false,
+                        code: "INVALID_GENDER"
+                    });
+                }
+                updateFields.push("gender = ?");
+                updateValues.push(normalizedGender);
+            }
         }
 
         if (updateFields.length === 0) {
@@ -529,11 +661,20 @@ router.post('/update-profile', middleware, async (req, res) => {
 
         // Güncellenmiş kullanıcı bilgilerini al
         const updatedUser = await getQuery("SELECT * FROM `users` WHERE id = ?", [userId]);
+        const row = updatedUser[0];
 
         return res.status(200).json({
             msg: "Profile updated successfully",
             success: true,
-            user: updatedUser[0]
+            user: {
+                ...row,
+                birthdate: row.birthdate
+                    ? new Date(row.birthdate).toISOString()
+                    : null,
+                accountCreatedDate: row.accountCreatedDate
+                    ? new Date(row.accountCreatedDate).toISOString()
+                    : row.accountCreatedDate,
+            }
         });
 
     } catch (error) {

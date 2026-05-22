@@ -4,6 +4,12 @@ const { getQuery , query} = require('../db')
 const axios = require('axios')
 const multer = require('multer');
 const FormData  = require("form-data");
+const {
+  generateCharacterTextReply,
+  generateCharacterVoiceReply,
+  generateCharacterImageReply,
+  sanitizeReplyText
+} = require('./lib/chatReplyService');
 
 /** Metin/OpenAI cevap üretimi (PDF vb.) — sesli/görüntülü ile aynı yaş ve yetişkin ton politikası */
 const RESPONSE_GENERATION_ADULT_POLICY =
@@ -73,9 +79,14 @@ router.post('/get-conversations', middleware, async (req, res) => {
   try {
     const { userId } = req.body;
 
-    // 1️⃣ Kullanıcının tüm conversation kayıtlarını al (tarihe göre sıralı - en yeni önce)
+    // Yalnızca en az bir mesajı olan sohbetler (boş create-chat kayıtları listelenmez)
     const convData = await getQuery(
-      "SELECT * FROM `coversations` WHERE userId = ? ORDER BY COALESCE(last_message_at, started_at, id) DESC", 
+      `SELECT c.* FROM \`coversations\` c
+       WHERE c.userId = ?
+         AND EXISTS (
+           SELECT 1 FROM \`messages\` m WHERE m.conversationId = c.id LIMIT 1
+         )
+       ORDER BY COALESCE(c.last_message_at, c.started_at, c.id) DESC`,
       [userId]
     );
 
@@ -117,9 +128,13 @@ router.post('/search-conversations', middleware, async (req, res) => {
 
     const searchTerm = `%${searchQuery}%`;
 
-    // 1️⃣ Kullanıcının conversation kayıtlarını al
     const convData = await getQuery(
-      "SELECT * FROM `coversations` WHERE userId = ? ORDER BY COALESCE(last_message_at, started_at, id) DESC", 
+      `SELECT c.* FROM \`coversations\` c
+       WHERE c.userId = ?
+         AND EXISTS (
+           SELECT 1 FROM \`messages\` m WHERE m.conversationId = c.id LIMIT 1
+         )
+       ORDER BY COALESCE(c.last_message_at, c.started_at, c.id) DESC`,
       [userId]
     );
 
@@ -203,19 +218,10 @@ router.post('/send-message',middleware,async (req,res)=>{
       });
     }
 
-    if (sender === 'user') {
-      try {
-        await axios.post("https://n8n.srv1548849.hstgr.cloud/webhook/start-chat", {
-          sender: "user",
-          message: message,
-          conversation: conversationId,
-          messageType: resolvedType
-        }, {
-          timeout: 15000
-        });
-      } catch (webhookError) {
-        console.error("send-message webhook error:", webhookError?.message || webhookError);
-      }
+    if (sender === 'user' && resolvedType === 'text') {
+      generateCharacterTextReply(conversationId).catch((err) => {
+        console.error('[send-message] character reply error:', err?.message || err);
+      });
     }
 
     return res.status(200).json({
@@ -294,7 +300,9 @@ async function analyzePdfAndReply(conversationId, rawMessage) {
     }
   );
 
-  const aiReply = openaiResp.data?.choices?.[0]?.message?.content || '';
+  const aiReply = sanitizeReplyText(
+    openaiResp.data?.choices?.[0]?.message?.content || ''
+  );
   if (!aiReply) {
     console.error('[analyzePdf] OpenAI boş yanıt döndü');
     return;
@@ -426,20 +434,12 @@ router.post('/send-audio-message', upload.single('file'), async (req, res) => {
 
     console.log('🗣️ ElevenLabs sonucu:', text);
 
-    // 🔁 6. Webhook’a sonucu gönder
-    await axios.post(
-      'https://n8n.srv1548849.hstgr.cloud/webhook/voice-message',
-      {
-        voiceText: text,
-        conversationId: conversation,
-        sender: 'user',
-      },
-      {
-        headers: { 'Content-Type': 'application/json' },
-      }
-    );
+    if (text.trim()) {
+      generateCharacterVoiceReply(conversation).catch((err) => {
+        console.error('[send-audio-message] character reply error:', err?.message || err);
+      });
+    }
 
-    // 🟢 7. API cevabı
     res.json({
       success: true,
       transcribedText: text,
@@ -563,55 +563,33 @@ router.post('/send-image-message', middleware, upload.fields([
       });
     }
 
-    let webhookMessage = '';
-    let webhookDate = null;
-    const webhookPayloadCore = {
-      conversationId,
-      sender,
-      imageURL: cdnFileUrl,
-      message: textMessage,
-      userMessageID: insertedId
-    };
-    // n8n akislari farkli parser kullandigi icin alanlari hem root'ta hem body icinde gonder.
-    const webhookPayload = {
-      ...webhookPayloadCore,
-      body: webhookPayloadCore
-    };
-
-    let webhookResponse;
+    let aiExplanation = '';
     try {
-      webhookResponse = await axios.post(
-        'https://n8n.srv1548849.hstgr.cloud/webhook/image-message',
-        webhookPayload,
-        {
-          headers: { 'Content-Type': 'application/json' },
-          timeout: 20000
-        }
-      );
-    } catch (webhookError) {
-      console.error('send-image-message webhook error:', {
+      aiExplanation =
+        (await generateCharacterImageReply(
+          conversationId,
+          cdnFileUrl,
+          textMessage,
+          insertedId
+        )) || '';
+    } catch (aiError) {
+      console.error('send-image-message ai reply error:', {
         requestId,
-        message: webhookError?.message || 'unknown',
-        status: webhookError?.response?.status || null,
-        data: webhookError?.response?.data || null,
-        payload: webhookPayload
+        message: aiError?.message || 'unknown'
       });
       return res.status(502).json({
         success: false,
-        error: 'WEBHOOK_FAILED',
-        message: 'Image uploaded but webhook call failed',
+        error: 'AI_REPLY_FAILED',
+        message: 'Image uploaded but character reply failed',
         requestId
       });
     }
 
-    webhookMessage = String(webhookResponse?.data?.message || '');
-    webhookDate = webhookResponse?.data?.date || null;
-
     const enrichedPayload = JSON.stringify({
       imageURL: cdnFileUrl,
       message: textMessage,
-      aiExplanation: webhookMessage,
-      date: webhookDate
+      aiExplanation,
+      date: new Date().toISOString()
     });
     await getQuery(
       'UPDATE `messages` SET `message` = ? WHERE `id` = ? LIMIT 1',

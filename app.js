@@ -11,6 +11,7 @@ const panel = require('./routes/panel')
 const voices = require('./routes/voices')
 const { createVoiceGateway, isVoiceStreamingEnabled } = require('./voice/voiceGateway')
 const { createVideoGateway, isVideoCallEnabled } = require('./voice/videoGateway')
+const VoiceChatServerV2 = require('./realtime/voiceChatServerV2')
 const { createVisemeRouter } = require('./voice/viseme')
 const requestLogger = require('./middleware/requestLogger')
 const app = express();
@@ -42,6 +43,15 @@ if (isVoiceStreamingEnabled()) {
 if (isVideoCallEnabled()) {
     createVideoGateway(server);
     console.log('Video call gateway active at /ws/video');
+}
+
+const realtimeEnabled =
+    String(process.env.REALTIME_V2_ENABLED || 'true').toLowerCase() === 'true';
+if (realtimeEnabled) {
+    const wsPath = process.env.REALTIME_WS_PATH || '/realtime';
+    const voiceChatServer = new VoiceChatServerV2();
+    voiceChatServer.start({ server, path: wsPath });
+    console.log(`Realtime voice chat v2 active at ${wsPath}`);
 }
 
 server.listen(PORT,()=>{

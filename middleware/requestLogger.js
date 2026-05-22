@@ -19,13 +19,19 @@ module.exports = function requestLogger(req, res, next) {
     refreshPreview: maskToken(refreshHeader)
   };
 
-  console.log(`[API] request`, reqInfo);
+  const path = req.originalUrl || req.url || '';
+  const isListenPoll = path.includes('/chat/listen-messages');
+
+  if (!isListenPoll) {
+    console.log(`[API] request`, reqInfo);
+  }
 
   res.on('finish', () => {
+    if (isListenPoll) return;
     const elapsedMs = Date.now() - startedAt;
     console.log(`[API] response`, {
       method: req.method,
-      path: req.originalUrl || req.url,
+      path,
       status: res.statusCode,
       elapsedMs
     });

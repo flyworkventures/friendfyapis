@@ -1,6 +1,7 @@
 const routes = require('express').Router();
 const middleware = require('../middleware/checkAuth')
 const { getQuery , query} = require('../db')
+const { normalizeLang, localizeAgents, localizeAgentRow } = require('./lib/agentLocalization');
 
 function toPhotoUrlArray(rawValue) {
     if (Array.isArray(rawValue)) {
@@ -32,6 +33,23 @@ function attachPhotoUrls(agent) {
         ...agent,
         photoURLs
     };
+}
+
+const MAX_AGENT_NAME_LENGTH = 20;
+
+function parseAgentName(name) {
+    const trimmed = String(name || '').trim();
+    if (!trimmed) {
+        return { ok: false, code: 'NAME_REQUIRED', msg: 'name is required' };
+    }
+    if (trimmed.length > MAX_AGENT_NAME_LENGTH) {
+        return {
+            ok: false,
+            code: 'NAME_TOO_LONG',
+            msg: `name must be at most ${MAX_AGENT_NAME_LENGTH} characters`
+        };
+    }
+    return { ok: true, value: trimmed };
 }
 
 function serializePhotoUrlsFromBody(body) {
@@ -341,13 +359,16 @@ routes.post('/get-user-agents',middleware,async (req,res)=>{
         }
         const userId = gate.jwtUserId;
 
+        const lang = normalizeLang(req.body?.lang);
         const userAgents = await fetchFriendCreateUserAgents(userId);
         
         if (userAgents.length === 0) {
             return res.status(200).json([]);
         }
         
-        return res.status(200).json(userAgents.map(attachPhotoUrls));
+        const withPhotos = userAgents.map(attachPhotoUrls);
+        const localized = await localizeAgents(withPhotos, lang);
+        return res.status(200).json(localized);
         
     } catch (error) {
         console.log("Error getting user agents:", error);
@@ -363,6 +384,7 @@ routes.post('/get-user-agents',middleware,async (req,res)=>{
 
 routes.post('/get-system-agents', middleware, async (req, res) => {
     try {
+        const lang = normalizeLang(req.body?.lang);
         const agents = await getQuery('SELECT * FROM `bots` WHERE system IN (1, 2)', []);
         const userId = await resolveJwtSubjectUserId(req);
         const overridesMap = await loadCatalogOverridesMap(userId);
@@ -371,7 +393,8 @@ routes.post('/get-system-agents', middleware, async (req, res) => {
             const row = o ? applyCatalogOverride(a, o) : a;
             return attachPhotoUrls(row);
         });
-        return res.status(200).json(merged);
+        const localized = await localizeAgents(merged, lang);
+        return res.status(200).json(localized);
     } catch (error) {
         console.log('get-system-agents error:', error);
         return res.status(500).json({
@@ -413,6 +436,7 @@ routes.post('/get-random-template-agent', middleware, async (req, res) => {
 routes.post('/get-agent-data', middleware, async (req, res) => {
     try {
         const { id } = req.body;
+        const lang = normalizeLang(req.body?.lang);
         const agents = await getQuery(
             'SELECT * FROM `bots` WHERE id = ? AND system != 2',
             [id]
@@ -431,9 +455,13 @@ routes.post('/get-agent-data', middleware, async (req, res) => {
             const o = map.get(Number(row.id));
             if (o) row = applyCatalogOverride(row, o);
         }
+        const enableTranslate = process.env.AGENT_TRANSLATE_ON_FETCH === 'true';
+        row = await localizeAgentRow(attachPhotoUrls(row), lang, {
+            translate: enableTranslate
+        });
         return res.status(200).json({
             success: true,
-            agent: attachPhotoUrls(row)
+            agent: row
         });
     } catch (error) {
         console.log(error);
@@ -468,12 +496,20 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             country
         } = req.body;
 
-        // Validate required fields
-        if (!name || !voiceId) {
+        if (!voiceId) {
             return res.status(400).json({
                 success: false,
                 code: "INVALID_PAYLOAD",
                 msg: "name and voiceId are required (ownerId or userId must match JWT)"
+            });
+        }
+
+        const parsedName = parseAgentName(name);
+        if (!parsedName.ok) {
+            return res.status(400).json({
+                success: false,
+                code: parsedName.code,
+                msg: parsedName.msg
             });
         }
 
@@ -485,7 +521,7 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
         const riveVal = parseRiveAvatarFromBody(req.body, null);
 
         const baseValues = [
-            name,
+            parsedName.value,
             character || '',
             Number(age) || 18,
             gender || 'female',
@@ -603,12 +639,25 @@ routes.post('/update-agent', middleware, async (req, res) => {
         const photoSerialized = serializePhotoUrlsFromBody({ photoURL, photoURLs });
         const riveResolved = parseRiveAvatarFromBody(req.body, bot);
 
+        let resolvedName = bot.name;
+        if (name !== undefined && name !== null) {
+            const parsedName = parseAgentName(name);
+            if (!parsedName.ok) {
+                return res.status(400).json({
+                    success: false,
+                    code: parsedName.code,
+                    msg: parsedName.msg
+                });
+            }
+            resolvedName = parsedName.value;
+        }
+
         // Kendi custom agent (system=0): yalnızca şu anki kullanıcı (JWT) sahibi olmalı — şablon creatorId ile ilgisi yok
         if (sys === 0 && normalizeAgentUserId(bot.creatorId) === actorId) {
             const ok = await query(
                 `UPDATE \`bots\` SET name=?, \`character\`=?, age=?, gender=?, interests=?, interestsType=?, photoURL=?, characterTags=?, speakingStyle=?, voiceId=?, country=?, rive_avatar=? WHERE id=? AND creatorId=? AND system=0 LIMIT 1`,
                 [
-                    name,
+                    resolvedName,
                     character || '',
                     Number(age) || 18,
                     gender || 'female',
@@ -665,7 +714,7 @@ routes.post('/update-agent', middleware, async (req, res) => {
                 upsertParams = [
                     actorId,
                     Number(agentId),
-                    name,
+                    resolvedName,
                     character || '',
                     Number(age) || 18,
                     gender || 'female',
@@ -702,7 +751,7 @@ routes.post('/update-agent', middleware, async (req, res) => {
                 upsertParams = [
                     actorId,
                     Number(agentId),
-                    name,
+                    resolvedName,
                     character || '',
                     Number(age) || 18,
                     gender || 'female',
@@ -755,6 +804,7 @@ routes.post('/update-agent', middleware, async (req, res) => {
 // Son 15 gün içerisinde eklenen botları çeker
 routes.post('/get-recent-bots', middleware, async (req, res) => {
     try {
+        const lang = normalizeLang(req.body?.lang);
         // Son 15 günün tarihini hesapla
         const fifteenDaysAgo = new Date();
         fifteenDaysAgo.setDate(fifteenDaysAgo.getDate() - 15);
@@ -774,12 +824,15 @@ routes.post('/get-recent-bots', middleware, async (req, res) => {
                 "data": []
             });
         }
+
+        const withPhotos = recentBots.map(attachPhotoUrls);
+        const localized = await localizeAgents(withPhotos, lang);
         
         return res.status(200).json({
             "msg": "Son 15 günde eklenen botlar başarıyla getirildi",
             "success": true,
-            "count": recentBots.length,
-            "data": recentBots.map(attachPhotoUrls)
+            "count": localized.length,
+            "data": localized
         });
         
     } catch (error) {

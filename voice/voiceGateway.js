@@ -607,7 +607,14 @@ async function handleEvent(ws, context, message) {
   }
 
   if (type === 'session.start') {
-    await initializeSession(context, payload);
+    try {
+      await initializeSession(context, payload);
+    } catch (error) {
+      console.error(
+        `[VOICE] session.start failed | userId=${context.userId || 'unknown'} message=${error?.message || error}`
+      );
+      throw error;
+    }
     console.log(
       `[VOICE] session.start connected | userId=${context.session.userId} sessionId=${context.session.sessionId} conversationId=${context.session.conversationId || 'null'} transport=${context.session.transport} language=${context.session.language}`
     );
@@ -838,6 +845,11 @@ function createVoiceGateway(httpServer) {
       let parsed = null;
       try {
         parsed = parseMessage(raw);
+        if (parsed?.type === 'session.start') {
+          console.log(
+            `[VOICE] <- session.start | userId=${context.userId || 'unknown'} sessionId=${parsed.payload?.sessionId || 'n/a'} conversationId=${parsed.payload?.conversationId || 'n/a'}`
+          );
+        }
         voiceDebugLog(`event received | type=${parsed?.type || 'unknown'} requestId=${parsed?.requestId || 'null'}`);
         await handleEvent(ws, context, parsed);
       } catch (error) {
