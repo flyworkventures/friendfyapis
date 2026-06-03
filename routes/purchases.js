@@ -12,6 +12,10 @@ const {
     DEVICE_TRIAL_PRODUCT_ID
 } = require('./lib/membershipsSync');
 const { assertJwtMatchesUserId, normalizeUserId } = require('./lib/assertJwtUserId');
+const {
+    pickRevenueCatCustomerId,
+    persistRevenueCatCustomerId
+} = require('./lib/revenuecatCustomerLink');
 
 router.post('/claim-free-trial', middleware, async (req, res) => {
     try {
@@ -208,6 +212,11 @@ router.post('/sync-memberships', middleware, async (req, res) => {
             JSON.stringify(merged),
             userId
         ]);
+
+        const rcCustomerId = pickRevenueCatCustomerId(req.body);
+        if (rcCustomerId) {
+            await persistRevenueCatCustomerId(userId, rcCustomerId);
+        }
 
         const updatedUser = await getQuery('SELECT * FROM `users` WHERE id = ?', [userId]);
 
