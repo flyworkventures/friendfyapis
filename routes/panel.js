@@ -115,10 +115,11 @@ router.get('/users', async (req, res) => {
         const listParams = [];
 
         if (search) {
-            whereSql = ' WHERE email LIKE ? OR username LIKE ? OR phoneNumber LIKE ? OR CAST(id AS CHAR) LIKE ? ';
+            whereSql =
+                ' WHERE email LIKE ? OR username LIKE ? OR phoneNumber LIKE ? OR CAST(id AS CHAR) LIKE ? OR appleUserIdentifier LIKE ? ';
             const like = `%${search}%`;
-            countParams.push(like, like, like, like);
-            listParams.push(like, like, like, like);
+            countParams.push(like, like, like, like, like);
+            listParams.push(like, like, like, like, like);
         }
 
         const [countRow] = await getQuery(
@@ -151,6 +152,79 @@ router.get('/users', async (req, res) => {
             ok: false,
             msg: 'Server error'
         });
+    }
+});
+
+/** RevenueCat müşteri kimliğini uygulama kullanıcısıyla eşleştirir. */
+router.get('/users/resolve-rc', async (req, res) => {
+    try {
+        const customerId =
+            typeof req.query.customerId === 'string' ? req.query.customerId.trim() : '';
+        if (!customerId) {
+            return res.status(400).json({ ok: false, msg: 'customerId gerekli' });
+        }
+
+        const candidates = [];
+
+        if (/^\d+$/.test(customerId)) {
+            const byId = await getQuery('SELECT * FROM `users` WHERE id = ? LIMIT 1', [
+                Number(customerId)
+            ]);
+            if (byId?.[0]) candidates.push(byId[0]);
+        }
+
+        if (!candidates.length) {
+            const byApple = await getQuery(
+                'SELECT * FROM `users` WHERE appleUserIdentifier = ? LIMIT 1',
+                [customerId]
+            );
+            if (byApple?.[0]) candidates.push(byApple[0]);
+        }
+
+        const aliasIds = Array.isArray(req.query.aliasIds)
+            ? req.query.aliasIds
+            : typeof req.query.aliasIds === 'string'
+              ? req.query.aliasIds.split(',').map((s) => s.trim()).filter(Boolean)
+              : [];
+
+        for (const aliasId of aliasIds) {
+            if (!/^\d+$/.test(aliasId)) continue;
+            const rows = await getQuery('SELECT * FROM `users` WHERE id = ? LIMIT 1', [
+                Number(aliasId)
+            ]);
+            if (rows?.[0] && !candidates.some((r) => r.id === rows[0].id)) {
+                candidates.push(rows[0]);
+            }
+        }
+
+        const email =
+            typeof req.query.email === 'string' ? req.query.email.trim() : '';
+        if (email && !candidates.length) {
+            const byEmail = await getQuery(
+                'SELECT * FROM `users` WHERE email = ? LIMIT 1',
+                [email]
+            );
+            if (byEmail?.[0]) candidates.push(byEmail[0]);
+        }
+
+        const user = candidates[0] ? rowToPanelUser(candidates[0]) : null;
+        return res.status(200).json({
+            contractVersion: '2',
+            matched: Boolean(user),
+            user,
+            matchStrategy: user
+                ? /^\d+$/.test(customerId) && String(user.id) === customerId
+                    ? 'user_id'
+                    : user.providerId === customerId
+                      ? 'apple_user_identifier'
+                      : email && user.email === email
+                        ? 'email'
+                        : 'alias_or_lookup'
+                : null
+        });
+    } catch (error) {
+        console.error('panel GET /users/resolve-rc error:', error);
+        return res.status(500).json({ ok: false, msg: 'Server error' });
     }
 });
 
