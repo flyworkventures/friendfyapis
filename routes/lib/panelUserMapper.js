@@ -91,6 +91,18 @@ function parseMembershipsSummary(raw) {
     };
 }
 
+function computeAgeFromBirthdate(birthdate) {
+    const d = toDateOrNull(birthdate);
+    if (!d) return null;
+    const now = new Date();
+    let age = now.getFullYear() - d.getFullYear();
+    const monthDiff = now.getMonth() - d.getMonth();
+    if (monthDiff < 0 || (monthDiff === 0 && now.getDate() < d.getDate())) {
+        age -= 1;
+    }
+    return age >= 0 ? age : null;
+}
+
 /**
  * DB users satırı → App Panel v2 PanelUser
  * @param {Record<string, unknown>} row
@@ -102,6 +114,8 @@ function rowToPanelUser(row) {
 
     const email = row.email != null ? String(row.email) : null;
     const country = row.country ?? row.counrty ?? null;
+    const membershipsSummary = parseMembershipsSummary(row.memberships);
+    const birthIso = row.birthdate ? toDateOrNull(row.birthdate)?.toISOString() ?? null : null;
 
     return {
         id,
@@ -118,13 +132,15 @@ function rowToPanelUser(row) {
             verificated: row.verificated ?? null,
             gender: row.gender ?? null,
             country: country != null ? String(country) : null,
-            birthdate: row.birthdate
-                ? toDateOrNull(row.birthdate)?.toISOString() ?? null
-                : null,
+            nativeLang: country != null ? String(country) : null,
+            birthdate: birthIso,
+            age: computeAgeFromBirthdate(row.birthdate),
             photoURL: row.photoURL ?? null,
             hobbies: row.hobbies ?? null,
             isGuest: isGuestEmail(email),
-            membershipsSummary: parseMembershipsSummary(row.memberships)
+            isPremium: Boolean(membershipsSummary?.activeCount),
+            providerId: row.appleUserIdentifier != null ? String(row.appleUserIdentifier) : null,
+            membershipsSummary
         }
     };
 }
