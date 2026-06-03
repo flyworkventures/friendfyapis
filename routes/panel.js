@@ -24,6 +24,7 @@ const {
     assertPatchMediaIfProvided
 } = require('./lib/panelAgentUploads');
 const { buildUserInsights } = require('./lib/panelUserInsights');
+const { parseMembershipsArray } = require('./lib/membershipsSync');
 
 /** Panel karakter ekleme: dosyalar Bunny CDN'e yüklenir, DB'ye public URL yazılır. */
 async function prepareCreateAgentBody(req, body) {
@@ -174,11 +175,38 @@ router.get('/users/resolve-rc', async (req, res) => {
         }
 
         if (!candidates.length) {
+            try {
+                const byRc = await getQuery(
+                    'SELECT * FROM `users` WHERE revenuecat_customer_id = ? LIMIT 1',
+                    [customerId]
+                );
+                if (byRc?.[0]) candidates.push(byRc[0]);
+            } catch (error) {
+                if (error?.code !== 'ER_BAD_FIELD_ERROR') throw error;
+            }
+        }
+
+        if (!candidates.length) {
             const byApple = await getQuery(
                 'SELECT * FROM `users` WHERE appleUserIdentifier = ? LIMIT 1',
                 [customerId]
             );
             if (byApple?.[0]) candidates.push(byApple[0]);
+        }
+
+        if (!candidates.length && aliasIds.length) {
+            for (const aliasId of aliasIds) {
+                if (!aliasId || candidates.length) break;
+                try {
+                    const byRcAlias = await getQuery(
+                        'SELECT * FROM `users` WHERE revenuecat_customer_id = ? LIMIT 1',
+                        [aliasId]
+                    );
+                    if (byRcAlias?.[0]) candidates.push(byRcAlias[0]);
+                } catch (error) {
+                    if (error?.code !== 'ER_BAD_FIELD_ERROR') throw error;
+                }
+            }
         }
 
         const aliasIds = Array.isArray(req.query.aliasIds)
@@ -215,11 +243,13 @@ router.get('/users/resolve-rc', async (req, res) => {
             matchStrategy: user
                 ? /^\d+$/.test(customerId) && String(user.id) === customerId
                     ? 'user_id'
-                    : user.providerId === customerId
-                      ? 'apple_user_identifier'
-                      : email && user.email === email
-                        ? 'email'
-                        : 'alias_or_lookup'
+                    : user.extras?.revenuecatCustomerId === customerId
+                      ? 'revenuecat_customer_id'
+                      : user.providerId === customerId
+                        ? 'apple_user_identifier'
+                        : email && user.email === email
+                          ? 'email'
+                          : 'alias_or_lookup'
                 : null
         });
     } catch (error) {
@@ -393,6 +423,56 @@ router.get('/voices', async (req, res) => {
         });
     } catch (error) {
         console.error('panel GET /voices error:', error);
+        return res.status(500).json({ ok: false, msg: 'Server error' });
+    }
+});
+
+router.get('/users/:id/billing', async (req, res) => {
+    try {
+        const id = req.params.id;
+        let rows;
+        try {
+            rows = await getQuery(
+                'SELECT id, email, username, memberships, revenuecat_customer_id FROM `users` WHERE id = ? LIMIT 1',
+                [id]
+            );
+        } catch (error) {
+            if (error?.code === 'ER_BAD_FIELD_ERROR') {
+                rows = await getQuery(
+                    'SELECT id, email, username, memberships FROM `users` WHERE id = ? LIMIT 1',
+                    [id]
+                );
+            } else {
+                throw error;
+            }
+        }
+
+        if (!rows?.length) {
+            return res.status(404).json({ ok: false, msg: 'User not found' });
+        }
+
+        const row = rows[0];
+        const memberships = parseMembershipsArray(row.memberships).map((m) => ({
+            type: m?.type ?? null,
+            productId: m?.productId ?? null,
+            isActive: Boolean(m?.isActive),
+            startDate: m?.startDate ?? null,
+            endDate: m?.endDate ?? null,
+            purchasedAt: m?.purchasedAt ?? null
+        }));
+
+        return res.status(200).json({
+            contractVersion: '2',
+            userId: String(row.id),
+            email: row.email ?? null,
+            displayName: row.username ?? null,
+            revenuecatCustomerId: row.revenuecat_customer_id ?? null,
+            memberships,
+            invoiceNote:
+                'Apple App Store faturaları genelde RevenueCat PDF olarak gelmez; mağaza fatura geçmişi veya RC abonelik detayı kullanılır.'
+        });
+    } catch (error) {
+        console.error('panel GET /users/:id/billing error:', error);
         return res.status(500).json({ ok: false, msg: 'Server error' });
     }
 });
