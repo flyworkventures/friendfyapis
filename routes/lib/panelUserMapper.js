@@ -140,6 +140,10 @@ function rowToPanelUser(row) {
             isGuest: isGuestEmail(email),
             isPremium: Boolean(membershipsSummary?.activeCount),
             providerId: row.appleUserIdentifier != null ? String(row.appleUserIdentifier) : null,
+            revenuecatCustomerId:
+                row.revenuecat_customer_id != null
+                    ? String(row.revenuecat_customer_id)
+                    : null,
             membershipsSummary
         }
     };
