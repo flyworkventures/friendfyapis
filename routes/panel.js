@@ -23,6 +23,7 @@ const {
     assertAgentMediaComplete,
     assertPatchMediaIfProvided
 } = require('./lib/panelAgentUploads');
+const { buildUserInsights } = require('./lib/panelUserInsights');
 
 /** Panel karakter ekleme: dosyalar Bunny CDN'e yüklenir, DB'ye public URL yazılır. */
 async function prepareCreateAgentBody(req, body) {
@@ -114,10 +115,10 @@ router.get('/users', async (req, res) => {
         const listParams = [];
 
         if (search) {
-            whereSql = ' WHERE email LIKE ? OR username LIKE ? OR phoneNumber LIKE ? ';
+            whereSql = ' WHERE email LIKE ? OR username LIKE ? OR phoneNumber LIKE ? OR CAST(id AS CHAR) LIKE ? ';
             const like = `%${search}%`;
-            countParams.push(like, like, like);
-            listParams.push(like, like, like);
+            countParams.push(like, like, like, like);
+            listParams.push(like, like, like, like);
         }
 
         const [countRow] = await getQuery(
@@ -269,6 +270,86 @@ router.get('/users/:id/agents', async (req, res) => {
     } catch (error) {
         console.error('panel GET /users/:id/agents error:', error);
         return res.status(500).json({ ok: false, msg: 'Server error' });
+    }
+});
+
+router.get('/voices', async (req, res) => {
+    try {
+        const genderRaw = String(req.query.gender || '').trim().toLowerCase();
+        const gender = genderRaw === 'female' || genderRaw === 'male' ? genderRaw : null;
+
+        let rows;
+        if (gender) {
+            rows = await getQuery(
+                'SELECT id, name, elevenlabs_id AS voiceId, mp3_url AS previewUrl, gender FROM `voices` WHERE gender = ? ORDER BY id ASC',
+                [gender]
+            );
+            if (!rows?.length) {
+                rows = await getQuery(
+                    'SELECT id, name, elevenlabs_id AS voiceId, mp3_url AS previewUrl, gender FROM `voices` ORDER BY id ASC',
+                    []
+                );
+            }
+        } else {
+            rows = await getQuery(
+                'SELECT id, name, elevenlabs_id AS voiceId, mp3_url AS previewUrl, gender FROM `voices` ORDER BY id ASC',
+                []
+            );
+        }
+
+        const mapped = (rows || []).map((row) => ({
+            voiceId: row.voiceId || '',
+            name: row.name || 'İsimsiz ses',
+            gender:
+                String(row.gender || '').toLowerCase() === 'female' ||
+                String(row.gender || '').toLowerCase() === 'male'
+                    ? String(row.gender).toLowerCase()
+                    : 'unknown',
+            previewUrl: row.previewUrl || null
+        }));
+
+        return res.status(200).json({
+            contractVersion: '2',
+            data: mapped,
+            meta: {
+                gender: gender || 'all',
+                total: mapped.length,
+                fallbackUsed: Boolean(gender && rows?.length && !rows.every((r) => String(r.gender).toLowerCase() === gender))
+            }
+        });
+    } catch (error) {
+        console.error('panel GET /voices error:', error);
+        return res.status(500).json({ ok: false, msg: 'Server error' });
+    }
+});
+
+router.get('/users/:id/details', async (req, res) => {
+    try {
+        const id = req.params.id;
+        const rows = await getQuery('SELECT * FROM `users` WHERE id = ? LIMIT 1', [id]);
+        if (!rows || rows.length === 0) {
+            return res.status(404).json({
+                ok: false,
+                msg: 'User not found'
+            });
+        }
+
+        const user = rowToPanelUser(rows[0]);
+        const insights = await buildUserInsights(id);
+
+        return res.status(200).json({
+            contractVersion: '2',
+            user: {
+                ...user,
+                insights
+            }
+        });
+    } catch (error) {
+        console.error('panel GET /users/:id/details error:', error);
+        return res.status(500).json({
+            ok: false,
+            msg: 'Server error'
+        });
     }
 });
 
