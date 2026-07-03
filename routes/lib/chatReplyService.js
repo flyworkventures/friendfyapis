@@ -347,6 +347,47 @@ async function generateCharacterTextReply(conversationId, lang) {
 }
 
 /**
+ * Yeni sohbette ilk mesajı karakter atar (kullanıcıdan önce).
+ * Sohbet geçmişi yoktur; karakter sıcak, kısa ve doğal bir açılış mesajı yazar.
+ */
+async function generateCharacterOpeningMessage(conversationId, lang) {
+  const ctx = await fetchConversationContext(conversationId);
+  if (!ctx) {
+    console.error('[chatReply] opening: conversation not found:', conversationId);
+    return null;
+  }
+
+  // Zaten mesaj varsa (yarış durumu) tekrar açılış üretme.
+  if (Array.isArray(ctx.history) && ctx.history.length > 0) {
+    return null;
+  }
+
+  const openingDirective =
+    '\n\nİLK MESAJ (ÇOK ÖNEMLİ):\n' +
+    '- Sohbeti SEN başlatıyorsun; kullanıcı henüz bir şey yazmadı.\n' +
+    '- Karşındaki kişiye sıcak, samimi ve karakterine uygun KISA bir ilk mesaj yaz.\n' +
+    '- Doğal bir selam ver; istersen kullanıcının adını kullan ve sohbeti açacak küçük bir soru sor.\n' +
+    '- Yukarıdaki tüm kurallara uy (max ~2 kısa cümle, emoji yok, meta/robotik dil yok).\n' +
+    '- Tırnak işareti veya "işte ilk mesajım" gibi açıklama ekleme; doğrudan mesajın kendisini yaz.';
+
+  const systemPrompt = buildSystemPrompt(ctx.bot, ctx.userName, lang) + openingDirective;
+
+  const reply = await callOpenAI({
+    messages: [{ role: 'system', content: systemPrompt }],
+    model: getChatModel(),
+    maxTokens: CHAT_MAX_OUTPUT_TOKENS
+  });
+
+  if (!reply) {
+    console.error('[chatReply] empty opening reply for conversation', conversationId);
+    return null;
+  }
+
+  await saveBotReply(conversationId, reply);
+  return reply;
+}
+
+/**
  * Sesli mesaj: transkript üzerinden aynı pipeline.
  */
 async function generateCharacterVoiceReply(conversationId, lang) {
@@ -595,6 +636,7 @@ module.exports = {
   generateCharacterTextReply,
   generateCharacterVoiceReply,
   generateCharacterImageReply,
+  generateCharacterOpeningMessage,
   generateProactiveMessage,
   buildSystemPrompt,
   saveBotReply,

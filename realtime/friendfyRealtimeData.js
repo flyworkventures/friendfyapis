@@ -3,14 +3,34 @@
 const jwt = require('jsonwebtoken');
 const { getQuery, query } = require('../db');
 const { buildSystemPrompt } = require('../routes/lib/chatReplyService');
+const { localizeName } = require('../routes/lib/nameLocalization');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'key';
+
+// Sesli/görüntülü aramada isim yerelleştirmesi için desteklenen diller.
+const LOCALIZE_LANGS = ['tr', 'en', 'de', 'fr', 'pt', 'it', 'es', 'zh', 'ja', 'ru', 'hi', 'ko'];
+
+/**
+ * Sistem karakterleri (system 1/2) için isimlerin dile göre yerelleştirilmiş
+ * haritasını üretir; kullanıcı karakterlerinde her dilde ham isim döner.
+ * Greeting (canned) bu haritadan `names[lang]` ile doğru ismi seçer.
+ */
+function buildLocalizedNames(row) {
+  const sys = Number(row.system);
+  const isSystem = sys === 1 || sys === 2;
+  const names = {};
+  for (const l of LOCALIZE_LANGS) {
+    names[l] = isSystem ? localizeName(row.name, l) : row.name;
+  }
+  return names;
+}
 
 function mapBotRow(row) {
   if (!row) return null;
   return {
     id: row.id,
     name: row.name,
+    system: row.system,
     voiceId: row.voiceId,
     gender: row.gender,
     character: row.character,
@@ -20,7 +40,7 @@ function mapBotRow(row) {
     characterTags: row.characterTags,
     job: row.job_tr || row.job_en || '',
     mainPrompt: row.system || '',
-    names: { tr: row.name, en: row.name },
+    names: buildLocalizedNames(row),
     explanation: row.character || '',
     features: [],
   };

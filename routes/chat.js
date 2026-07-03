@@ -8,6 +8,7 @@ const {
   generateCharacterTextReply,
   generateCharacterVoiceReply,
   generateCharacterImageReply,
+  generateCharacterOpeningMessage,
   generateProactiveMessage,
   sanitizeReplyText
 } = require('./lib/chatReplyService');
@@ -39,12 +40,29 @@ function guidGenerator() {
 
 router.post('/create-chat',middleware,async (req,res)=>{
    const {  userId , botId, started_at, last_message_at} = req.body;
+   const lang = normalizeLang(req.body?.lang);
 
   var result = await getQuery("SELECT * FROM `coversations` WHERE userId = ? AND botId = ?",[userId,botId]);
   if (result.length === 0) {
-    const chatCreated = await query("INSERT INTO `coversations` ( `userId`, `botId`, `current_chat_state` , `lastMessage`, `last_message_at` , `started_at`) VALUES (?, ?, ?, ?, ?,?)",[userId,botId,"normal",null,null,null]);
+    // Yeni sohbet: ilk mesajı karakter atacağı için "bot_typing" ile başlat.
+    const chatCreated = await query("INSERT INTO `coversations` ( `userId`, `botId`, `current_chat_state` , `lastMessage`, `last_message_at` , `started_at`) VALUES (?, ?, ?, ?, ?,?)",[userId,botId,"bot_typing",null,null,null]);
       if (chatCreated === true) {
           var resp = await getQuery("SELECT * FROM `coversations` WHERE userId = ? AND botId = ?",[userId,botId]);
+          const newConversationId = resp[0]?.id;
+          // İlk mesajı karakter atsın (async). Frontend polling ile yakalar;
+          // üretim bitince/başarısız olunca sohbet state'ini normal'e çek.
+          if (newConversationId) {
+            generateCharacterOpeningMessage(newConversationId, lang)
+              .catch((err) =>
+                console.error('[create-chat] opening message error:', err?.message || err)
+              )
+              .finally(() => {
+                query(
+                  "UPDATE `coversations` SET `current_chat_state` = 'normal' WHERE id = ? LIMIT 1",
+                  [newConversationId]
+                ).catch(() => {});
+              });
+          }
           return await res.status(200).json({
             "msg": "Conversation Created",
             "conversationData": resp[0],
@@ -57,6 +75,33 @@ router.post('/create-chat',middleware,async (req,res)=>{
           })
       }
   } else {
+       // Sohbet zaten var; ama hiç mesajı yoksa (boş sohbet) ilk mesajı yine
+       // karakter atsın. Böylece daha önce açılıp mesajlaşılmamış sohbetlerde de
+       // karakter konuşmayı başlatır.
+       const existingId = result[0]?.id;
+       if (existingId) {
+         const msgCountRows = await getQuery(
+           'SELECT COUNT(*) AS c FROM `messages` WHERE conversationId = ?',
+           [existingId]
+         );
+         const hasMessages = (msgCountRows?.[0]?.c || 0) > 0;
+         if (!hasMessages) {
+           await query(
+             "UPDATE `coversations` SET `current_chat_state` = 'bot_typing' WHERE id = ? LIMIT 1",
+             [existingId]
+           ).catch(() => {});
+           generateCharacterOpeningMessage(existingId, lang)
+             .catch((err) =>
+               console.error('[create-chat] opening message error:', err?.message || err)
+             )
+             .finally(() => {
+               query(
+                 "UPDATE `coversations` SET `current_chat_state` = 'normal' WHERE id = ? LIMIT 1",
+                 [existingId]
+               ).catch(() => {});
+             });
+         }
+       }
        return await res.status(200).json({
             "msg": "Conversation Data",
             "conversationData": result[0],
