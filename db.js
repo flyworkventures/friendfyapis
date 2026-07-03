@@ -32,6 +32,16 @@ async function query(sql,values){
     }
 }
 
+async function insertQuery(sql, values) {
+    try {
+        const [result] = await connection.query(sql, values);
+        return result?.insertId ?? null;
+    } catch (error) {
+        console.log('SQL insert error ', error);
+        return null;
+    }
+}
+
 
 
 /*
@@ -45,4 +55,4 @@ connection.connect((err) => {
 
 */
 
-module.exports = {getQuery,query};
+module.exports = {getQuery,query,insertQuery};

@@ -987,7 +987,7 @@ class VoiceChatServerV2 {
 
     let consultant;
     try {
-      consultant = await getBotById(consultantId);
+      consultant = await getBotById(consultantId, userId);
     } catch (e) {
       console.error(`[VCv2] ❌ consultant fetch failed:`, e.message);
       ws.close(1011, 'Consultant fetch failed');

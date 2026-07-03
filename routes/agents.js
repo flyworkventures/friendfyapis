@@ -1,6 +1,6 @@
 const routes = require('express').Router();
 const middleware = require('../middleware/checkAuth')
-const { getQuery , query} = require('../db')
+const { getQuery , query, insertQuery} = require('../db')
 const { normalizeLang, localizeAgents, localizeAgentRow } = require('./lib/agentLocalization');
 
 function toPhotoUrlArray(rawValue) {
@@ -89,6 +89,41 @@ function normalizeArrayLike(value) {
         return [trimmed];
     }
     return [];
+}
+
+/** voices.id veya elevenlabs_id → bots.voiceId için ElevenLabs voice id. */
+async function resolveVoiceIdForStorage(rawVoiceId) {
+    if (rawVoiceId === null || rawVoiceId === undefined) return null;
+    const s = String(rawVoiceId).trim();
+    if (!s) return null;
+
+    // Zaten ElevenLabs voice id (harf içeren, yeterince uzun slug)
+    if (/[a-zA-Z]/.test(s) && s.length >= 10) {
+        return s;
+    }
+
+    // Sayısal voices tablosu id
+    if (/^\d+$/.test(s)) {
+        const rows = await getQuery(
+            'SELECT elevenlabs_id FROM `voices` WHERE id = ? LIMIT 1',
+            [Number(s)]
+        );
+        const resolved = rows?.[0]?.elevenlabs_id;
+        if (resolved && String(resolved).trim()) {
+            return String(resolved).trim();
+        }
+    }
+
+    // Doğrudan elevenlabs_id eşleşmesi
+    const byEl = await getQuery(
+        'SELECT elevenlabs_id FROM `voices` WHERE elevenlabs_id = ? LIMIT 1',
+        [s]
+    );
+    if (byEl?.[0]?.elevenlabs_id) {
+        return String(byEl[0].elevenlabs_id).trim();
+    }
+
+    return s;
 }
 
 /** İstemci ve JWT id karşılaştırması (string | number). */
@@ -504,6 +539,15 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             });
         }
 
+        const resolvedVoiceId = await resolveVoiceIdForStorage(voiceId);
+        if (!resolvedVoiceId) {
+            return res.status(400).json({
+                success: false,
+                code: "INVALID_VOICE",
+                msg: "voiceId could not be resolved"
+            });
+        }
+
         const parsedName = parseAgentName(name);
         if (!parsedName.ok) {
             return res.status(400).json({
@@ -530,7 +574,7 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             serializePhotoUrlsFromBody({ photoURL, photoURLs }),
             normalizedCharacterTags,
             speakingStyle || '',
-            voiceId,
+            resolvedVoiceId,
             country || '',
             riveVal,
             actorId,
@@ -560,12 +604,22 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             values = baseValues;
         }
 
-        const result = await query(insertQuery, values);
+        const newAgentId = await insertQuery(insertQuery, values);
 
-        if (result) {
+        if (newAgentId) {
+            const createdRows = await getQuery(
+                'SELECT * FROM `bots` WHERE id = ? LIMIT 1',
+                [newAgentId]
+            );
+            const createdAgent = createdRows?.[0]
+                ? attachPhotoUrls(createdRows[0])
+                : null;
             return res.status(200).json({
                 success: true,
-                msg: "Custom agent created successfully"
+                msg: "Custom agent created successfully",
+                agentId: newAgentId,
+                voiceId: resolvedVoiceId,
+                agent: createdAgent
             });
         } else {
             return res.status(500).json({
@@ -638,6 +692,10 @@ routes.post('/update-agent', middleware, async (req, res) => {
         const normalizedCharacterTags = JSON.stringify(normalizeArrayLike(characterTags));
         const photoSerialized = serializePhotoUrlsFromBody({ photoURL, photoURLs });
         const riveResolved = parseRiveAvatarFromBody(req.body, bot);
+        const resolvedVoiceId =
+            voiceId !== undefined && voiceId !== null
+                ? await resolveVoiceIdForStorage(voiceId)
+                : bot.voiceId;
 
         let resolvedName = bot.name;
         if (name !== undefined && name !== null) {
@@ -666,7 +724,7 @@ routes.post('/update-agent', middleware, async (req, res) => {
                     photoSerialized,
                     normalizedCharacterTags,
                     speakingStyle || '',
-                    voiceId,
+                    resolvedVoiceId,
                     country || '',
                     riveResolved,
                     agentId,
@@ -683,7 +741,8 @@ routes.post('/update-agent', middleware, async (req, res) => {
             return res.status(200).json({
                 success: true,
                 msg: 'Agent updated successfully',
-                agentId: Number(agentId)
+                agentId: Number(agentId),
+                voiceId: resolvedVoiceId
             });
         }
 
@@ -723,7 +782,7 @@ routes.post('/update-agent', middleware, async (req, res) => {
                     photoSerialized,
                     normalizedCharacterTags,
                     speakingStyle || '',
-                    voiceId,
+                    resolvedVoiceId,
                     country || '',
                     riveForCatalog
                 ];
@@ -760,7 +819,7 @@ routes.post('/update-agent', middleware, async (req, res) => {
                     photoSerialized,
                     normalizedCharacterTags,
                     speakingStyle || '',
-                    voiceId,
+                    resolvedVoiceId,
                     country || ''
                 ];
             }
@@ -775,7 +834,8 @@ routes.post('/update-agent', middleware, async (req, res) => {
             return res.status(200).json({
                 success: true,
                 msg: 'Catalog agent customized',
-                agentId: Number(agentId)
+                agentId: Number(agentId),
+                voiceId: resolvedVoiceId
             });
         }
 

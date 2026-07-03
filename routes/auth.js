@@ -153,11 +153,12 @@ router.post('/signup', [
 
             const birthdate = formatDateForMySQL(parsedUser.birthdate);
             const hashedPassword = null; // Social users local password kullanmaz
+            const hobbies = serializeHobbiesForDb(parsedUser.hobbies);
 
             const signupUsername = String(parsedUser.username || '').trim().slice(0, 20);
             await query(
-                "INSERT INTO `users` (`username`, `email`, `password`, `token`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `country`, `gender` , `birthdate`, `appleUserIdentifier`, `appleToken`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-                [signupUsername,userEmail, hashedPassword, null,  null, null, "1", credential, null, null, null,parsedUser.counrty || null,parsedUser.gender  , birthdate, appleUid, appleToken]
+                "INSERT INTO `users` (`username`, `email`, `password`, `token`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `country`, `gender` , `birthdate`, `appleUserIdentifier`, `appleToken`, `hobbies`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                [signupUsername,userEmail, hashedPassword, null,  null, null, "1", credential, null, null, null,parsedUser.counrty || null,parsedUser.gender  , birthdate, appleUid, appleToken, hobbies]
             );
 
             const insertedRows = await getQuery('SELECT id, email FROM `users` WHERE email = ? LIMIT 1', [userEmail]);
@@ -194,6 +195,38 @@ function formatDateForMySQL(dateString) {
     ":" +
     pad(date.getSeconds())
   );
+}
+
+function serializeHobbiesForDb(hobbies) {
+    if (hobbies == null) return null;
+    if (typeof hobbies === 'string') return hobbies;
+    return JSON.stringify(hobbies);
+}
+
+function mapGuestUserRow(row, fallback = {}) {
+    if (!row) return null;
+    return {
+        id: row.id,
+        username: row.username || fallback.username,
+        email: row.email || fallback.email,
+        token: fallback.token ?? row.token ?? null,
+        refreshToken: fallback.refreshToken ?? row.refreshToken ?? null,
+        accountCreatedDate: row.accountCreatedDate
+            ? new Date(row.accountCreatedDate).toISOString()
+            : fallback.accountCreatedDate,
+        birthdate: row.birthdate
+            ? new Date(row.birthdate).toISOString()
+            : fallback.birthdate,
+        memberships: row.memberships ?? null,
+        ownAgents: row.ownAgents ? row.ownAgents : [],
+        verificated: Number(row.verificated ?? 1),
+        credential: row.credential || 'guest',
+        lastLogins: row.lastLogins ?? null,
+        counrty: row.counrty ?? null,
+        gender: row.gender || fallback.gender || 'male',
+        hobbies: row.hobbies ?? null,
+        photoURL: row.photoURL ?? null
+    };
 }
 
 
@@ -262,14 +295,36 @@ router.post('/login', async (req, res) => {
 router.post('/guest-login', async (req, res) => {
     try {
         const guestId = guidGenerator().replace(/-/g, '').slice(0, 16);
-        const email = `guest_${guestId}@guest.local`;
-        const username = `Guest${guestId.slice(0, 6)}`;
         const nowIso = new Date().toISOString();
         const defaultBirthdateIso = new Date('1970-01-01T00:00:00.000Z').toISOString();
+        const onboarding = req.body?.onboarding || {};
+
+        const usernameRaw = String(onboarding.username || '').trim();
+        const username = usernameRaw.length > 0
+            ? usernameRaw.slice(0, 20)
+            : `Guest${guestId.slice(0, 6)}`;
+
+        // Misafir e-postası kullanıcının verdiği isimden türetilir (benzersizlik için kısa id eklenir).
+        const emailSlug = usernameRaw
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/[^a-z0-9]+/g, '')
+            .slice(0, 20);
+        const emailLocalPart = emailSlug.length > 0
+            ? `${emailSlug}_${guestId.slice(0, 8)}`
+            : `guest_${guestId}`;
+        const email = `${emailLocalPart}@guest.local`;
+        const genderRaw = String(onboarding.gender || '').trim().toLowerCase();
+        const gender = ['male', 'female'].includes(genderRaw) ? genderRaw : 'male';
+        const birthdateForDb = onboarding.birthdate
+            ? formatDateForMySQL(onboarding.birthdate)
+            : formatDateForMySQL(defaultBirthdateIso);
+        const hobbies = serializeHobbiesForDb(onboarding.hobbies);
 
         await query(
-            "INSERT INTO `users` (`username`, `email`, `password`, `token`, `accountCreatedDate`, `birthdate`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `gender`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-            [username, email, null, null, nowIso, defaultBirthdateIso, null, null, 1, "guest", null, null, null, 'male']
+            "INSERT INTO `users` (`username`, `email`, `password`, `token`, `accountCreatedDate`, `birthdate`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `gender`, `hobbies`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            [username, email, null, null, nowIso, birthdateForDb, null, null, 1, "guest", null, null, null, gender, hobbies]
         );
 
         const createdUserRows = await getQuery("SELECT * FROM `users` WHERE email = ? LIMIT 1", [email]);
@@ -294,28 +349,17 @@ router.post('/guest-login', async (req, res) => {
 
         return res.status(200).json({
             success: true,
-            user: {
-                id: createdUser.id,
-                username: createdUser.username || username,
-                email: createdUser.email || email,
+            user: mapGuestUserRow(createdUser, {
+                username,
+                email,
                 token,
                 refreshToken,
-                accountCreatedDate: createdUser.accountCreatedDate
-                    ? new Date(createdUser.accountCreatedDate).toISOString()
-                    : nowIso,
-                birthdate: createdUser.birthdate
-                    ? new Date(createdUser.birthdate).toISOString()
+                accountCreatedDate: nowIso,
+                birthdate: onboarding.birthdate
+                    ? new Date(onboarding.birthdate).toISOString()
                     : defaultBirthdateIso,
-                memberships: createdUser.memberships ?? null,
-                ownAgents: createdUser.ownAgents ? createdUser.ownAgents : [],
-                verificated: Number(createdUser.verificated ?? 1),
-                credential: createdUser.credential || 'guest',
-                lastLogins: createdUser.lastLogins ?? null,
-                counrty: createdUser.counrty ?? null,
-                gender: createdUser.gender || 'male',
-                hobbies: createdUser.hobbies ?? null,
-                photoURL: createdUser.photoURL ?? null
-            }
+                gender,
+            })
         });
     } catch (error) {
         console.error("guest-login error:", error);
@@ -568,7 +612,7 @@ const middleware = require('../middleware/checkAuth');
 
 router.post('/update-profile', middleware, async (req, res) => {
     try {
-        const { userId, username, photoURL, birthdate, gender } = req.body;
+        const { userId, username, photoURL, birthdate, gender, hobbies } = req.body;
 
         if (!userId) {
             return res.status(400).json({
@@ -644,6 +688,11 @@ router.post('/update-profile', middleware, async (req, res) => {
                 updateFields.push("gender = ?");
                 updateValues.push(normalizedGender);
             }
+        }
+
+        if (hobbies !== undefined) {
+            updateFields.push("hobbies = ?");
+            updateValues.push(serializeHobbiesForDb(hobbies));
         }
 
         if (updateFields.length === 0) {

@@ -1,5 +1,6 @@
 const axios = require('axios');
 const { getQuery } = require('../../db');
+const { localizeName } = require('./nameLocalization');
 
 const SUPPORTED_LANGS = ['tr', 'en', 'de', 'fr', 'pt', 'it', 'es', 'zh', 'ja', 'ru', 'hi', 'ko'];
 
@@ -324,6 +325,14 @@ async function localizeAgentRow(row, lang, options = {}) {
         out.character = pickCharacterSync(row, normalizedLang);
         out.speakingStyle = pickSpeakingStyleSync(row, normalizedLang);
     }
+
+    // Yalnızca sistem karakterlerinin (system 1/2) isimlerini dile özgü hale getir.
+    // Kullanıcı karakterleri (system=0) ve haritada olmayan isimler değiştirilmez.
+    const systemFlag = Number(row.system);
+    if (systemFlag === 1 || systemFlag === 2) {
+        out.name = localizeName(row.name, normalizedLang);
+    }
+
     return out;
 }
 

@@ -63,9 +63,36 @@ async function authenticateRealtime(req) {
   }
 }
 
-async function getBotById(botId) {
+async function getBotById(botId, userId = null) {
   const rows = await getQuery('SELECT * FROM `bots` WHERE id = ? LIMIT 1', [botId]);
-  return mapBotRow(rows?.[0]);
+  const row = rows?.[0];
+  if (!row) return null;
+
+  const sys = Number(row.system);
+  if (userId && (sys === 1 || sys === 2)) {
+    try {
+      const overrides = await getQuery(
+        'SELECT * FROM `bot_catalog_overrides` WHERE user_id = ? AND bot_id = ? LIMIT 1',
+        [userId, botId]
+      );
+      const o = overrides?.[0];
+      if (o) {
+        if (o.voiceId != null && String(o.voiceId).trim()) {
+          row.voiceId = o.voiceId;
+        }
+        if (o.name != null && String(o.name).trim()) row.name = o.name;
+        if (o.character != null && String(o.character).trim()) {
+          row.character = o.character;
+        }
+      }
+    } catch (e) {
+      if (!(e && e.code === 'ER_NO_SUCH_TABLE')) {
+        console.warn('[realtime] catalog override lookup failed:', e?.message || e);
+      }
+    }
+  }
+
+  return mapBotRow(row);
 }
 
 async function getUserById(userId) {
@@ -140,7 +167,7 @@ async function getChatHistory(chatId, limit = 20) {
 
 async function buildRealtimeSystemPrompt(bot, user, conversationLang = 'tr') {
   const userName = user?.username || 'kullanıcı';
-  const base = buildSystemPrompt(bot, userName);
+  const base = buildSystemPrompt(bot, userName, conversationLang);
 
   const langName =
     {

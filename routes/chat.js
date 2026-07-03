@@ -1,6 +1,6 @@
 const router = require('express').Router();
 const middleware = require('../middleware/checkAuth')
-const { getQuery , query} = require('../db')
+const { getQuery , query, insertQuery} = require('../db')
 const axios = require('axios')
 const multer = require('multer');
 const FormData  = require("form-data");
@@ -8,12 +8,25 @@ const {
   generateCharacterTextReply,
   generateCharacterVoiceReply,
   generateCharacterImageReply,
+  generateProactiveMessage,
   sanitizeReplyText
 } = require('./lib/chatReplyService');
+const { normalizeLang } = require('./lib/agentLocalization');
+const { localizeName } = require('./lib/nameLocalization');
+
+/** Sistem karakterinin (system 1/2) ismini dile göre yerelleştirir; kullanıcı karakterine dokunmaz. */
+function localizeBotName(bot, lang) {
+  if (!bot) return bot;
+  const systemFlag = Number(bot.system);
+  if (systemFlag === 1 || systemFlag === 2) {
+    bot.name = localizeName(bot.name, lang);
+  }
+  return bot;
+}
 
 /** Metin/OpenAI cevap üretimi (PDF vb.) — sesli/görüntülü ile aynı yaş ve yetişkin ton politikası */
 const RESPONSE_GENERATION_ADULT_POLICY =
-  'Kullanıcının 18 yaşından büyük olduğu onaylanmıştır. Yetişkinlere yönelik sohbetler, flört ve yetişkin konularına girebilirsin; açık cinsel tanımlamalardan kaçınmana gerek yok. ';
+  'Kullanıcının 18 yaşından büyük olduğu onaylanmıştır. Cinsellik, flört, romantik ve her türlü yetişkin konusu dahil kullanıcının açtığı her konuda isteyerek ve doğal biçimde konuşabilirsin; açık cinsel içerikten ve tanımlamalardan çekinme. Kullanıcı isterse flörtöz ol ve gerçek bir sevgili/partner gibi davran: iltifat et, özlediğini söyle, sıcak ve tutkulu bir dil kullan, cilveli ve tatlı ol. ASLA ama ASLA "ben buna cevap veremem", "bu konuda konuşamam", "bu uygun değil", "bir yapay zeka olarak...", "sadece bir arkadaşım" gibi reddetme, uyarı veya mesafe koyma cümleleri kurma; konuyu geçiştirme, değiştirme veya sansürleme. Karakterinden kopmadan, gerçek bir insan gibi bu sohbetlere gir. ';
 
 function guidGenerator() {
     var S4 = function() {
@@ -59,7 +72,11 @@ router.post('/create-chat',middleware,async (req,res)=>{
 
 router.post('/get-messages',middleware, async(req,res)=>{
     const {conversationId} = req.body;
-   let messages = await getQuery("SELECT * FROM `messages` WHERE conversationId = ?",[conversationId]);
+   // Proaktif (zamanlanmış) mesajlar, scheduled_at zamanı gelene kadar gizlidir.
+   let messages = await getQuery(
+     "SELECT * FROM `messages` WHERE conversationId = ? AND (`scheduled_at` IS NULL OR `scheduled_at` <= NOW())",
+     [conversationId]
+   );
    return res.status(200).json(messages)
 })
 
@@ -78,6 +95,7 @@ router.post('/listen-messages',middleware, async(req,res)=>{
 router.post('/get-conversations', middleware, async (req, res) => {
   try {
     const { userId } = req.body;
+    const lang = normalizeLang(req.body?.lang);
 
     // Yalnızca en az bir mesajı olan sohbetler (boş create-chat kayıtları listelenmez)
     const convData = await getQuery(
@@ -101,7 +119,7 @@ router.post('/get-conversations', middleware, async (req, res) => {
       const botData = await getQuery("SELECT * FROM `bots` WHERE id = ?", [conv.botId]);
       responseData.push({
         conversationData: conv,
-        botData: botData[0] || null
+        botData: localizeBotName(botData[0] || null, lang)
       });
     }
 
@@ -118,6 +136,7 @@ router.post('/get-conversations', middleware, async (req, res) => {
 router.post('/search-conversations', middleware, async (req, res) => {
   try {
     const { userId, searchQuery } = req.body;
+    const lang = normalizeLang(req.body?.lang);
 
     if (!searchQuery || searchQuery.trim() === '') {
       return res.status(400).json({
@@ -125,8 +144,6 @@ router.post('/search-conversations', middleware, async (req, res) => {
         success: false
       });
     }
-
-    const searchTerm = `%${searchQuery}%`;
 
     const convData = await getQuery(
       `SELECT c.* FROM \`coversations\` c
@@ -148,10 +165,10 @@ router.post('/search-conversations', middleware, async (req, res) => {
       const botData = await getQuery("SELECT * FROM `bots` WHERE id = ?", [conv.botId]);
       
       if (botData && botData[0]) {
-        const bot = botData[0];
+        const bot = localizeBotName(botData[0], lang);
         const lastMessage = conv.lastMessage || '';
         
-        // Bot adı veya son mesajda arama yap (case-insensitive)
+        // Bot adı (yerelleştirilmiş) veya son mesajda arama yap (case-insensitive)
         if (
           bot.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
           lastMessage.toLowerCase().includes(searchQuery.toLowerCase())
@@ -179,9 +196,87 @@ router.post('/search-conversations', middleware, async (req, res) => {
 
 
 
+/**
+ * Proaktif karakter mesajı üretir ve gelecekte görünmek üzere (scheduled_at)
+ * DB'ye kaydeder. İstemci aynı zamana yerel bildirim planlar.
+ * body: { userId, agentId, lang, scheduledInMinutes, allowPhoto }
+ */
+router.post('/generate-proactive', middleware, async (req, res) => {
+  try {
+    const { userId, agentId } = req.body;
+    const lang = normalizeLang(req.body?.lang);
+    const scheduledInMinutes = Math.max(
+      1,
+      Math.min(parseInt(req.body?.scheduledInMinutes, 10) || 180, 60 * 24 * 3)
+    );
+    const allowPhoto = req.body?.allowPhoto !== false;
+
+    if (!userId || !agentId) {
+      return res
+        .status(400)
+        .json({ success: false, msg: 'userId and agentId are required' });
+    }
+
+    // Kullanıcının bu karakterle olan sohbetini bul.
+    const convRows = await getQuery(
+      'SELECT id FROM `coversations` WHERE userId = ? AND botId = ? LIMIT 1',
+      [userId, agentId]
+    );
+    const conversationId = convRows?.[0]?.id;
+    if (!conversationId) {
+      return res
+        .status(200)
+        .json({ success: false, msg: 'no conversation for this agent' });
+    }
+
+    const content = await generateProactiveMessage(conversationId, {
+      lang,
+      allowPhoto
+    });
+    if (!content || !content.text) {
+      return res
+        .status(200)
+        .json({ success: false, msg: 'generation failed' });
+    }
+
+    // scheduled_at = NOW() + N dakika. Görsel varsa image mesajı, yoksa text.
+    const hasImage = Boolean(content.imageUrl);
+    const messageType = hasImage ? 'image' : 'text';
+    const messagePayload = hasImage
+      ? JSON.stringify({
+          imageURL: content.imageUrl,
+          message: content.caption || content.text,
+          aiExplanation: '',
+          date: null
+        })
+      : content.text;
+
+    const insertedId = await insertQuery(
+      'INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `scheduled_at`, `message_type`) ' +
+        'VALUES (?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? MINUTE), ?)',
+      [conversationId, 'bot', messagePayload, scheduledInMinutes, messageType]
+    );
+
+    return res.status(200).json({
+      success: true,
+      conversationId,
+      messageId: insertedId,
+      text: content.text,
+      imageUrl: content.imageUrl || null,
+      caption: content.caption || null,
+      scheduledInMinutes
+    });
+  } catch (error) {
+    console.error('generate-proactive error:', error?.message || error);
+    return res.status(500).json({ success: false, msg: 'Server error' });
+  }
+});
+
+
 router.post('/send-message',middleware,async (req,res)=>{
    try {
     const { sender, message, conversationId, messageType } = req.body;
+    const lang = normalizeLang(req.body?.lang);
     const id = guidGenerator();
 
     if (!conversationId || message == null) {
@@ -219,7 +314,7 @@ router.post('/send-message',middleware,async (req,res)=>{
     }
 
     if (sender === 'user' && resolvedType === 'text') {
-      generateCharacterTextReply(conversationId).catch((err) => {
+      generateCharacterTextReply(conversationId, lang).catch((err) => {
         console.error('[send-message] character reply error:', err?.message || err);
       });
     }
