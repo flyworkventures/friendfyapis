@@ -321,7 +321,7 @@ async function saveBotReply(conversationId, text) {
 /**
  * Metin sohbeti: kullanıcı mesajı DB'de kayıtlı; bot cevabını üretip kaydeder.
  */
-async function generateCharacterTextReply(conversationId, lang) {
+async function generateCharacterTextReply(conversationId, lang, extraDirective) {
   const ctx = await fetchConversationContext(conversationId);
   if (!ctx) {
     console.error('[chatReply] conversation not found:', conversationId);
@@ -330,6 +330,9 @@ async function generateCharacterTextReply(conversationId, lang) {
 
   const systemPrompt = buildSystemPrompt(ctx.bot, ctx.userName, lang);
   const messages = [{ role: 'system', content: systemPrompt }, ...ctx.history];
+  if (extraDirective && String(extraDirective).trim()) {
+    messages.push({ role: 'system', content: String(extraDirective).trim() });
+  }
 
   const reply = await callOpenAI({
     messages,
@@ -548,6 +551,145 @@ async function generateProactivePhoto(referenceUrl, scenePrompt) {
 }
 
 /**
+ * Kullanıcının mesajı bir "fotoğraf gönder" isteği mi? (çok dilli sezgisel).
+ * Foto ismi + istek/emir ipucu birlikte geçiyorsa true döner.
+ */
+function userWantsPhoto(rawText) {
+  const text = String(rawText || '').toLowerCase().trim();
+  if (!text) return false;
+  if (text.length > 200) return false; // uzun paragraflar istek değildir
+
+  // Foto/görsel isimleri (12 dil).
+  const photoNouns = [
+    'foto', 'fotoğraf', 'fotograf', 'resim', 'selfie', 'özçekim', 'ozcekim', 'görsel', 'gorsel',
+    'photo', 'picture', 'pic', 'image', 'snapshot', 'selfy',
+    'bild', 'imagem', 'retrato', 'immagine', 'imagen',
+    '照片', '自拍', '图片', '写真', '自撮り', 'セルフィー', '画像',
+    'фото', 'фотка', 'селфи', 'изображение', 'картинка',
+    'फोटो', 'तस्वीर', 'सेल्फी', 'फ़ोटो',
+    '사진', '셀카', '셀피', '이미지'
+  ];
+
+  // İstek/emir ipuçları (çok dilli).
+  const requestCues = [
+    'at ', 'atar', 'atsana', 'gönder', 'gonder', 'yolla', 'çek', 'cek', 'göster', 'goster',
+    'ver', 'istiyorum', 'ister', 'paylaş', 'paylas', 'görebilir', 'gorebilir', 'yollar',
+    'send', 'show', 'share', 'want', 'give', 'take', 'can i see', 'let me see', 'lemme see',
+    'schick', 'zeig', 'senden', 'zeigen',
+    'envie', 'envia', 'manda', 'mostra', 'mostre', 'mande',
+    'envoie', 'montre',
+    'invia', 'mostrami', 'manda',
+    'enviar', 'muestra', 'mándame', 'mandame', 'quiero ver',
+    '发', '给我', '拍', '看看', '发个', '发张', '来张',
+    '送って', '見せて', '撮って', 'ちょうだい',
+    'отправь', 'пришли', 'скинь', 'покажи', 'хочу',
+    'भेज', 'दिखा', 'भेजो', 'दिखाओ',
+    '보내', '보여', '찍어', '줘'
+  ];
+
+  const hasNoun = photoNouns.some((n) => text.includes(n));
+  if (!hasNoun) return false;
+  // Sadece foto ismi geçiyorsa (kısa mesajlarda) veya istek ipucu varsa istek say.
+  const hasCue = requestCues.some((c) => text.includes(c));
+  const isShort = text.length <= 40;
+  return hasCue || isShort;
+}
+
+/**
+ * Kullanıcı foto istediğinde: karakterin mevcut fotosunu referans alarak sohbet
+ * bağlamına uygun yeni bir görsel üretir ve image mesajı olarak kaydeder.
+ * Foto üretilemezse metin cevabına düşer (null yerine text döndürür).
+ */
+async function generateCharacterPhotoReply(conversationId, lang) {
+  const ctx = await fetchConversationContext(conversationId);
+  if (!ctx) {
+    console.error('[chatReply] photo: conversation not found:', conversationId);
+    return null;
+  }
+
+  // Foto üretilemediğinde (referans yok / CDN / model hatası) kullanılacak
+  // metin fallback yönergesi: karakter ASLA "fotoğraf gönderemem/paylaşamam"
+  // dememeli. Fotoğrafı şu an gönderemediğini doğal ve sıcak bir dille,
+  // birazdan atacakmış gibi geçiştirmeli.
+  const photoFallbackDirective =
+    'Kullanıcı senden bir fotoğraf istedi ama şu an teknik bir nedenle fotoğrafı ' +
+    'gönderemedin. ASLA "fotoğraf gönderemem", "paylaşamam", "yapamam" gibi reddetme ' +
+    'cümlesi KURMA. Bunun yerine karakterine uygun, sıcak ve flörtöz bir dille; ' +
+    'fotoğrafı birazdan/az sonra atacağını ya da o an çekemediğini doğal biçimde söyle ' +
+    've sohbeti akıcı tut. En fazla 2 kısa cümle.';
+
+  const referenceUrl = firstPhotoUrl(ctx.bot?.photoURL);
+  // Referans foto yoksa üretemeyiz — reddetmeyen metin cevabı ver.
+  if (!referenceUrl) {
+    return generateCharacterTextReply(conversationId, lang, photoFallbackDirective);
+  }
+
+  const systemPrompt = buildSystemPrompt(ctx.bot, ctx.userName, lang);
+
+  // Karakter tonunda kısa bir caption üret (fotoğrafla birlikte gidecek).
+  let caption = '';
+  try {
+    const captionRaw = await callOpenAI({
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...ctx.history,
+        {
+          role: 'system',
+          content:
+            'Kullanıcı senden bir fotoğrafını istedi ve sen ona kendinden bir fotoğraf ' +
+            'gönderiyorsun. YALNIZCA fotoğrafın kısa, doğal ve samimi alt yazısını (caption) yaz; ' +
+            'en fazla 1 cümle, sohbet bağlamına uygun. Tırnak veya "caption:" gibi ön ek KULLANMA.'
+        }
+      ],
+      model: getChatModel(),
+      maxTokens: 60
+    });
+    caption = enforceCompactReplyStyle(captionRaw) || '';
+  } catch (e) {
+    console.warn('[chatReply] photo caption failed:', e?.message || e);
+  }
+
+  const scene = caption ||
+    'Kullanıcıyla olan sohbetin havasına uygun, sıcak ve samimi bir selfie anı.';
+
+  const imageUrl = await generateProactivePhoto(referenceUrl, scene);
+  // Görsel üretilemezse reddetmeyen metin cevabına düş.
+  if (!imageUrl) {
+    return generateCharacterTextReply(conversationId, lang, photoFallbackDirective);
+  }
+
+  const payload = JSON.stringify({
+    imageURL: imageUrl,
+    message: caption,
+    aiExplanation: '',
+    date: new Date().toISOString()
+  });
+
+  const inserted = await query(
+    "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
+    [conversationId, 'bot', payload, 'image']
+  );
+  if (inserted !== true) return null;
+
+  await query(
+    'UPDATE `coversations` SET `lastMessage` = ?, `last_message_at` = NOW() WHERE id = ? LIMIT 1',
+    [(caption || '📷').slice(0, 500), conversationId]
+  );
+
+  return { imageUrl, caption };
+}
+
+/**
+ * Kullanıcı metin mesajı için cevap üretir: foto isteği ise görsel, değilse metin.
+ */
+async function generateCharacterReply(conversationId, lang, userMessageText) {
+  if (userWantsPhoto(userMessageText)) {
+    return generateCharacterPhotoReply(conversationId, lang);
+  }
+  return generateCharacterTextReply(conversationId, lang);
+}
+
+/**
  * Proaktif (karakterin kendisinden gelen) mesaj içeriği üretir.
  * DB'ye KAYDETMEZ; çağıran taraf scheduled_at ile ekler.
  * @param {number} conversationId
@@ -637,6 +779,9 @@ module.exports = {
   generateCharacterVoiceReply,
   generateCharacterImageReply,
   generateCharacterOpeningMessage,
+  generateCharacterPhotoReply,
+  generateCharacterReply,
+  userWantsPhoto,
   generateProactiveMessage,
   buildSystemPrompt,
   saveBotReply,

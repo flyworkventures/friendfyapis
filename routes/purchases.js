@@ -16,10 +16,42 @@ const {
     pickRevenueCatCustomerId,
     persistRevenueCatCustomerId
 } = require('./lib/revenuecatCustomerLink');
+const {
+    verifyWebhookAuth,
+    applyRevenueCatEvent
+} = require('./lib/revenuecatWebhook');
+
+/**
+ * Cihaz başına otomatik 3 günlük deneme artık varsayılan olarak KAPALI.
+ * Ücretsiz deneme yalnızca paywall satın almasıyla (App Store/Play tanıtım
+ * teklifi) başlar. Eski istemciler bu uç noktayı çağırmaya devam edebilir; bu
+ * yüzden 200 dönüp mevcut kullanıcıyı iade ediyoruz ama hiçbir deneme vermiyoruz.
+ * Gerekirse DEVICE_FREE_TRIAL_ENABLED=true ile eski davranış geri açılabilir.
+ */
+const DEVICE_FREE_TRIAL_ENABLED =
+    String(process.env.DEVICE_FREE_TRIAL_ENABLED || 'false').toLowerCase() === 'true';
 
 router.post('/claim-free-trial', middleware, async (req, res) => {
     try {
         const { userId, deviceTrialFingerprint } = req.body || {};
+
+        if (!DEVICE_FREE_TRIAL_ENABLED) {
+            const gate = assertJwtMatchesUserId(req, userId);
+            if (!gate.ok) {
+                return res.status(gate.status).json(gate.json);
+            }
+            const existing = await getQuery(
+                'SELECT * FROM `users` WHERE id = ? LIMIT 1',
+                [userId]
+            );
+            return res.status(200).json({
+                success: true,
+                trialNotAllowed: true,
+                deviceTrialDisabled: true,
+                msg: 'Device free trial disabled; trial is granted via subscription purchase',
+                user: existing?.[0] || null
+            });
+        }
         const fpRaw =
             deviceTrialFingerprint ??
             req.body?.device_trial_fingerprint ??
@@ -231,6 +263,42 @@ router.post('/sync-memberships', middleware, async (req, res) => {
             msg: 'Server error',
             success: false
         });
+    }
+});
+
+/**
+ * RevenueCat webhook — uygulama kapalıyken de abonelik durumunu güncel tutar.
+ * RevenueCat Dashboard → Integrations → Webhooks üzerinden:
+ *   URL:  https://<sunucu>/purchases/revenuecat-webhook
+ *   Authorization header: process.env.REVENUECAT_WEBHOOK_AUTH ile aynı değer
+ * Not: JWT (checkAuth) middleware KULLANILMAZ; kimlik doğrulama header secret ile.
+ */
+router.post('/revenuecat-webhook', async (req, res) => {
+    try {
+        if (!verifyWebhookAuth(req)) {
+            return res.status(401).json({ success: false, msg: 'Unauthorized' });
+        }
+
+        const event = req.body?.event;
+        if (!event || typeof event !== 'object') {
+            return res.status(400).json({ success: false, msg: 'Missing event' });
+        }
+
+        const result = await applyRevenueCatEvent(event);
+
+        // Kullanıcı bulunamasa/olay işlenmese bile 200 dön ki RevenueCat retry
+        // fırtınası oluşmasın; sonucu logla.
+        console.log('[revenuecat-webhook]', {
+            type: event.type,
+            result
+        });
+
+        return res.status(200).json({ success: true, result });
+    } catch (error) {
+        console.error('revenuecat-webhook error:', error);
+        // 500 dönersek RevenueCat tekrar dener; kalıcı hata değilse yeniden
+        // deneme faydalı olur.
+        return res.status(500).json({ success: false, msg: 'Server error' });
     }
 });
 

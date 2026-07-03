@@ -56,4 +56,10 @@ if (realtimeEnabled) {
 
 server.listen(PORT,()=>{
     console.log(`Server started on port ${PORT}.`);
+    // Önceki süreç bir cevap üretirken kapandıysa (deploy/nodemon/çökme) bazı
+    // sohbetler 'bot_typing' durumunda takılı kalmış olabilir; başlangıçta temizle.
+    const { query } = require('./db');
+    query("UPDATE `coversations` SET `current_chat_state` = 'normal' WHERE `current_chat_state` = 'bot_typing'")
+        .then(() => console.log('Stale bot_typing states reset on startup.'))
+        .catch((err) => console.error('Failed to reset stale bot_typing states:', err?.message || err));
 });
