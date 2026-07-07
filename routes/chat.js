@@ -820,19 +820,57 @@ router.post('/send-image-message', middleware, upload.fields([
 // Report Conversation
 router.post('/report-conversation', middleware, async (req, res) => {
   try {
-    const { userId, conversationId, botId, reason, description } = req.body;
+    const { conversationId, botId, reason, description, messageId } = req.body;
+    const authUserId = req.user?.id ?? req.user?.userId;
 
-    if (!userId || !conversationId || !reason || !description) {
+    if (!authUserId) {
+      return res.status(401).json({
+        msg: "Unauthorized",
+        success: false
+      });
+    }
+
+    if (!conversationId || !reason || !description) {
       return res.status(400).json({ 
         msg: "Missing required fields", 
         success: false 
       });
     }
 
+    // Verify conversation belongs to authenticated user
+    const conversation = await getQuery(
+      "SELECT id, botId FROM `coversations` WHERE id = ? AND userId = ? LIMIT 1",
+      [conversationId, authUserId]
+    );
+    if (!conversation || conversation.length === 0) {
+      return res.status(403).json({
+        msg: "Conversation not found or unauthorized",
+        success: false
+      });
+    }
+
+    const resolvedBotId = botId || conversation[0].botId;
+    let normalizedDescription = String(description).trim();
+
+    // Optional: bind report to a concrete message in this conversation
+    if (messageId != null && messageId != '') {
+      const messageRows = await getQuery(
+        "SELECT id, sender FROM `messages` WHERE id = ? AND conversationId = ? LIMIT 1",
+        [messageId, conversationId]
+      );
+      if (!messageRows || messageRows.length === 0) {
+        return res.status(400).json({
+          msg: "Invalid messageId for this conversation",
+          success: false
+        });
+      }
+      normalizedDescription += `\n\nmessage_id=${messageRows[0].id};sender=${messageRows[0].sender}`;
+    }
+
     // Insert report into database
     await getQuery(
       "INSERT INTO `reports` (`userId`, `conversationId`, `botId`, `reason`, `description`, `status`, `created_at`) VALUES (?, ?, ?, ?, ?, 'pending', NOW())",
-      [userId, conversationId, botId, reason, description]
+      [authUserId, conversationId, resolvedBotId, reason, normalizedDescription]
     );
 
     res.status(200).json({ 
