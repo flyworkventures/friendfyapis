@@ -155,6 +155,22 @@ function resolveInterestTopics(bot) {
 }
 
 function buildSystemPrompt(bot, userName, lang) {
+  const languageCode = String(lang || 'en').toLowerCase().split(/[-_]/)[0];
+  const languageNames = {
+    tr: 'Turkish',
+    en: 'English',
+    de: 'German',
+    fr: 'French',
+    pt: 'Portuguese',
+    it: 'Italian',
+    es: 'Spanish',
+    zh: 'Chinese',
+    ja: 'Japanese',
+    ru: 'Russian',
+    hi: 'Hindi',
+    ko: 'Korean'
+  };
+  const strictLanguageName = languageNames[languageCode] || 'English';
   // Sistem karakterlerinde (system 1/2) ismi konuşma diline göre yerelleştir;
   // böylece karakter kendini kullanıcıya görünen isimle tanıtır.
   const systemFlag = Number(bot?.system);
@@ -202,6 +218,7 @@ Konuşma tarzı: ${speakingStyle || '(tanımlı değil)'}
 ${backgroundBlock ? `\n${backgroundBlock}\n` : ''}
 ${exampleLine ? `${exampleLine}\n` : ''}
 NASIL KONUŞACAKSIN (en önemli kurallar):
+- COK KRITIK DIL KURALI: Tum yanitlarini yalnizca ${strictLanguageName} dilinde ver. Baska dil kullanma, karisik dil kullanma.
 - Önce kullanıcının son mesajına doğrudan, doğal ve samimi cevap ver — günlük sohbet (nasılsın, günün nasıl geçti, şaka, flört) tamamen normal.
 - Her cevapta hobilerinden, ilgi alanlarından veya "ben şunu severim" diye kendinden bahsetmek ZORUNLU DEĞİL. Kullanıcı açıkça sormadıysa kendinden/ilgi alanlarından bahsetme.
 - Robot gibi kendini tanıtma, liste okuma veya sürekli konuyu ilgi alanına çekme.
