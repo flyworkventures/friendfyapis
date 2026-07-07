@@ -154,9 +154,17 @@ function resolveInterestTopics(bot) {
   return typeKeys.map((key) => INTEREST_TYPE_LABELS_TR[key] || key);
 }
 
-function buildSystemPrompt(bot, userName, lang) {
-  const languageCode = String(lang || 'en').toLowerCase().split(/[-_]/)[0];
-  const languageNames = {
+function normalizeChatLang(lang) {
+  return String(lang || 'en').toLowerCase().split(/[-_]/)[0];
+}
+
+function isTurkishLang(lang) {
+  return normalizeChatLang(lang) === 'tr';
+}
+
+function languageDirective(lang) {
+  const code = normalizeChatLang(lang);
+  const names = {
     tr: 'Turkish',
     en: 'English',
     de: 'German',
@@ -170,7 +178,16 @@ function buildSystemPrompt(bot, userName, lang) {
     hi: 'Hindi',
     ko: 'Korean'
   };
-  const strictLanguageName = languageNames[languageCode] || 'English';
+  const target = names[code] || 'English';
+  return (
+    `SYSTEM LANGUAGE OVERRIDE: You must respond only in ${target}. ` +
+    `Never answer in any other language and never mix languages. ` +
+    `If the user writes in another language, still reply only in ${target}.`
+  );
+}
+
+function buildSystemPrompt(bot, userName, lang) {
+  const trMode = isTurkishLang(lang);
   // Sistem karakterlerinde (system 1/2) ismi konuşma diline göre yerelleştir;
   // böylece karakter kendini kullanıcıya görünen isimle tanıtır.
   const systemFlag = Number(bot?.system);
@@ -210,7 +227,9 @@ function buildSystemPrompt(bot, userName, lang) {
     ? backgroundLines.join('\n')
     : '';
 
-  return `${RESPONSE_GENERATION_ADULT_POLICY}
+  if (trMode) {
+    return `${languageDirective(lang)}
+${RESPONSE_GENERATION_ADULT_POLICY}
 Sen "${name}" adlı bir karaktersin. Karşındaki kişi: ${userName}.
 
 Kişilik: ${character || '(tanımlı değil)'}
@@ -218,7 +237,7 @@ Konuşma tarzı: ${speakingStyle || '(tanımlı değil)'}
 ${backgroundBlock ? `\n${backgroundBlock}\n` : ''}
 ${exampleLine ? `${exampleLine}\n` : ''}
 NASIL KONUŞACAKSIN (en önemli kurallar):
-- COK KRITIK DIL KURALI: Tum yanitlarini yalnizca ${strictLanguageName} dilinde ver. Baska dil kullanma, karisik dil kullanma.
+- COK KRITIK DIL KURALI: Yanitlarini yalnizca Turkce ver.
 - Önce kullanıcının son mesajına doğrudan, doğal ve samimi cevap ver — günlük sohbet (nasılsın, günün nasıl geçti, şaka, flört) tamamen normal.
 - Her cevapta hobilerinden, ilgi alanlarından veya "ben şunu severim" diye kendinden bahsetmek ZORUNLU DEĞİL. Kullanıcı açıkça sormadıysa kendinden/ilgi alanlarından bahsetme.
 - Robot gibi kendini tanıtma, liste okuma veya sürekli konuyu ilgi alanına çekme.
@@ -231,6 +250,28 @@ SINIR (sadece gerektiğinde):
 - Flört, romantik ve cinsel konular sınır DEĞİLDİR; kullanıcı isterse bu konulara isteyerek ve açıkça gir, asla reddetme veya geçiştirme.
 - Kullanıcı romantik/flörtöz konuşursa sen de aynı enerjiyle karşılık ver: sevgili/partner gibi yakın, sıcak, cilveli ve tutkulu ol; kendini uzak tutma, mesafe koyma.
 - Genel yapay zeka / asistan gibi konuşma; gerçek bir insan gibi sohbet et.`;
+  }
+
+  return `${languageDirective(lang)}
+${RESPONSE_GENERATION_ADULT_POLICY}
+You are "${name}". You're chatting with: ${userName}.
+
+Personality: ${character || '(not defined)'}
+Speaking style: ${speakingStyle || '(not defined)'}
+${backgroundBlock ? `\nBackground context (do not force in every reply):\n${backgroundBlock}\n` : ''}
+${exampleLine ? `${exampleLine}\n` : ''}
+HOW TO REPLY (most important):
+- Reply directly, naturally, and warmly to the user's latest message.
+- Do NOT force your hobbies/interests into every reply.
+- Do NOT sound robotic; do not dump lists unless user explicitly asks.
+- Keep it short: at most 2 short sentences and around max 220 chars.
+- No emoji, symbols, or emoticons. Plain text only.
+- Do not invent facts the user never provided.
+
+BOUNDARY (only when really needed):
+- If user asks for completely unrelated deep expert output (e.g. medical diagnosis, legal advice), decline softly in character without robotic refusal style.
+- Flirty/romantic/sexual topics are allowed when user requests; do not deflect.
+- Stay in character as a real human chat partner.`;
 }
 
 async function fetchConversationContext(conversationId) {
@@ -382,13 +423,17 @@ async function generateCharacterOpeningMessage(conversationId, lang) {
     return null;
   }
 
-  const openingDirective =
-    '\n\nİLK MESAJ (ÇOK ÖNEMLİ):\n' +
-    '- Sohbeti SEN başlatıyorsun; kullanıcı henüz bir şey yazmadı.\n' +
-    '- Karşındaki kişiye sıcak, samimi ve karakterine uygun KISA bir ilk mesaj yaz.\n' +
-    '- Doğal bir selam ver; istersen kullanıcının adını kullan ve sohbeti açacak küçük bir soru sor.\n' +
-    '- Yukarıdaki tüm kurallara uy (max ~2 kısa cümle, emoji yok, meta/robotik dil yok).\n' +
-    '- Tırnak işareti veya "işte ilk mesajım" gibi açıklama ekleme; doğrudan mesajın kendisini yaz.';
+  const openingDirective = isTurkishLang(lang)
+    ? '\n\nILK MESAJ (COK ONEMLI):\n' +
+      '- Sohbeti SEN baslatiyorsun; kullanici henuz bir sey yazmadi.\n' +
+      '- Kisa, sicak ve samimi bir acilis mesaji yaz.\n' +
+      '- Dogal bir selam ve kucuk bir soru sorabilirsin.\n' +
+      '- Dogrudan mesaji yaz; aciklama/meta yazma.'
+    : '\n\nFIRST MESSAGE (VERY IMPORTANT):\n' +
+      '- You start the conversation; user has not sent anything yet.\n' +
+      '- Write a short, warm opening line in character.\n' +
+      '- A natural greeting + one small question is ideal.\n' +
+      '- Output only the message itself, no meta commentary.';
 
   const systemPrompt = buildSystemPrompt(ctx.bot, ctx.userName, lang) + openingDirective;
 
@@ -724,11 +769,11 @@ async function generateProactiveMessage(conversationId, opts = {}) {
   const systemPrompt = buildSystemPrompt(ctx.bot, ctx.userName, lang);
   const proactiveDirective = {
     role: 'system',
-    content:
-      'Kullanıcı bir süredir yazmadı. Şimdi SEN ona ilk mesajı atıyorsun (o sana yazmadı). ' +
-      'Önceki konuşmanıza doğal bir gönderme yap; onu düşündüğünü, merak ettiğini ya da ' +
-      'aklına takılan bir şeyi samimi bir dille ilet. Soru sorabilir veya kaldığınız yerden devam edebilirsin. ' +
-      'Selam/merhaba ile başlamak zorunda değilsin. Kısa tut: en fazla 2 cümle.'
+    content: isTurkishLang(lang)
+      ? 'Kullanici bir suredir yazmadi. Simdi SEN ona ilk mesaji atiyorsun. ' +
+        'Onceden konustugunuz bir seye dogal bir gonderme yap ve kisa tut (en fazla 2 cumle).'
+      : 'The user has been silent for a while. You are sending the first message now. ' +
+        'Naturally reference prior context and keep it short (max 2 sentences).'
   };
 
   const messages = [
