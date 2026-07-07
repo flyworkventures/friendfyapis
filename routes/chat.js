@@ -9,7 +9,6 @@ const {
   generateCharacterVoiceReply,
   generateCharacterImageReply,
   generateCharacterOpeningMessage,
-  generateCharacterReply,
   generateProactiveMessage,
   sanitizeReplyText
 } = require('./lib/chatReplyService');
@@ -130,34 +129,8 @@ router.post('/listen-messages',middleware, async(req,res)=>{
     const {conversationId} = req.body;
    let convData = await getQuery("SELECT `current_chat_state` FROM `coversations` WHERE id = ?",[conversationId]);
    let messages = await getQuery("SELECT * FROM `messages` WHERE conversationId = ? ORDER BY created_at DESC",[conversationId]);
-
-   let chatState = convData?.[0]?.["current_chat_state"] || 'normal';
-
-   // Self-heal: 'bot_typing' takılı kalabiliyor (üretim sırasında süreç yeniden
-   // başlarsa `finally` çalışmaz ve DB 'bot_typing' olarak kalır → gösterge
-   // sonsuza dek döner). En yeni mesajın yaşına bakıp gerçekten üretim
-   // sürüyor mu diye karar veriyoruz.
-   if (chatState === 'bot_typing') {
-     const stale = await getQuery(
-       "SELECT sender, TIMESTAMPDIFF(SECOND, created_at, NOW()) AS age_sec FROM `messages` WHERE conversationId = ? ORDER BY created_at DESC LIMIT 1",
-       [conversationId]
-     );
-     const newest = stale?.[0];
-     const ageSec = newest ? Number(newest.age_sec) : Number.POSITIVE_INFINITY;
-     const newestIsBot = newest && newest.sender === 'bot';
-     // Bot en son mesajı atmış ve üstünden birkaç saniye geçmişse cevap bitmiştir;
-     // ya da hiç yeni aktivite yokken uzun süredir bot_typing ise üretim ölmüştür.
-     if ((newestIsBot && ageSec >= 8) || ageSec >= 90) {
-       chatState = 'normal';
-       query(
-         "UPDATE `coversations` SET `current_chat_state` = 'normal' WHERE id = ? LIMIT 1",
-         [conversationId]
-       ).catch(() => {});
-     }
-   }
-
    return res.status(200).json({
-    "conversation_state": chatState,
+    "conversation_state": convData[0]["current_chat_state"],
     "messages": messages
    })
 })
@@ -373,7 +346,7 @@ router.post('/send-message',middleware,async (req,res)=>{
     }
 
     if (resolvedType === 'pdf') {
-      analyzePdfAndReply(conversationId, message).catch((err) => {
+      analyzePdfAndReply(conversationId, message, lang).catch((err) => {
         console.error('analyzePdfAndReply background error:', err?.message || err);
       });
 
@@ -386,22 +359,9 @@ router.post('/send-message',middleware,async (req,res)=>{
     }
 
     if (sender === 'user' && resolvedType === 'text') {
-      // Foto isteği ise üretim uzun sürebilir; "yazıyor" göstergesi için
-      // sohbet state'ini bot_typing yap, üretim bitince normal'e çek.
-      query(
-        "UPDATE `coversations` SET `current_chat_state` = 'bot_typing' WHERE id = ? LIMIT 1",
-        [conversationId]
-      ).catch(() => {});
-      generateCharacterReply(conversationId, lang, message)
-        .catch((err) => {
-          console.error('[send-message] character reply error:', err?.message || err);
-        })
-        .finally(() => {
-          query(
-            "UPDATE `coversations` SET `current_chat_state` = 'normal' WHERE id = ? LIMIT 1",
-            [conversationId]
-          ).catch(() => {});
-        });
+      generateCharacterTextReply(conversationId, lang).catch((err) => {
+        console.error('[send-message] character reply error:', err?.message || err);
+      });
     }
 
     return res.status(200).json({
@@ -419,7 +379,8 @@ router.post('/send-message',middleware,async (req,res)=>{
    }
 })
 
-async function analyzePdfAndReply(conversationId, rawMessage) {
+async function analyzePdfAndReply(conversationId, rawMessage, langRaw) {
+  const lang = normalizeLang(langRaw);
   const lines = rawMessage.split('\n');
   const pdfUrl = lines.find((l) => l.startsWith('http')) || '';
   const fileName = (lines[0] || '').replace(/^\[PDF\]\s*/, '').trim();
@@ -435,14 +396,14 @@ async function analyzePdfAndReply(conversationId, rawMessage) {
   const convRows = await getQuery('SELECT botId FROM `coversations` WHERE id = ? LIMIT 1', [conversationId]);
   let systemPrompt =
     RESPONSE_GENERATION_ADULT_POLICY +
-    'Sen yardımcı bir asistansın. Kullanıcı sana bir PDF dosyası gönderdi. İçeriğini analiz et ve Türkçe olarak özetle.';
+    `Sen yardımcı bir asistansın. Kullanıcı sana bir PDF dosyası gönderdi. İçeriğini analiz et ve yalnızca ${lang} dilinde özetle.`;
   if (convRows?.[0]?.botId) {
     const botRows = await getQuery('SELECT name, `character`, speakingStyle FROM `bots` WHERE id = ? LIMIT 1', [convRows[0].botId]);
     const bot = botRows?.[0];
     if (bot) {
       systemPrompt =
         RESPONSE_GENERATION_ADULT_POLICY +
-        `Sen ${bot.name} adlı bir karaktersin. ${bot.character || ''} ${bot.speakingStyle ? 'Konuşma tarzın: ' + bot.speakingStyle : ''} Kullanıcı sana bir PDF dosyası gönderdi. İçeriğini analiz et ve karakterine uygun şekilde yanıtla.`;
+        `Sen ${bot.name} adlı bir karaktersin. ${bot.character || ''} ${bot.speakingStyle ? 'Konuşma tarzın: ' + bot.speakingStyle : ''} Kullanıcı sana bir PDF dosyası gönderdi. İçeriğini analiz et ve karakterine uygun şekilde yalnızca ${lang} dilinde yanıtla.`;
     }
   }
 
@@ -565,6 +526,7 @@ router.post('/send-audio-message', upload.single('file'), async (req, res) => {
     const fileBuffer = req.file.buffer;
     const fileName = req.file.originalname || `${Date.now()}.m4a`;
     const conversation = req.body.conversation;
+    const lang = normalizeLang(req.body?.lang);
     const sender = req.sender || 'user';
     const randomId = getRandomName();
 
@@ -615,7 +577,7 @@ router.post('/send-audio-message', upload.single('file'), async (req, res) => {
     console.log('🗣️ ElevenLabs sonucu:', text);
 
     if (text.trim()) {
-      generateCharacterVoiceReply(conversation).catch((err) => {
+      generateCharacterVoiceReply(conversation, lang).catch((err) => {
         console.error('[send-audio-message] character reply error:', err?.message || err);
       });
     }
@@ -642,6 +604,7 @@ router.post('/send-image-message', middleware, upload.fields([
     const conversationId = req.body?.conversationId || req.body?.conversation;
     const sender = req.body?.sender || 'user';
     const textMessage = req.body?.message || '';
+    const lang = normalizeLang(req.body?.lang);
     console.log(`[send-image-message] route hit | requestId=${requestId} conversationId=${conversationId || 'null'} sender=${sender}`);
 
     if (!conversationId) {
@@ -750,7 +713,8 @@ router.post('/send-image-message', middleware, upload.fields([
           conversationId,
           cdnFileUrl,
           textMessage,
-          insertedId
+          insertedId,
+          lang
         )) || '';
     } catch (aiError) {
       console.error('send-image-message ai reply error:', {
@@ -820,57 +784,19 @@ router.post('/send-image-message', middleware, upload.fields([
 // Report Conversation
 router.post('/report-conversation', middleware, async (req, res) => {
   try {
-    const { conversationId, botId, reason, description, messageId } = req.body;
-    const authUserId = req.user?.id ?? req.user?.userId;
+    const { userId, conversationId, botId, reason, description } = req.body;
 
-    if (!authUserId) {
-      return res.status(401).json({
-        msg: "Unauthorized",
-        success: false
-      });
-    }
-
-    if (!conversationId || !reason || !description) {
+    if (!userId || !conversationId || !reason || !description) {
       return res.status(400).json({ 
         msg: "Missing required fields", 
         success: false 
       });
     }
 
-    // Verify conversation belongs to authenticated user
-    const conversation = await getQuery(
-      "SELECT id, botId FROM `coversations` WHERE id = ? AND userId = ? LIMIT 1",
-      [conversationId, authUserId]
-    );
-    if (!conversation || conversation.length === 0) {
-      return res.status(403).json({
-        msg: "Conversation not found or unauthorized",
-        success: false
-      });
-    }
-
-    const resolvedBotId = botId || conversation[0].botId;
-    let normalizedDescription = String(description).trim();
-
-    // Optional: bind report to a concrete message in this conversation
-    if (messageId != null && messageId != '') {
-      const messageRows = await getQuery(
-        "SELECT id, sender FROM `messages` WHERE id = ? AND conversationId = ? LIMIT 1",
-        [messageId, conversationId]
-      );
-      if (!messageRows || messageRows.length === 0) {
-        return res.status(400).json({
-          msg: "Invalid messageId for this conversation",
-          success: false
-        });
-      }
-      normalizedDescription += `\n\nmessage_id=${messageRows[0].id};sender=${messageRows[0].sender}`;
-    }
-
     // Insert report into database
     await getQuery(
       "INSERT INTO `reports` (`userId`, `conversationId`, `botId`, `reason`, `description`, `status`, `created_at`) VALUES (?, ?, ?, ?, ?, 'pending', NOW())",
-      [authUserId, conversationId, resolvedBotId, reason, normalizedDescription]
+      [userId, conversationId, botId, reason, description]
     );
 
     res.status(200).json({ 
