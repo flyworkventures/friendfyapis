@@ -1018,21 +1018,20 @@ class VoiceChatServerV2 {
       }
     }
 
-    // Language priority:
-    //   1. Language of the most recent user message in chat history
-    //      (only if chat actually has content)
-    //   2. clientLang — the device/app locale sent by the Flutter client
-    //   3. user.nativeLang (device locale stored on signup)
+    // Language priority (app locale wins — characters speak in the app language):
+    //   1. clientLang — Flutter app locale (`?lang=`)
+    //   2. Language of recent user messages in chat history
+    //   3. user.nativeLang (legacy; may be a country code)
     //   4. 'tr' as last-resort fallback
     const detectedFromChat = this._detectChatLanguage(historyRows);
     const conversationLang =
-      detectedFromChat ||
       clientLang ||
+      detectedFromChat ||
       user?.nativeLang ||
       'tr';
     console.log(
       `[VCv2] 🌐 [${connectionId}] language = ${conversationLang} ` +
-      `(chat=${detectedFromChat || '-'} client=${clientLang || '-'} ` +
+      `(client=${clientLang || '-'} chat=${detectedFromChat || '-'} ` +
       `native=${user?.nativeLang || '-'})`
     );
 
@@ -1680,50 +1679,28 @@ class VoiceChatServerV2 {
         return;
       }
 
-      // Filter 4 — language handling.
-      //   a) Detect the transcript's language first.
-      //   b) If the detected language is DIFFERENT from the current
-      //      conversation language AND the transcript is long enough to be
-      //      a confident signal (≥10 chars), treat it as a genuine
-      //      language SWITCH and update ctx.language immediately. Do NOT
-      //      drop — the user wants to continue in this new language.
-      //   c) Otherwise, drop on mismatch:
-      //        - Script mismatch (tr → ja/ko/ru) = always drop.
-      //        - Same-script mismatch (tr → en) on short transcript = drop.
-      //      This still lets a clear "Türkçe konuşalım" through while
-      //      rejecting noise / single-word hallucinations.
-      const detectedLang = detectLanguage(raw);
-      let languageSwitched = false;
-      if (
-        detectedLang &&
-        detectedLang !== ctx.language &&
-        raw.length >= 10
-      ) {
+      // Filter 4 — keep the app/conversation language.
+      // Do NOT auto-switch when the user happens to speak another language
+      // (noise, code-switching, STT mistakes). Characters must stay on the
+      // app language unless the user explicitly asks to change (handled by
+      // the LLM instruction, not by rewriting ctx.language here).
+      // Drop clear script mismatches / short same-script mismatches as
+      // likely STT hallucinations.
+      if (_isScriptMismatch(raw, ctx.language)) {
         console.log(
-          `[VCv2] 🌐 [${ctx.connectionId}] language switch (user-driven): ` +
-          `${ctx.language} → ${detectedLang}`
+          `[VCv2] 🙊 [${ctx.connectionId}] dropped (script mismatch, expected=${ctx.language}): ` +
+          `"${raw.substring(0, 60)}"`
         );
-        ctx.language = detectedLang;
-        languageSwitched = true;
+        this._revertToListening(ctx, 'script_mismatch');
+        return;
       }
-
-      if (!languageSwitched) {
-        if (_isScriptMismatch(raw, ctx.language)) {
-          console.log(
-            `[VCv2] 🙊 [${ctx.connectionId}] dropped (script mismatch, expected=${ctx.language}): ` +
-            `"${raw.substring(0, 60)}"`
-          );
-          this._revertToListening(ctx, 'script_mismatch');
-          return;
-        }
-        if (_isLanguageMismatch(raw, ctx.language) && raw.length < 60) {
-          console.log(
-            `[VCv2] 🙊 [${ctx.connectionId}] dropped (lang mismatch, expected=${ctx.language}): ` +
-            `"${raw.substring(0, 60)}"`
-          );
-          this._revertToListening(ctx, 'lang_mismatch');
-          return;
-        }
+      if (_isLanguageMismatch(raw, ctx.language) && raw.length < 60) {
+        console.log(
+          `[VCv2] 🙊 [${ctx.connectionId}] dropped (lang mismatch, expected=${ctx.language}): ` +
+          `"${raw.substring(0, 60)}"`
+        );
+        this._revertToListening(ctx, 'lang_mismatch');
+        return;
       }
 
       // Verified real user turn — safe to act on it now.

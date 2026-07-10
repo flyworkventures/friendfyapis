@@ -129,33 +129,77 @@ function textMatchesLang(text, lang) {
     return false;
 }
 
-function englishCharacterFallback(gender) {
+function isFemaleGender(gender) {
     const g = String(gender || '').toLowerCase();
-    if (g.includes('kad') || g.includes('female') || g === 'f') {
+    return g.includes('kad') || g.includes('female') || g === 'f' || g === 'woman';
+}
+
+function isMaleGender(gender) {
+    const g = String(gender || '').toLowerCase();
+    return g.includes('erk') || g.includes('male') || g === 'm' || g === 'man';
+}
+
+/** EN metinlerde yanlış he/she kullanımını cinsiyete göre düzeltir. */
+function applyGenderPronouns(text, lang, gender) {
+    const trimmed = String(text || '').trim();
+    if (!trimmed || normalizeLang(lang) !== 'en') return trimmed;
+
+    if (isFemaleGender(gender)) {
+        return trimmed
+            .replace(/\bHe\b/g, 'She')
+            .replace(/\bhe\b/g, 'she')
+            .replace(/\bHim\b/g, 'Her')
+            .replace(/\bhim\b/g, 'her')
+            .replace(/\bHis\b/g, 'Her')
+            .replace(/\bhis\b/g, 'her');
+    }
+    if (isMaleGender(gender)) {
+        return trimmed
+            .replace(/\bShe\b/g, 'He')
+            .replace(/\bshe\b/g, 'he')
+            .replace(/\bHer\b/g, 'Him')
+            .replace(/\bher\b/g, 'him')
+            .replace(/\bHers\b/g, 'His')
+            .replace(/\bhers\b/g, 'his');
+    }
+    return trimmed;
+}
+
+function genderTranslationHint(gender, targetLang) {
+    const lang = normalizeLang(targetLang);
+    if (lang !== 'en') return '';
+    if (isFemaleGender(gender)) {
+        return ' The character is female — use she/her (not he/him).';
+    }
+    if (isMaleGender(gender)) {
+        return ' The character is male — use he/him (not she/her).';
+    }
+    return '';
+}
+
+function englishCharacterFallback(gender) {
+    if (isFemaleGender(gender)) {
         return 'Has a striking, energetic and exciting personality. Helpful and sensitive, a game enthusiast and technology lover.';
     }
     return 'Charismatic, confident and attentive. Warm, engaging, and keeps conversations flowing naturally.';
 }
 
 function turkishCharacterFallback(gender) {
-    const g = String(gender || '').toLowerCase();
-    if (g.includes('kad') || g.includes('female') || g === 'f') {
+    if (isFemaleGender(gender)) {
         return 'Göz alıcı, enerjik ve heyecan verici bir kişiliğe sahip. Yardımsever ve duyarlı; oyun meraklısı ve teknoloji aşığı.';
     }
     return 'Karizmatik, kendinden emin ve ilgili. Sıcak, samimi ve sohbeti doğal bir şekilde ilerletir.';
 }
 
 function englishSpeakingStyleFallback(gender) {
-    const g = String(gender || '').toLowerCase();
-    if (g.includes('kad') || g.includes('female') || g === 'f') {
+    if (isFemaleGender(gender)) {
         return 'Speaks in a cheerful, energetic tone. Warm and engaging, sometimes chatty and playful.';
     }
     return 'Speaks in a clear, informative tone. Shares knowledge with a touch of humor when it fits.';
 }
 
 function turkishSpeakingStyleFallback(gender) {
-    const g = String(gender || '').toLowerCase();
-    if (g.includes('kad') || g.includes('female') || g === 'f') {
+    if (isFemaleGender(gender)) {
         return 'Neşeli ve enerjik bir tonda konuşur. Sıcak ve samimi; bazen sohbetçi ve oyuncu.';
     }
     return 'Açık ve bilgilendirici bir tonda konuşur. Uygun olduğunda hafif bir mizahla bilgi paylaşır.';
@@ -173,14 +217,16 @@ function speakingStyleFallback(gender, lang) {
         : englishSpeakingStyleFallback(gender);
 }
 
-async function translateAgentText(text, targetLang) {
+async function translateAgentText(text, targetLang, gender) {
     const trimmed = String(text || '').trim();
     if (!trimmed) return '';
 
     const normalizedLang = normalizeLang(targetLang);
-    if (textMatchesLang(trimmed, normalizedLang)) return trimmed;
+    if (textMatchesLang(trimmed, normalizedLang)) {
+        return applyGenderPronouns(trimmed, normalizedLang, gender);
+    }
 
-    const cacheKey = `${normalizedLang}:${trimmed}`;
+    const cacheKey = `${normalizedLang}:${String(gender || '')}:${trimmed}`;
     if (translationCache.has(cacheKey)) {
         return translationCache.get(cacheKey);
     }
@@ -202,8 +248,9 @@ async function translateAgentText(text, targetLang) {
                     {
                         role: 'system',
                         content:
-                            `Translate the following AI character description into ${targetName}. ` +
-                            'Preserve tone, personality, and length. Return only the translation.'
+                            `Translate the following AI character description into ${targetName}.` +
+                            genderTranslationHint(gender, normalizedLang) +
+                            ' Preserve tone, personality, and length. Return only the translation.'
                     },
                     { role: 'user', content: trimmed }
                 ]
@@ -219,14 +266,15 @@ async function translateAgentText(text, targetLang) {
 
         const translated = response.data?.choices?.[0]?.message?.content?.trim();
         if (translated) {
-            translationCache.set(cacheKey, translated);
-            return translated;
+            const fixed = applyGenderPronouns(translated, normalizedLang, gender);
+            translationCache.set(cacheKey, fixed);
+            return fixed;
         }
     } catch (error) {
         console.warn('[agentLocalization] translate failed:', error.message);
     }
 
-    return trimmed;
+    return applyGenderPronouns(trimmed, normalizedLang, gender);
 }
 
 function pickLocalizedField(row, prefix, lang) {
@@ -262,39 +310,45 @@ function pickSpeakingStyleSync(row, lang) {
 
 function pickCharacterSync(row, lang) {
     const picked = pickLocalizedField(row, 'character', lang);
-    if (picked && textMatchesLang(picked, lang)) return picked;
+    if (picked && textMatchesLang(picked, lang)) {
+        return applyGenderPronouns(picked, lang, row.gender);
+    }
     if (lang === 'tr' && picked && !looksTurkish(picked)) {
         return characterFallback(row.gender, lang);
     }
-    if (picked) return picked;
+    if (picked) return applyGenderPronouns(picked, lang, row.gender);
     return characterFallback(row.gender, lang);
 }
 
 async function pickSpeakingStyle(row, lang, { translate = false } = {}) {
     const picked = pickLocalizedField(row, 'speakingStyle', lang);
-    if (picked && textMatchesLang(picked, lang)) return picked;
+    if (picked && textMatchesLang(picked, lang)) {
+        return applyGenderPronouns(picked, lang, row.gender);
+    }
     if (translate && picked) {
-        const translated = await translateAgentText(picked, lang);
+        const translated = await translateAgentText(picked, lang, row.gender);
         if (translated) return translated;
     }
     if (lang === 'tr' && picked && !looksTurkish(picked)) {
         return speakingStyleFallback(row.gender, lang);
     }
-    if (picked) return picked;
+    if (picked) return applyGenderPronouns(picked, lang, row.gender);
     return speakingStyleFallback(row.gender, lang);
 }
 
 async function pickCharacter(row, lang, { translate = false } = {}) {
     const picked = pickLocalizedField(row, 'character', lang);
-    if (picked && textMatchesLang(picked, lang)) return picked;
+    if (picked && textMatchesLang(picked, lang)) {
+        return applyGenderPronouns(picked, lang, row.gender);
+    }
     if (translate && picked) {
-        const translated = await translateAgentText(picked, lang);
+        const translated = await translateAgentText(picked, lang, row.gender);
         if (translated) return translated;
     }
     if (lang === 'tr' && picked && !looksTurkish(picked)) {
         return characterFallback(row.gender, lang);
     }
-    if (picked) return picked;
+    if (picked) return applyGenderPronouns(picked, lang, row.gender);
     return characterFallback(row.gender, lang);
 }
 

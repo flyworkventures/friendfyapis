@@ -88,10 +88,9 @@ class OpenAIRealtimeSession extends EventEmitter {
       }
     }, 8000);
 
-    // Language handling: auto-detect from the user's audio and mirror it.
-    // Never switch to a different language mid-conversation on your own.
-    // `this.language` is only used as a fallback (initial greeting) when
-    // we haven't yet heard any user speech.
+    // Stick to the app/conversation language. Do not mirror whatever language
+    // the mic happens to pick up — users expect the character to speak in the
+    // language selected in the app.
     const LANG_NAMES = {
       tr: 'Turkish', en: 'English', de: 'German', es: 'Spanish',
       fr: 'French', it: 'Italian', pt: 'Portuguese', ru: 'Russian',
@@ -103,9 +102,10 @@ class OpenAIRealtimeSession extends EventEmitter {
     const instructions = `${this.instructions}
 
 LANGUAGE RULES (very important):
-- Always respond in the exact same language the user is speaking right now.
-- If you haven't heard the user yet, OR cannot clearly identify their language, you MUST respond in ${defaultLanguage} (code: ${this.language}).
-- Never switch to another language unless the user does it first.
+- You MUST always respond in ${defaultLanguage} (code: ${this.language}).
+- This is the app language for this call — do not switch to another language
+  just because the user spoke a different one, or because of background noise.
+- Only switch language if the user explicitly asks you to (e.g. "speak English").
 - Never mix languages in the same sentence.
 
 TONE:

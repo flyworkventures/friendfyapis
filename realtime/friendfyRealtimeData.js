@@ -207,7 +207,8 @@ async function buildRealtimeSystemPrompt(bot, user, conversationLang = 'tr') {
 
   const voiceBlock = `
 VOICE CALL MODE (critical):
-- You are in a live voice/video call. Reply in ${langName} unless the user clearly switches language.
+- You are in a live voice/video call. Always reply in ${langName} (the app language).
+- Do not switch language unless the user explicitly asks you to.
 - Keep answers very short: usually 1-2 spoken sentences. No lists, no markdown.
 - Sound natural and conversational — like a real person on a phone call.
 - Do not mention being an AI, a bot, or a language model.
