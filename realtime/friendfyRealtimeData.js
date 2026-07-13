@@ -4,6 +4,7 @@ const jwt = require('jsonwebtoken');
 const { getQuery, query } = require('../db');
 const { buildSystemPrompt } = require('../routes/lib/chatReplyService');
 const { localizeName } = require('../routes/lib/nameLocalization');
+const { hasActivePremiumAccess } = require('../routes/lib/dailyUsageLimits');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'key';
 
@@ -68,6 +69,15 @@ async function authenticateRealtime(req) {
       url.searchParams.get('botId') || url.searchParams.get('consultantId');
     const botId = parseInt(rawBotId, 10);
     if (!botId || botId <= 0) return { success: false, error: 'Invalid botId' };
+
+    // Sesli/görüntülü arama: yalnızca aktif premium veya RC trial.
+    const users = await getQuery(
+      'SELECT memberships FROM `users` WHERE id = ? LIMIT 1',
+      [userId]
+    );
+    if (!users?.[0] || !hasActivePremiumAccess(users[0].memberships)) {
+      return { success: false, error: 'Premium required' };
+    }
 
     const rawLang = (url.searchParams.get('lang') || '').toLowerCase().trim();
     const clientLang = /^[a-z]{2}$/.test(rawLang) ? rawLang : null;

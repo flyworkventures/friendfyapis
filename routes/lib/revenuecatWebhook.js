@@ -6,10 +6,10 @@ const { normalizeUserId } = require('./assertJwtUserId');
  * RevenueCat webhook entegrasyonu.
  *
  * Amaç: Uygulama kapalıyken bile abonelik durumunu (yenileme, iptal, süre
- * dolması, ödeme sorunu) sunucuda güncel tutmak. Ücretsiz deneme artık yalnızca
- * paywall satın almasıyla (App Store/Play tanıtım teklifi) başladığından, trial
- * dönemi de RevenueCat'te `period_type = TRIAL` olan aktif bir abonelik olarak
- * gelir ve burada `paid` üyelik olarak işlenir (deneme boyunca kullanıcı premium).
+ * dolması, ödeme sorunu) sunucuda güncel tutmak. Store intro trial
+ * `period_type = TRIAL` ile gelir ve burada `type: trial` olarak yazılır;
+ * süre `expiration_at_ms` ile RC'den gelir. Trial ve paid aynı full-premium
+ * erişimi verir (mesaj/arama/karakter).
  */
 
 /** Erişimi AKTİF hale getiren/uzatan olaylar. */
@@ -118,14 +118,15 @@ async function resolveUser(event) {
  * kaldırıp yeni hesaplanan ücretli üyeliği yerleştirir. Kullanıcı tarafından
  * eklenmiş diğer (device dışı) freeTrial kayıtları korunur.
  */
-function upsertPaidMembership(dbArr, newPaid) {
+function upsertSubscriptionMembership(dbArr, newMembership) {
     const preserved = dbArr.filter((m) => {
         if (!m || typeof m !== 'object') return false;
         const t = String(m.type || '').toLowerCase();
-        if (t === 'paid') return false; // eski paid kayıtları değiştir
+        // RC abonelik kayıtlarını değiştir (paid + trial)
+        if (t === 'paid' || t === 'trial') return false;
         return true;
     });
-    if (newPaid) preserved.push(newPaid);
+    if (newMembership) preserved.push(newMembership);
     return preserved;
 }
 
@@ -176,20 +177,28 @@ async function applyRevenueCatEvent(event) {
 
     const dbArr = parseMembershipsArray(userRow.memberships);
 
+    // Store intro trial → type: trial (süre expiration_at_ms ile RC'den gelir).
+    // Normal abonelik → type: paid. İkisi de full premium erişim verir.
+    const periodType = String(event.period_type || '').toUpperCase();
+    const membershipType = periodType === 'TRIAL' ? 'trial' : 'paid';
+
     let newArr;
     if (!isActive) {
-        // Erişim bitti: paid kayıtları kaldır (device freeTrial dışı üyelikleri koru).
-        newArr = dbArr.filter((m) => String(m?.type || '').toLowerCase() !== 'paid');
+        // Erişim bitti: RC abonelik kayıtlarını kaldır (paid + trial).
+        newArr = dbArr.filter((m) => {
+            const t = String(m?.type || '').toLowerCase();
+            return t !== 'paid' && t !== 'trial';
+        });
     } else {
-        const newPaid = {
+        const newMembership = {
             startDate: startIso,
             endDate: endIso,
             productId,
-            type: 'paid',
+            type: membershipType,
             isActive: true,
             purchasedAt: startIso
         };
-        newArr = upsertPaidMembership(dbArr, newPaid);
+        newArr = upsertSubscriptionMembership(dbArr, newMembership);
     }
 
     // Sunucu tarafında güvenilmeyen device freeTrial kayıtlarını da temizle.

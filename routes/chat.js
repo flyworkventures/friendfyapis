@@ -14,6 +14,10 @@ const {
 } = require('./lib/chatReplyService');
 const { normalizeLang } = require('./lib/agentLocalization');
 const { localizeName } = require('./lib/nameLocalization');
+const {
+  enforceDailySendLimit,
+  jwtUserId,
+} = require('./lib/dailyUsageLimits');
 
 /** Sistem karakterinin (system 1/2) ismini dile göre yerelleştirir; kullanıcı karakterine dokunmaz. */
 function localizeBotName(bot, lang) {
@@ -332,6 +336,14 @@ router.post('/send-message',middleware,async (req,res)=>{
     }
 
     const resolvedType = messageType || 'text';
+    const limitKind = resolvedType === 'image' ? 'image' : resolvedType === 'voice' ? 'voice' : 'text';
+    const usage = await enforceDailySendLimit({
+      userId: jwtUserId(req),
+      kind: limitKind,
+    });
+    if (!usage.ok) {
+      return res.status(usage.status).json(usage.body);
+    }
 
     const result = await query(
       "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
@@ -516,11 +528,19 @@ function detectImageMimeFromMagicBytes(buffer) {
   return null;
 }
 
-router.post('/send-audio-message', upload.single('file'), async (req, res) => {
+router.post('/send-audio-message', middleware, upload.single('file'), async (req, res) => {
   try {
     // 📦 1. Gelen dosyayı kontrol et
     if (!req.file) {
       return res.status(400).json({ error: 'Ses dosyası yüklenmedi.' });
+    }
+
+    const usage = await enforceDailySendLimit({
+      userId: jwtUserId(req),
+      kind: 'voice',
+    });
+    if (!usage.ok) {
+      return res.status(usage.status).json(usage.body);
     }
 
     const fileBuffer = req.file.buffer;
@@ -614,6 +634,14 @@ router.post('/send-image-message', middleware, upload.fields([
         message: 'conversationId missing',
         requestId
       });
+    }
+
+    const usage = await enforceDailySendLimit({
+      userId: jwtUserId(req),
+      kind: 'image',
+    });
+    if (!usage.ok) {
+      return res.status(usage.status).json(usage.body);
     }
 
     const uploadedImage = req.files?.image?.[0] || req.files?.file?.[0];
