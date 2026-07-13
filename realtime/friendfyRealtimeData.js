@@ -70,21 +70,25 @@ async function authenticateRealtime(req) {
     const botId = parseInt(rawBotId, 10);
     if (!botId || botId <= 0) return { success: false, error: 'Invalid botId' };
 
-    // Sesli/görüntülü arama: yalnızca aktif premium veya RC trial.
-    const users = await getQuery(
-      'SELECT memberships FROM `users` WHERE id = ? LIMIT 1',
-      [userId]
-    );
-    if (!users?.[0] || !hasActivePremiumAccess(users[0].memberships)) {
-      return { success: false, error: 'Premium required' };
+    // Görüntülü arama herkese açık; sesli arama premium/trial ister.
+    const rawModeEarly = (url.searchParams.get('callMode') || url.searchParams.get('mode') || '')
+      .toLowerCase()
+      .trim();
+    const isVideoCall = rawModeEarly === 'video';
+    if (!isVideoCall) {
+      const users = await getQuery(
+        'SELECT memberships FROM `users` WHERE id = ? LIMIT 1',
+        [userId]
+      );
+      if (!users?.[0] || !hasActivePremiumAccess(users[0].memberships)) {
+        return { success: false, error: 'Premium required' };
+      }
     }
 
     const rawLang = (url.searchParams.get('lang') || '').toLowerCase().trim();
     const clientLang = /^[a-z]{2}$/.test(rawLang) ? rawLang : null;
 
-    const rawMode = (url.searchParams.get('callMode') || url.searchParams.get('mode') || '')
-      .toLowerCase()
-      .trim();
+    const rawMode = rawModeEarly;
     const callMode = rawMode === 'voice' || rawMode === 'video' ? rawMode : null;
 
     return { success: true, userId, consultantId: botId, botId, clientLang, callMode };
