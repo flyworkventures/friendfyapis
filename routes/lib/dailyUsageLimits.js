@@ -3,10 +3,29 @@
 const { getQuery } = require('../../db');
 const { parseMembershipsArray } = require('./membershipsSync');
 
+function envInt(name, fallback) {
+  const n = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 /** Misafir günlük kotaları */
-const GUEST_LIMITS = Object.freeze({ text: 10, image: 2, voice: 2 });
+const GUEST_LIMITS = Object.freeze({
+  text: envInt('GUEST_DAILY_TEXT_LIMIT', 100),
+  image: envInt('GUEST_DAILY_IMAGE_LIMIT', 2),
+  voice: envInt('GUEST_DAILY_VOICE_LIMIT', 2),
+});
 /** Ücretsiz (logged-in, premium değil) günlük kotaları */
-const FREE_LIMITS = Object.freeze({ text: 20, image: 2, voice: 2 });
+const FREE_LIMITS = Object.freeze({
+  // Test günlerinde düşük kota (20) sohbeti kilitliyordu; env ile override edilebilir.
+  text: envInt('FREE_DAILY_TEXT_LIMIT', 200),
+  image: envInt('FREE_DAILY_IMAGE_LIMIT', 2),
+  voice: envInt('FREE_DAILY_VOICE_LIMIT', 2),
+});
+
+/** true ise metin günlük limiti uygulanmaz (yalnızca lokal/debug). */
+const DISABLE_DAILY_TEXT_LIMIT =
+  String(process.env.DISABLE_DAILY_TEXT_LIMIT || '').toLowerCase() === 'true' ||
+  process.env.DISABLE_DAILY_TEXT_LIMIT === '1';
 
 const KIND_TO_MESSAGE_TYPES = Object.freeze({
   text: ['text'],
@@ -102,6 +121,10 @@ async function enforceDailySendLimit({ userId, kind }) {
     return { ok: true, unlimited: true };
   }
 
+  if (kind === 'text' && DISABLE_DAILY_TEXT_LIMIT) {
+    return { ok: true, unlimited: true, bypass: 'DISABLE_DAILY_TEXT_LIMIT' };
+  }
+
   const limit = getDailyLimitForKind(user.credential, kind);
   const used = await countTodayUserMessages(user.id, kind);
 
@@ -115,6 +138,10 @@ async function enforceDailySendLimit({ userId, kind }) {
           : isGuest
             ? 'GUEST_MESSAGE_LIMIT'
             : 'DAILY_MESSAGE_LIMIT';
+
+    console.warn(
+      `[usage] daily limit hit user=${user.id} kind=${kind} used=${used} limit=${limit}`
+    );
 
     return {
       ok: false,

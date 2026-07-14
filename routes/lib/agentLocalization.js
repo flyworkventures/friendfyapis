@@ -1,6 +1,6 @@
 const axios = require('axios');
 const { getQuery } = require('../../db');
-const { localizeName } = require('./nameLocalization');
+const { localizeName, rewriteNamesInText } = require('./nameLocalization');
 
 const SUPPORTED_LANGS = ['tr', 'en', 'de', 'fr', 'pt', 'it', 'es', 'zh', 'ja', 'ru', 'hi', 'ko'];
 
@@ -384,7 +384,51 @@ async function localizeAgentRow(row, lang, options = {}) {
     // Kullanıcı karakterleri (system=0) ve haritada olmayan isimler değiştirilmez.
     const systemFlag = Number(row.system);
     if (systemFlag === 1 || systemFlag === 2) {
-        out.name = localizeName(row.name, normalizedLang);
+        const canonicalName = row.name;
+        out.name = localizeName(canonicalName, normalizedLang);
+        // Açıklama alanlarındaki yabancı isim varyantlarını da hedef dil ismiyle değiştir.
+        // (Flutter çoğu yerde character_tr vb. alanları tercih ediyor.)
+        const charCols = [
+            'character',
+            'character_tr',
+            'character_en',
+            'character_de',
+            'character_fr',
+            'character_pt',
+            'character_it',
+            'character_es',
+            'character_zh',
+            'character_ja',
+            'character_ru',
+            'character_hi',
+            'character_ko',
+            'character_localized',
+        ];
+        const langByCol = {
+            character: normalizedLang,
+            character_localized: normalizedLang,
+            character_tr: 'tr',
+            character_en: 'en',
+            character_de: 'de',
+            character_fr: 'fr',
+            character_pt: 'pt',
+            character_it: 'it',
+            character_es: 'es',
+            character_zh: 'zh',
+            character_ja: 'ja',
+            character_ru: 'ru',
+            character_hi: 'hi',
+            character_ko: 'ko',
+        };
+        for (const col of charCols) {
+            if (out[col]) {
+                out[col] = rewriteNamesInText(
+                    out[col],
+                    canonicalName,
+                    langByCol[col] || normalizedLang
+                );
+            }
+        }
     }
 
     return out;

@@ -17,6 +17,10 @@ const REFRESH_TOKEN_EXPIRY = '365d';  // 1 yıl
 // checkAuth ile aynı sır: ortamda JWT_SECRET yoksa 'key' (eski davranış)
 const JWT_SECRET = process.env.JWT_SECRET || 'key';
 
+
+
+
+
 /** Access JWT: id + userId (sayı) + email — agent rotaları req.user.id için gerekli. */
 function signAccessTokenForUser(userRow) {
     if (!userRow || !userRow.email) return null;
@@ -203,6 +207,38 @@ function serializeHobbiesForDb(hobbies) {
     return JSON.stringify(hobbies);
 }
 
+function serializeNotificationPreferencesForDb(prefs) {
+    if (prefs == null) return null;
+    if (typeof prefs === 'string') {
+        try {
+            JSON.parse(prefs);
+            return prefs;
+        } catch (_) {
+            return null;
+        }
+    }
+    if (typeof prefs !== 'object' || Array.isArray(prefs)) return null;
+    return JSON.stringify(prefs);
+}
+
+function parseNotificationPreferences(raw) {
+    if (raw == null) return null;
+    if (typeof raw === 'object' && !Array.isArray(raw)) return raw;
+    if (typeof raw === 'string' && raw.trim()) {
+        try {
+            let parsed = JSON.parse(raw);
+            // Çift encode (string içinde JSON) durumu.
+            if (typeof parsed === 'string') {
+                parsed = JSON.parse(parsed);
+            }
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                return parsed;
+            }
+        } catch (_) {}
+    }
+    return null;
+}
+
 function mapGuestUserRow(row, fallback = {}) {
     if (!row) return null;
     return {
@@ -225,7 +261,10 @@ function mapGuestUserRow(row, fallback = {}) {
         counrty: row.counrty ?? null,
         gender: row.gender || fallback.gender || 'male',
         hobbies: row.hobbies ?? null,
-        photoURL: row.photoURL ?? null
+        photoURL: row.photoURL ?? null,
+        notificationPreferences: parseNotificationPreferences(
+            row.notification_preferences ?? row.notificationPreferences
+        ),
     };
 }
 
@@ -527,8 +566,14 @@ console.log("Tetiklendi")
 if (sqlQuery.length === 0) {
            return null;
         }else{
-            console.log("User: " + sqlQuery[0])
-            return sqlQuery[0];
+            const row = sqlQuery[0];
+            console.log("User: " + row)
+            return {
+                ...row,
+                notificationPreferences: parseNotificationPreferences(
+                    row.notification_preferences ?? row.notificationPreferences
+                ),
+            };
         }
 }
 
@@ -612,7 +657,15 @@ const middleware = require('../middleware/checkAuth');
 
 router.post('/update-profile', middleware, async (req, res) => {
     try {
-        const { userId, username, photoURL, birthdate, gender, hobbies } = req.body;
+        const {
+            userId,
+            username,
+            photoURL,
+            birthdate,
+            gender,
+            hobbies,
+            notificationPreferences,
+        } = req.body;
 
         if (!userId) {
             return res.status(400).json({
@@ -695,6 +748,21 @@ router.post('/update-profile', middleware, async (req, res) => {
             updateValues.push(serializeHobbiesForDb(hobbies));
         }
 
+        if (notificationPreferences !== undefined) {
+            const serialized = serializeNotificationPreferencesForDb(
+                notificationPreferences
+            );
+            if (notificationPreferences !== null && serialized == null) {
+                return res.status(400).json({
+                    msg: "Invalid notificationPreferences",
+                    success: false,
+                    code: "INVALID_NOTIFICATION_PREFERENCES",
+                });
+            }
+            updateFields.push("notification_preferences = ?");
+            updateValues.push(serialized);
+        }
+
         if (updateFields.length === 0) {
             return res.status(400).json({
                 msg: "No fields to update",
@@ -723,6 +791,9 @@ router.post('/update-profile', middleware, async (req, res) => {
                 accountCreatedDate: row.accountCreatedDate
                     ? new Date(row.accountCreatedDate).toISOString()
                     : row.accountCreatedDate,
+                notificationPreferences: parseNotificationPreferences(
+                    row.notification_preferences ?? row.notificationPreferences
+                ),
             }
         });
 

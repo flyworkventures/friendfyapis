@@ -104,7 +104,46 @@ function localizeName(name, lang) {
     return entry[l] || entry.en || raw;
 }
 
+function escapeRegExp(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Açıklama metnindeki tüm dil varyantı isimleri hedef dildeki isimle değiştirir.
+ * Örn. TR'de "Alaric, biraz..." → "Alp, biraz..."
+ */
+function rewriteNamesInText(text, canonicalName, lang) {
+    const rawText = String(text || '');
+    const canonical = String(canonicalName || '').trim();
+    if (!rawText || !canonical) return rawText;
+
+    const localized = localizeName(canonical, lang);
+    const entry =
+        NAME_MAP[canonical] ||
+        NAME_MAP_LOWER[canonical.toLocaleLowerCase('tr')] ||
+        NAME_MAP_LOWER[canonical.toLowerCase()];
+
+    const variants = new Set();
+    variants.add(canonical);
+    if (entry) {
+        for (const v of Object.values(entry)) {
+            if (v && String(v).trim()) variants.add(String(v).trim());
+        }
+    }
+
+    // Uzun isimleri önce değiştir (ör. Seraphina > Sera).
+    const ordered = [...variants].sort((a, b) => b.length - a.length);
+    let out = rawText;
+    for (const variant of ordered) {
+        if (!variant || variant === localized) continue;
+        const re = new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRegExp(variant)}(?![\\p{L}\\p{N}_])`, 'giu');
+        out = out.replace(re, localized);
+    }
+    return out;
+}
+
 module.exports = {
     localizeName,
+    rewriteNamesInText,
     NAME_MAP,
 };
