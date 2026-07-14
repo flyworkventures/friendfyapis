@@ -9,6 +9,7 @@ const {
   generateCharacterVoiceReply,
   generateCharacterImageReply,
   generateCharacterOpeningMessage,
+  generateCharacterReply,
   generateProactiveMessage,
   sanitizeReplyText
 } = require('./lib/chatReplyService');
@@ -133,8 +134,29 @@ router.post('/listen-messages',middleware, async(req,res)=>{
     const {conversationId} = req.body;
    let convData = await getQuery("SELECT `current_chat_state` FROM `coversations` WHERE id = ?",[conversationId]);
    let messages = await getQuery("SELECT * FROM `messages` WHERE conversationId = ? ORDER BY created_at DESC",[conversationId]);
+
+   let chatState = convData?.[0]?.["current_chat_state"] || 'normal';
+
+   // Self-heal: üretim sırasında crash olursa bot_typing takılı kalabilir.
+   if (chatState === 'bot_typing') {
+     const stale = await getQuery(
+       "SELECT sender, TIMESTAMPDIFF(SECOND, created_at, NOW()) AS age_sec FROM `messages` WHERE conversationId = ? ORDER BY created_at DESC LIMIT 1",
+       [conversationId]
+     );
+     const newest = stale?.[0];
+     const ageSec = newest ? Number(newest.age_sec) : Number.POSITIVE_INFINITY;
+     const newestIsBot = newest && newest.sender === 'bot';
+     if ((newestIsBot && ageSec >= 8) || ageSec >= 90) {
+       chatState = 'normal';
+       query(
+         "UPDATE `coversations` SET `current_chat_state` = 'normal' WHERE id = ? LIMIT 1",
+         [conversationId]
+       ).catch(() => {});
+     }
+   }
+
    return res.status(200).json({
-    "conversation_state": convData[0]["current_chat_state"],
+    "conversation_state": chatState,
     "messages": messages
    })
 })
@@ -371,9 +393,21 @@ router.post('/send-message',middleware,async (req,res)=>{
     }
 
     if (sender === 'user' && resolvedType === 'text') {
-      generateCharacterTextReply(conversationId, lang).catch((err) => {
-        console.error('[send-message] character reply error:', err?.message || err);
-      });
+      // Foto isteği uzun sürebilir; "yazıyor" göstergesi için bot_typing.
+      query(
+        "UPDATE `coversations` SET `current_chat_state` = 'bot_typing' WHERE id = ? LIMIT 1",
+        [conversationId]
+      ).catch(() => {});
+      generateCharacterReply(conversationId, lang, message)
+        .catch((err) => {
+          console.error('[send-message] character reply error:', err?.message || err);
+        })
+        .finally(() => {
+          query(
+            "UPDATE `coversations` SET `current_chat_state` = 'normal' WHERE id = ? LIMIT 1",
+            [conversationId]
+          ).catch(() => {});
+        });
     }
 
     return res.status(200).json({

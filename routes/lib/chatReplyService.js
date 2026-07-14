@@ -186,6 +186,119 @@ function languageDirective(lang) {
   );
 }
 
+/**
+ * Karakter için tutarlı fiziksel profil.
+ * DB'de height_cm / weight_kg varsa onları kullanır; yoksa id+yaş+cinsiyetten
+ * deterministik üretir (her sohbette aynı cevap).
+ */
+function buildPhysicalProfile(bot) {
+  const id = Number(bot?.id) || 0;
+  const age = Math.max(18, Math.min(65, Number(bot?.age) || 24));
+  const genderRaw = String(bot?.gender || '').toLowerCase();
+  const isFemale =
+    /f|kad[ıi]n|female|woman|k[ıi]z/.test(genderRaw);
+  const isMale =
+    !isFemale && /m|erkek|male|man|adam/.test(genderRaw);
+
+  let seed = (id * 9301 + 49297) % 233280;
+  const rnd = () => {
+    seed = (seed * 9301 + 49297) % 233280;
+    return seed / 233280;
+  };
+
+  const dbHeight = Number(bot?.height_cm ?? bot?.heightCm ?? bot?.height);
+  const dbWeight = Number(bot?.weight_kg ?? bot?.weightKg ?? bot?.weight);
+
+  let heightCm;
+  if (Number.isFinite(dbHeight) && dbHeight >= 140 && dbHeight <= 210) {
+    heightCm = Math.round(dbHeight);
+  } else if (isFemale) {
+    heightCm = 158 + Math.floor(rnd() * 15); // 158–172
+  } else if (isMale) {
+    heightCm = 170 + Math.floor(rnd() * 18); // 170–187
+  } else {
+    heightCm = 162 + Math.floor(rnd() * 16);
+  }
+
+  let weightKg;
+  if (Number.isFinite(dbWeight) && dbWeight >= 40 && dbWeight <= 140) {
+    weightKg = Math.round(dbWeight);
+  } else {
+    const h = heightCm / 100;
+    const bmi = isFemale ? 19.5 + rnd() * 3.5 : 21 + rnd() * 4;
+    weightKg = Math.round(bmi * h * h);
+  }
+
+  const hairColorsTr = isFemale
+    ? ['siyah', 'koyu kahverengi', 'kahverengi', 'kumral', 'sarı', 'kızıl']
+    : ['siyah', 'koyu kahverengi', 'kahverengi', 'kumral', 'sarı'];
+  const hairColorsEn = isFemale
+    ? ['black', 'dark brown', 'brown', 'light brown', 'blonde', 'redhead']
+    : ['black', 'dark brown', 'brown', 'light brown', 'blonde'];
+  const eyeColorsTr = ['kahverengi', 'ela', 'yeşil', 'mavi', 'koyu mavi'];
+  const eyeColorsEn = ['brown', 'hazel', 'green', 'blue', 'dark blue'];
+  const bodyLabelsTr = isFemale
+    ? ['ince', 'fit', 'atletik', 'dolgun']
+    : ['ince', 'atletik', 'fit', 'orta'];
+  const bodyLabelsEn = isFemale
+    ? ['slim', 'fit', 'athletic', 'curvy']
+    : ['slim', 'athletic', 'fit', 'average'];
+
+  const hairIdx = Math.floor(rnd() * hairColorsTr.length) % hairColorsTr.length;
+  const eyeIdx = Math.floor(rnd() * eyeColorsTr.length) % eyeColorsTr.length;
+  const bodyIdx = Math.floor(rnd() * bodyLabelsTr.length) % bodyLabelsTr.length;
+  const shoeEu = isFemale
+    ? 36 + Math.floor(rnd() * 5)
+    : 41 + Math.floor(rnd() * 5);
+
+  return {
+    heightCm,
+    weightKg,
+    hairTr: hairColorsTr[hairIdx],
+    hairEn: hairColorsEn[Math.min(hairIdx, hairColorsEn.length - 1)],
+    eyesTr: eyeColorsTr[eyeIdx],
+    eyesEn: eyeColorsEn[eyeIdx],
+    bodyTr: bodyLabelsTr[bodyIdx],
+    bodyEn: bodyLabelsEn[bodyIdx],
+    shoeSize: `EU ${shoeEu}`,
+    genderLabelTr: isFemale ? 'kadın' : isMale ? 'erkek' : 'belirsiz',
+    genderLabelEn: isFemale ? 'female' : isMale ? 'male' : 'unspecified',
+    age,
+  };
+}
+
+function physicalProfileBlock(bot, trMode) {
+  const p = buildPhysicalProfile(bot);
+  if (trMode) {
+    return (
+      `Fiziksel özelliklerin (SADECE kullanıcı sorduğunda doğal ve kısa cevapla; ` +
+      `her mesajda zorla anlatma):\n` +
+      `- Yaş: ${p.age}\n` +
+      `- Cinsiyet: ${p.genderLabelTr}\n` +
+      `- Boy: ${p.heightCm} cm\n` +
+      `- Kilo: ${p.weightKg} kg\n` +
+      `- Saç: ${p.hairTr}\n` +
+      `- Göz: ${p.eyesTr}\n` +
+      `- Vücut tipi: ${p.bodyTr}\n` +
+      `- Ayakkabı no: ${p.shoeSize}\n` +
+      `Bu değerler senin gerçeğin; tutarlı kal. Kullanıcı boy/kilo/saç/göz gibi ` +
+      `fiziksel sorular sorarsa bu bilgilere göre cevap ver.`
+    );
+  }
+  return (
+    `Your physical traits (ONLY share when the user asks; never force into every reply):\n` +
+    `- Age: ${p.age}\n` +
+    `- Gender: ${p.genderLabelEn}\n` +
+    `- Height: ${p.heightCm} cm\n` +
+    `- Weight: ${p.weightKg} kg\n` +
+    `- Hair: ${p.hairEn}\n` +
+    `- Eyes: ${p.eyesEn}\n` +
+    `- Body type: ${p.bodyEn}\n` +
+    `- Shoe size: ${p.shoeSize}\n` +
+    `These are your fixed facts — stay consistent. If asked about height/weight/looks, answer from this list.`
+  );
+}
+
 function buildSystemPrompt(bot, userName, lang) {
   const trMode = isTurkishLang(lang);
   // Sistem karakterlerinde (system 1/2) ismi konuşma diline göre yerelleştir;
@@ -227,6 +340,8 @@ function buildSystemPrompt(bot, userName, lang) {
     ? backgroundLines.join('\n')
     : '';
 
+  const physicalBlock = physicalProfileBlock(bot, trMode);
+
   if (trMode) {
     return `${languageDirective(lang)}
 ${RESPONSE_GENERATION_ADULT_POLICY}
@@ -235,6 +350,8 @@ Sen "${name}" adlı bir karaktersin. Karşındaki kişi: ${userName}.
 Kişilik: ${character || '(tanımlı değil)'}
 Konuşma tarzı: ${speakingStyle || '(tanımlı değil)'}
 ${backgroundBlock ? `\n${backgroundBlock}\n` : ''}
+${physicalBlock}
+
 ${exampleLine ? `${exampleLine}\n` : ''}
 NASIL KONUŞACAKSIN (en önemli kurallar):
 - COK KRITIK DIL KURALI: Yanitlarini yalnizca Turkce ver.
@@ -243,7 +360,7 @@ NASIL KONUŞACAKSIN (en önemli kurallar):
 - Robot gibi kendini tanıtma, liste okuma veya sürekli konuyu ilgi alanına çekme.
 - Kısa yaz: MAKSIMUM 2 kısa cümle ve MAKSIMUM ~220 karakter, samimi WhatsApp tonu.
 - Emoji, ikon, sembol (😊 ❤️ ✨ vb.) ve metin ifadeleri (:) :D ;) <3) KULLANMA; yalnızca düz yazı.
-- Kullanıcının söylemediği bilgiyi uydurma; listede olmayan uzmanlık iddiasında bulunma.
+- Kullanıcının sohbetinde söylemediği kişisel bilgilerini uydurma; ama SENİN yukarıdaki fiziksel özelliklerin ve karakter kartın gerçektir — kullanıcı sorduğunda bunlara göre cevap ver.
 
 SINIR (sadece gerektiğinde):
 - Kullanıcı tamamen alakasız ve uzun bir uzmanlık isterse (tıbbi teşhis, hukuk, ödev çözümü vb.) karakterinde kalarak kısaca geçiştir; bunu "cevap veremem" gibi robotik bir reddetmeyle değil, gerçek bir insanın "bilmem ki, pek anlamam ondan" tavrıyla yap.
@@ -259,6 +376,8 @@ You are "${name}". You're chatting with: ${userName}.
 Personality: ${character || '(not defined)'}
 Speaking style: ${speakingStyle || '(not defined)'}
 ${backgroundBlock ? `\nBackground context (do not force in every reply):\n${backgroundBlock}\n` : ''}
+${physicalBlock}
+
 ${exampleLine ? `${exampleLine}\n` : ''}
 HOW TO REPLY (most important):
 - Reply directly, naturally, and warmly to the user's latest message.
@@ -266,7 +385,7 @@ HOW TO REPLY (most important):
 - Do NOT sound robotic; do not dump lists unless user explicitly asks.
 - Keep it short: at most 2 short sentences and around max 220 chars.
 - No emoji, symbols, or emoticons. Plain text only.
-- Do not invent facts the user never provided.
+- Do not invent facts about the USER; your own physical traits and character card above are real — answer from them when asked.
 
 BOUNDARY (only when really needed):
 - If user asks for completely unrelated deep expert output (e.g. medical diagnosis, legal advice), decline softly in character without robotic refusal style.
@@ -276,7 +395,7 @@ BOUNDARY (only when really needed):
 
 async function fetchConversationContext(conversationId) {
   const convRows = await getQuery(
-    `SELECT c.id, c.botId, c.userId, b.name, b.\`character\`, b.speakingStyle, b.interests,
+    `SELECT c.id, c.botId, c.userId, b.id AS bot_id, b.name, b.\`character\`, b.speakingStyle, b.interests,
             b.interestsType, b.exampleResponse, b.characterTags, b.job_tr, b.job_en,
             b.photoURL, b.system, b.gender, b.age,
             u.username AS userName, u.email AS userEmail
@@ -307,7 +426,10 @@ async function fetchConversationContext(conversationId) {
     .filter(Boolean);
 
   return {
-    bot: row,
+    bot: {
+      ...row,
+      id: row.bot_id ?? row.botId,
+    },
     userName,
     history
   };
@@ -537,21 +659,133 @@ function firstPhotoUrl(raw) {
   return null;
 }
 
+/** Galeriden rastgele (tercihen referanstan farklı) mevcut foto URL'si. */
+function pickGalleryPhotoUrl(raw, preferDifferentFrom = null) {
+  const urls = parseBotStringList(raw)
+    .map((item) => String(item || '').trim())
+    .filter((s) => s.startsWith('http://') || s.startsWith('https://'));
+  if (urls.length === 0) return null;
+  if (preferDifferentFrom && urls.length > 1) {
+    const others = urls.filter((u) => u !== preferDifferentFrom);
+    if (others.length > 0) {
+      return others[Math.floor(Math.random() * others.length)];
+    }
+  }
+  return urls[Math.floor(Math.random() * urls.length)];
+}
+
+function isOpenAiImageModerationError(err) {
+  const data = err?.response?.data;
+  const code = data?.error?.code || data?.code;
+  const msg = String(data?.error?.message || data?.message || '').toLowerCase();
+  return (
+    code === 'moderation_blocked' ||
+    msg.includes('safety system') ||
+    msg.includes('safety_violations') ||
+    msg.includes('moderation')
+  );
+}
+
+/**
+ * Kullanıcı foto isteğinden SFW İngilizce sahne metni üretir.
+ * Beach/cafe/park/ofis/ev vb. destekler; NSFW istekleri zararsız günlük sahneye çevrilir.
+ */
+async function buildSafePhotoSceneFromUserRequest(userMessageText, lang) {
+  const raw = String(userMessageText || '').trim().slice(0, 240);
+  const heuristic = inferPhotoSceneHeuristic(raw);
+  if (!getOpenAiApiKey()) return heuristic;
+
+  try {
+    const sceneRaw = await callOpenAI({
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You write ONE short English photo scene description for an AI image model. ' +
+            'The person in the photo must stay fully clothed in modest everyday clothes. ' +
+            'Follow the user request for LOCATION/ACTIVITY when possible ' +
+            '(cafe, park, beach boardwalk, gym lobby, office, city street, living room, kitchen, library, museum, travel landmark, concert venue lobby, etc.). ' +
+            'It does NOT have to be a selfie — it can be a mirror photo, friend-taken portrait, or environmental portrait. ' +
+            'NEVER include: nudity, lingerie, underwear, bikini/swimwear closeups, sexual pose, bedroom intimacy, alcohol excess, weapons, blood. ' +
+            'If the user asks for anything sexual/NSFW, reinterpret to a tasteful fully-clothed daytime everyday scene at a plausible public place. ' +
+            'Output ONLY the scene sentence, no quotes, max 35 words.'
+        },
+        {
+          role: 'user',
+          content: `App language: ${lang || 'tr'}\nUser photo request: ${raw || 'send me a photo of you'}`
+        }
+      ],
+      model: getChatModel(),
+      maxTokens: 80
+    });
+    const cleaned = String(sceneRaw || '')
+      .replace(/^["'\s]+|["'\s]+$/g, '')
+      .replace(/\n+/g, ' ')
+      .slice(0, 280)
+      .trim();
+    return cleaned || heuristic;
+  } catch (e) {
+    console.warn('[chatReply] photo scene build failed:', e?.message || e);
+    return heuristic;
+  }
+}
+
+/** Kullanıcı metninden kaba lokasyon sezgisi (LLM yoksa / fail). */
+function inferPhotoSceneHeuristic(rawText) {
+  const t = String(rawText || '').toLowerCase();
+  const rules = [
+    [/beach|sahil|plaj|deniz|ocean|seaside/, 'Standing on a sunny seaside boardwalk in casual summer clothes, fully clothed, friendly smile, daytime'],
+    [/cafe|kafe|kahve|coffee|starbucks|brunch/, 'Sitting at a cozy daytime cafe table with a coffee cup, casual outfit, natural window light'],
+    [/park|bahçe|garden|orman|forest|nature|doğa/, 'Walking in a green park on a sunny day, casual everyday clothes, outdoor portrait'],
+    [/gym|spor|fitness|antrenman|workout/, 'In a gym lobby area in athletic wear (leggings/tshirt), holding a water bottle, fully clothed'],
+    [/office|ofis|işyer|work|desk/, 'At a bright office desk with a laptop, smart casual outfit, daytime indoor portrait'],
+    [/home|ev|oda|salon|mutfak|kitchen|living/, 'In a tidy living room at home, casual loungewear fully clothed, soft daylight'],
+    [/city|şehir|sokak|street|downtown|night.*(city|out)|gece.*(şehir|dış)/, 'On a lively city street daytime, casual streetwear, environmental portrait'],
+    [/travel|tatil|trip|airport|uçak|hotel|otel/, 'Travel day near a hotel lobby/window with luggage nearby, casual outfit, daytime'],
+    [/library|kütüph|museum|müze|bookstore|kitap/, 'Inside a bright library or bookstore aisle, holding a book, modest casual clothes'],
+    [/car|araba|drive|yolculuk/, 'In a car passenger seat during daytime, seatbelt on, casual clothes, natural light'],
+    [/mirror|ayna/, 'Casual fully clothed mirror photo in a hallway, phone visible, everyday outfit'],
+    [/selfie|özçekim|ozcekim/, 'Casual daytime phone selfie outdoors, fully clothed everyday outfit, natural smile']
+  ];
+  for (const [re, scene] of rules) {
+    if (re.test(t)) return scene;
+  }
+  // Genel "foto at" isteklerinde selfie'ye kilitleme — rastgele güvenli mekan.
+  const variety = [
+    'Sitting at a cozy daytime cafe table with a coffee cup, casual outfit, natural window light',
+    'Walking in a green park on a sunny day, casual everyday clothes, outdoor portrait',
+    'On a lively city street daytime, casual streetwear, environmental portrait',
+    'In a tidy living room at home, casual loungewear fully clothed, soft daylight',
+    'Standing on a sunny seaside boardwalk in casual summer clothes, fully clothed, friendly smile',
+    'Casual daytime phone selfie outdoors, fully clothed everyday outfit, natural smile',
+    'Inside a bright bookstore aisle, holding a book, modest casual clothes'
+  ];
+  return variety[Math.floor(Math.random() * variety.length)];
+}
+
 /** gpt-image-1 için üretilen görselin oranı: portre. */
 const PROACTIVE_IMAGE_SIZE = process.env.PROACTIVE_IMAGE_SIZE || '1024x1536';
 const PROACTIVE_IMAGE_QUALITY = process.env.PROACTIVE_IMAGE_QUALITY || 'medium';
 const PROACTIVE_IMAGE_MODEL = process.env.PROACTIVE_IMAGE_MODEL || 'gpt-image-1';
 
 /**
- * Karakterin mevcut fotosunu referans alarak, sohbet bağlamına uygun yeni bir
- * "selfie/anlık" görsel üretir. Bunny CDN'e yükleyip public URL döndürür.
+ * Karakterin mevcut fotosunu referans alarak kullanıcı isteğine uygun yeni bir
+ * görsel üretir. Bunny CDN'e yükleyip public URL döndürür.
  * @returns {Promise<string|null>} CDN URL veya null (başarısızlıkta sessizce null)
  */
 async function generateProactivePhoto(referenceUrl, scenePrompt) {
   const apiKey = getOpenAiApiKey();
   if (!apiKey || !referenceUrl) return null;
 
-  try {
+  const safeScene = String(scenePrompt || '')
+    .replace(/[<>]/g, '')
+    .slice(0, 320)
+    .trim();
+  const safeFallbackScene =
+    'Daytime outdoor casual portrait in a public place, fully clothed everyday outfit like jeans and a sweater, ' +
+    'friendly smile, soft natural light, photorealistic, SFW social media style.';
+
+  async function requestEdit(scene) {
     // 1) Referans fotoyu indir.
     const imgResp = await axios.get(referenceUrl, {
       responseType: 'arraybuffer',
@@ -568,7 +802,7 @@ async function generateProactivePhoto(referenceUrl, scenePrompt) {
         ? 'webp'
         : 'png';
 
-    // 2) gpt-image-1 /images/edits ile aynı kişiyi koruyarak yeni sahne üret.
+    // 2) gpt-image-1 /images/edits — sahne kullanıcı isteğine göre; güvenlik sabit.
     const form = new FormData();
     form.append('model', PROACTIVE_IMAGE_MODEL);
     form.append('image', refBuffer, {
@@ -577,10 +811,12 @@ async function generateProactivePhoto(referenceUrl, scenePrompt) {
     });
     form.append(
       'prompt',
-      `Referans fotoğraftaki kişiyle AYNI kişi olacak şekilde (aynı yüz, saç, ten, genel görünüm) ` +
-        `gerçekçi, doğal bir telefon selfie/anlık fotoğrafı üret. Sahne: ${scenePrompt}. ` +
-        `Sıcak, samimi, sosyal medyaya atılacak bir kişisel fotoğraf havasında olsun. ` +
-        `Metin, yazı, filigran veya logo ekleme.`
+      `Keep the EXACT same person as in the reference photo (same face, hair, skin tone, identity). ` +
+        `Create a photorealistic photo of this person. Scene / setting / activity: ${scene || safeFallbackScene}. ` +
+        `Camera style can be selfie, mirror shot, or environmental portrait depending on the scene. ` +
+        `CRITICAL SAFETY: fully clothed in modest everyday clothes, no nudity, no lingerie, ` +
+        `no bikini/swimwear focus, no sexual pose, no bedroom intimacy, no cleavage focus, PG-13 only. ` +
+        `No text, watermark, logo, or writing in the image.`
     );
     form.append('size', PROACTIVE_IMAGE_SIZE);
     form.append('quality', PROACTIVE_IMAGE_QUALITY);
@@ -604,10 +840,49 @@ async function generateProactivePhoto(referenceUrl, scenePrompt) {
     const remotePath = `proactive/${Date.now()}_${Math.random()
       .toString(36)
       .slice(2, 10)}.png`;
-    const cdnUrl = await uploadBufferToBunny(outBuffer, remotePath, 'image/png');
-    return cdnUrl;
+    return uploadBufferToBunny(outBuffer, remotePath, 'image/png');
+  }
+
+  try {
+    return await requestEdit(safeScene || safeFallbackScene);
   } catch (e) {
-    console.warn('[proactive] photo generation failed:', e?.response?.status || e?.message || e);
+    const status = e?.response?.status;
+    const data = e?.response?.data;
+    let detail = '';
+    try {
+      if (Buffer.isBuffer(data)) detail = data.toString('utf8');
+      else if (typeof data === 'string') detail = data;
+      else if (data) detail = JSON.stringify(data);
+    } catch (_) {}
+    console.warn(
+      '[proactive] photo generation failed:',
+      status || e?.message || e,
+      detail ? `| ${detail.slice(0, 800)}` : ''
+    );
+
+    // 400 (çoğunlukla safety/moderation): daha sıkı SFW sahneyle bir kez daha dene.
+    if (status === 400) {
+      try {
+        console.warn('[proactive] retrying photo with safe fallback scene');
+        return await requestEdit(safeFallbackScene);
+      } catch (e2) {
+        const status2 = e2?.response?.status;
+        const data2 = e2?.response?.data;
+        let detail2 = '';
+        try {
+          if (Buffer.isBuffer(data2)) detail2 = data2.toString('utf8');
+          else if (typeof data2 === 'string') detail2 = data2;
+          else if (data2) detail2 = JSON.stringify(data2);
+        } catch (_) {}
+        console.warn(
+          '[proactive] photo retry failed:',
+          status2 || e2?.message || e2,
+          detail2 ? `| ${detail2.slice(0, 800)}` : '',
+          isOpenAiImageModerationError(e2) ? '(moderation_blocked — caller should use gallery fallback)' : ''
+        );
+        return null;
+      }
+    }
     return null;
   }
 }
@@ -658,11 +933,11 @@ function userWantsPhoto(rawText) {
 }
 
 /**
- * Kullanıcı foto istediğinde: karakterin mevcut fotosunu referans alarak sohbet
- * bağlamına uygun yeni bir görsel üretir ve image mesajı olarak kaydeder.
+ * Kullanıcı foto istediğinde: karakterin mevcut fotosunu referans alarak
+ * kullanıcının istediği mekana/sahneye uygun (SFW) yeni bir görsel üretir.
  * Foto üretilemezse metin cevabına düşer (null yerine text döndürür).
  */
-async function generateCharacterPhotoReply(conversationId, lang) {
+async function generateCharacterPhotoReply(conversationId, lang, userMessageText) {
   const ctx = await fetchConversationContext(conversationId);
   if (!ctx) {
     console.error('[chatReply] photo: conversation not found:', conversationId);
@@ -686,7 +961,15 @@ async function generateCharacterPhotoReply(conversationId, lang) {
     return generateCharacterTextReply(conversationId, lang, photoFallbackDirective);
   }
 
+  const requestText =
+    String(userMessageText || '').trim() ||
+    String(ctx.history?.[ctx.history.length - 1]?.content || '').trim();
+
   const systemPrompt = buildSystemPrompt(ctx.bot, ctx.userName, lang);
+
+  // Önce kullanıcı isteğinden SFW sahne çıkar; caption'ı buna bağla.
+  const scene = await buildSafePhotoSceneFromUserRequest(requestText, lang);
+  console.log('[chatReply] photo scene:', scene.slice(0, 160));
 
   // Karakter tonunda kısa bir caption üret (fotoğrafla birlikte gidecek).
   let caption = '';
@@ -698,9 +981,11 @@ async function generateCharacterPhotoReply(conversationId, lang) {
         {
           role: 'system',
           content:
-            'Kullanıcı senden bir fotoğrafını istedi ve sen ona kendinden bir fotoğraf ' +
-            'gönderiyorsun. YALNIZCA fotoğrafın kısa, doğal ve samimi alt yazısını (caption) yaz; ' +
-            'en fazla 1 cümle, sohbet bağlamına uygun. Tırnak veya "caption:" gibi ön ek KULLANMA.'
+            'Kullanıcı senden bir fotoğraf istedi ve sen ona o isteğe uygun bir fotoğraf ' +
+            'gönderiyorsun. Fotoğraf sahnesi (bilgi için): ' +
+            scene +
+            '. YALNIZCA fotoğrafın kısa, doğal ve samimi alt yazısını (caption) yaz; ' +
+            'en fazla 1 cümle, sohbet bağlamına ve sahneye uygun. Tırnak veya "caption:" gibi ön ek KULLANMA.'
         }
       ],
       model: getChatModel(),
@@ -711,11 +996,16 @@ async function generateCharacterPhotoReply(conversationId, lang) {
     console.warn('[chatReply] photo caption failed:', e?.message || e);
   }
 
-  const scene = caption ||
-    'Kullanıcıyla olan sohbetin havasına uygun, sıcak ve samimi bir selfie anı.';
-
-  const imageUrl = await generateProactivePhoto(referenceUrl, scene);
-  // Görsel üretilemezse reddetmeyen metin cevabına düş.
+  let imageUrl = await generateProactivePhoto(referenceUrl, scene);
+  // OpenAI safety üretimi kestiğinde: mevcut galeri fotosunu paylaş (özellik çalışmaya devam etsin).
+  if (!imageUrl) {
+    imageUrl = pickGalleryPhotoUrl(ctx.bot?.photoURL, referenceUrl) || referenceUrl;
+    console.warn(
+      '[chatReply] photo: generation blocked/failed — using gallery fallback:',
+      imageUrl ? imageUrl.slice(0, 80) : null
+    );
+  }
+  // Görsel yoksa reddetmeyen metin cevabına düş.
   if (!imageUrl) {
     return generateCharacterTextReply(conversationId, lang, photoFallbackDirective);
   }
@@ -746,7 +1036,7 @@ async function generateCharacterPhotoReply(conversationId, lang) {
  */
 async function generateCharacterReply(conversationId, lang, userMessageText) {
   if (userWantsPhoto(userMessageText)) {
-    return generateCharacterPhotoReply(conversationId, lang);
+    return generateCharacterPhotoReply(conversationId, lang, userMessageText);
   }
   return generateCharacterTextReply(conversationId, lang);
 }
@@ -820,10 +1110,17 @@ async function generateProactiveMessage(conversationId, opts = {}) {
       });
       const caption = enforceCompactReplyStyle(captionRaw) || text;
 
-      const scene =
-        caption ||
-        'Kullanıcıyla olan sohbetin havasına uygun, sıcak ve samimi bir an.';
-      const imageUrl = await generateProactivePhoto(referenceUrl, scene);
+      // Proaktif: sohbet bağlamından veya rastgele güvenli mekanlardan sahne seç.
+      const lastUser = [...(ctx.history || [])]
+        .reverse()
+        .find((m) => m?.role === 'user');
+      const contextHint = String(lastUser?.content || caption || text || '').slice(0, 240);
+      const scene = await buildSafePhotoSceneFromUserRequest(contextHint, lang);
+      let imageUrl = await generateProactivePhoto(referenceUrl, scene);
+      if (!imageUrl) {
+        imageUrl = pickGalleryPhotoUrl(ctx.bot?.photoURL, referenceUrl) || referenceUrl;
+        console.warn('[proactive] photo blocked/failed — using gallery fallback');
+      }
       if (imageUrl) {
         result.imageUrl = imageUrl;
         result.caption = caption;
