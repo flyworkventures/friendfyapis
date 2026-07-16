@@ -272,7 +272,39 @@ function applyCatalogOverride(agent, overrideRow) {
     if (!overrideRow) return agent;
     const base = { ...agent };
     base.name = overrideRow.name ?? base.name;
-    base.character = overrideRow.character ?? base.character;
+    const overrideCharacter =
+        overrideRow.character != null &&
+        String(overrideRow.character).trim() !== ''
+            ? String(overrideRow.character)
+            : null;
+    if (overrideCharacter !== null) {
+        base.character = overrideCharacter;
+        // Kullanıcı sistem karakterinin `character` alanını düzenlediğinde
+        // baz satırdaki tüm lokalize `character_{lang}` ve
+        // `character_localized` kolonlarını sil — aksi halde
+        // pickLocalizedField / getCharacterByLang bunları önce görüp
+        // kullanıcının override'ını yok sayardı. Böylece downstream
+        // localization override'ı tekrar `character` üzerinden picker'a
+        // düşürüyor ve kullanıcı kendi düzenlemesini her dilde görüyor.
+        const localizedCharCols = [
+            'character_localized',
+            'character_tr',
+            'character_en',
+            'character_de',
+            'character_fr',
+            'character_pt',
+            'character_it',
+            'character_es',
+            'character_zh',
+            'character_ja',
+            'character_ru',
+            'character_hi',
+            'character_ko',
+        ];
+        for (const col of localizedCharCols) {
+            base[col] = null;
+        }
+    }
     base.age =
         overrideRow.age != null && !Number.isNaN(Number(overrideRow.age))
             ? Number(overrideRow.age)
