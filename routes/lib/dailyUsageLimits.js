@@ -12,14 +12,14 @@ function envInt(name, fallback) {
 const GUEST_LIMITS = Object.freeze({
   text: envInt('GUEST_DAILY_TEXT_LIMIT', 100),
   image: envInt('GUEST_DAILY_IMAGE_LIMIT', 2),
-  voice: envInt('GUEST_DAILY_VOICE_LIMIT', 2),
+  voice: envInt('GUEST_DAILY_VOICE_LIMIT', 50),
 });
 /** Ücretsiz (logged-in, premium değil) günlük kotaları */
 const FREE_LIMITS = Object.freeze({
   // Test günlerinde düşük kota (20) sohbeti kilitliyordu; env ile override edilebilir.
   text: envInt('FREE_DAILY_TEXT_LIMIT', 200),
   image: envInt('FREE_DAILY_IMAGE_LIMIT', 2),
-  voice: envInt('FREE_DAILY_VOICE_LIMIT', 2),
+  voice: envInt('FREE_DAILY_VOICE_LIMIT', 50),
 });
 
 /** true ise metin günlük limiti uygulanmaz (yalnızca lokal/debug). */

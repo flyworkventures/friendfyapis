@@ -581,10 +581,10 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             0
         ];
 
-        let insertQuery;
+        let insertSql;
         let values;
         if (hasOriginCol) {
-            insertQuery = `
+            insertSql = `
             INSERT INTO bots 
             (name, \`character\`, age, gender, interests, interestsType, photoURL, 
              characterTags, speakingStyle, voiceId, country, rive_avatar, creatorId, system, user_agent_origin)
@@ -595,7 +595,7 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             console.warn(
                 '[agents] create-custom-agent: `user_agent_origin` kolonu yok — eski INSERT kullanılıyor. `scripts/sql/bots_user_agent_origin.sql` çalıştırın.'
             );
-            insertQuery = `
+            insertSql = `
             INSERT INTO bots 
             (name, \`character\`, age, gender, interests, interestsType, photoURL, 
              characterTags, speakingStyle, voiceId, country, rive_avatar, creatorId, system)
@@ -604,7 +604,7 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             values = baseValues;
         }
 
-        const newAgentId = await insertQuery(insertQuery, values);
+        const newAgentId = await insertQuery(insertSql, values);
 
         if (newAgentId) {
             const createdRows = await getQuery(

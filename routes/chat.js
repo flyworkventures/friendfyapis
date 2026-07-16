@@ -564,7 +564,6 @@ function detectImageMimeFromMagicBytes(buffer) {
 
 router.post('/send-audio-message', middleware, upload.single('file'), async (req, res) => {
   try {
-    // 📦 1. Gelen dosyayı kontrol et
     if (!req.file) {
       return res.status(400).json({ error: 'Ses dosyası yüklenmedi.' });
     }
@@ -578,77 +577,208 @@ router.post('/send-audio-message', middleware, upload.single('file'), async (req
     }
 
     const fileBuffer = req.file.buffer;
-    const fileName = req.file.originalname || `${Date.now()}.m4a`;
-    const conversation = req.body.conversation;
+    const mime = String(req.file.mimetype || 'audio/m4a').toLowerCase();
+    const ext =
+      mime.includes('webm') ? 'webm'
+      : mime.includes('wav') ? 'wav'
+      : mime.includes('mpeg') || mime.includes('mp3') ? 'mp3'
+      : 'm4a';
+    const fileName = req.file.originalname || `${Date.now()}.${ext}`;
+    const conversation = req.body.conversation || req.body.conversationId;
+    if (!conversation) {
+      return res.status(400).json({ error: 'conversation required' });
+    }
     const lang = normalizeLang(req.body?.lang);
-    const sender = req.sender || 'user';
+    const sender = String(req.body?.sender || 'user').trim() || 'user';
     const randomId = getRandomName();
 
-    console.log(`conversationId: ${conversation}`);
+    console.log(`[send-audio-message] conversation=${conversation} size=${fileBuffer.length} mime=${mime}`);
 
-    // 📡 2. CDN URL’leri
-    const CDNURL = `https://storage.bunnycdn.com/fakefriendstorage/${randomId}.m4a`;
-    const CDNFILEURL = `https://fakefriend.b-cdn.net/${randomId}.m4a`;
+    const CDNURL = `https://storage.bunnycdn.com/fakefriendstorage/${randomId}.${ext}`;
+    const CDNFILEURL = `https://fakefriend.b-cdn.net/${randomId}.${ext}`;
 
-    // 🟢 3. BunnyCDN'e direkt dosyayı yükle (formData DEĞİL)
     await axios.put(CDNURL, fileBuffer, {
       headers: {
-        'AccessKey': '68664abb-b19e-47e7-acd67dba78a5-e90a-4386',
-        'Content-Type': 'audio/m4a', // uygun content-type
+        AccessKey: process.env.BUNNY_STORAGE_ACCESS_KEY || '68664abb-b19e-47e7-acd67dba78a5-e90a-4386',
+        'Content-Type': mime.startsWith('audio/') ? mime : `audio/${ext}`,
       },
       maxBodyLength: Infinity,
+      timeout: 60000,
+    });
+    console.log('[send-audio-message] CDN upload ok');
+
+    // Mesajı STT beklemeden kaydet — istemci ses balonunu hemen görebilir.
+    const initialPayload = JSON.stringify({
+      text: '',
+      url: CDNFILEURL,
     });
 
-    console.log('✅ Dosya BunnyCDN’e yüklendi.');
-
-
-
-    // 🎙️ 5. ElevenLabs Speech-to-Text çağrısı
-    const form = new FormData();
-    form.append('file', fileBuffer, fileName);
-    form.append('model_id', 'scribe_v1');
-
-    const elevenResponse = await axios.post(
-      'https://api.elevenlabs.io/v1/speech-to-text',
-      form,
-      {
-        headers: {
-          ...form.getHeaders(),
-          'xi-api-key': 'sk_2f6bb270166b14978aef45a02395d595e8661799dc110ce9',
-        },
-        maxBodyLength: Infinity,
-      }
-    );
-
-    const text = elevenResponse.data.text || '';
-        // 💾 4. Veritabanına kaydet
-    await query(
+    const insertResult = await getQuery(
       'INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?)',
-      [conversation, sender, JSON.stringify({text:text,url: CDNFILEURL}), 'voice']
+      [conversation, sender, initialPayload, 'voice']
     );
-
-
-    console.log('🗣️ ElevenLabs sonucu:', text);
-
-    if (text.trim()) {
-      generateCharacterVoiceReply(conversation, lang).catch((err) => {
-        console.error('[send-audio-message] character reply error:', err?.message || err);
-      });
+    const insertedId = insertResult?.insertId || null;
+    if (!insertedId) {
+      return res.status(500).json({ error: 'DB insert failed' });
     }
 
-    res.json({
+    await query(
+      'UPDATE `coversations` SET `lastMessage` = ?, `last_message_at` = NOW() WHERE id = ? LIMIT 1',
+      ['🎤', conversation]
+    );
+
+    // Typing'i hemen aç; STT arka planda sürerken client polling tutarlı kalsın.
+    await query(
+      "UPDATE `coversations` SET `current_chat_state` = 'bot_typing' WHERE id = ? LIMIT 1",
+      [conversation]
+    ).catch(() => {});
+
+    // STT + karakter cevabı arka planda; HTTP cevabını bloklamasın.
+    setImmediate(() => {
+      (async () => {
+        let text = '';
+        try {
+          text = await transcribeVoiceMessage(fileBuffer, fileName, mime);
+        } catch (sttErr) {
+          console.warn(
+            '[send-audio-message] STT failed (message still saved):',
+            sttErr?.message || sttErr
+          );
+        }
+
+        const transcript = String(text || '').trim();
+        const payload = JSON.stringify({
+          text: transcript,
+          url: CDNFILEURL,
+        });
+
+        await query('UPDATE `messages` SET `message` = ? WHERE id = ? LIMIT 1', [
+          payload,
+          insertedId,
+        ]);
+        await query(
+          'UPDATE `coversations` SET `lastMessage` = ?, `last_message_at` = NOW() WHERE id = ? LIMIT 1',
+          [(transcript || '🎤').slice(0, 500), conversation]
+        );
+
+        try {
+          await generateCharacterVoiceReply(conversation, lang);
+        } catch (err) {
+          console.error(
+            '[send-audio-message] character reply error:',
+            err?.message || err
+          );
+        } finally {
+          await query(
+            "UPDATE `coversations` SET `current_chat_state` = 'normal' WHERE id = ? LIMIT 1",
+            [conversation]
+          ).catch(() => {});
+        }
+      })().catch((err) => {
+        console.error(
+          '[send-audio-message] background pipeline error:',
+          err?.message || err
+        );
+        query(
+          "UPDATE `coversations` SET `current_chat_state` = 'normal' WHERE id = ? LIMIT 1",
+          [conversation]
+        ).catch(() => {});
+      });
+    });
+
+    return res.status(200).json({
       success: true,
-      transcribedText: text,
+      messageId: insertedId,
+      transcribedText: '',
       fileUrl: CDNFILEURL,
     });
   } catch (err) {
-    console.error('❌ Hata:', err.message);
-    res.status(500).json({
+    console.error('[send-audio-message] error:', err?.message || err);
+    return res.status(500).json({
       error: `Forward sırasında hata oluştu: ${err.message}`,
     });
   }
 });
 
+/** Sesli mesaj STT: OpenAI (env) → ElevenLabs (env) fallback. */
+async function transcribeVoiceMessage(fileBuffer, fileName, mime) {
+  const contentType = mime && String(mime).startsWith('audio/')
+    ? mime
+    : 'audio/m4a';
+
+  const openAiKey = String(process.env.OPENAI_API_KEY || '').trim();
+  if (openAiKey) {
+    try {
+      const form = new FormData();
+      form.append('file', fileBuffer, {
+        filename: fileName || 'audio.m4a',
+        contentType,
+      });
+      form.append(
+        'model',
+        process.env.OPENAI_STT_MODEL || 'gpt-4o-transcribe'
+      );
+      const r = await axios.post(
+        'https://api.openai.com/v1/audio/transcriptions',
+        form,
+        {
+          headers: {
+            Authorization: `Bearer ${openAiKey}`,
+            ...form.getHeaders(),
+          },
+          maxBodyLength: Infinity,
+          timeout: 90000,
+        }
+      );
+      const text = String(r.data?.text || '').trim();
+      if (text) {
+        console.log('[send-audio-message] OpenAI STT ok, chars=', text.length);
+        return text;
+      }
+    } catch (e) {
+      console.warn(
+        '[send-audio-message] OpenAI STT failed:',
+        e?.response?.status || e?.message || e
+      );
+    }
+  }
+
+  const elKey = String(process.env.ELEVENLABS_API_KEY || '').trim();
+  if (elKey) {
+    try {
+      const form = new FormData();
+      form.append('file', fileBuffer, {
+        filename: fileName || 'audio.m4a',
+        contentType,
+      });
+      form.append('model_id', 'scribe_v1');
+      const elevenResponse = await axios.post(
+        'https://api.elevenlabs.io/v1/speech-to-text',
+        form,
+        {
+          headers: {
+            ...form.getHeaders(),
+            'xi-api-key': elKey,
+          },
+          maxBodyLength: Infinity,
+          timeout: 90000,
+        }
+      );
+      const text = String(elevenResponse.data?.text || '').trim();
+      if (text) {
+        console.log('[send-audio-message] ElevenLabs STT ok, chars=', text.length);
+        return text;
+      }
+    } catch (e) {
+      console.warn(
+        '[send-audio-message] ElevenLabs STT failed:',
+        e?.response?.status || e?.message || e
+      );
+    }
+  }
+
+  return '';
+}
 router.post('/send-image-message', middleware, upload.fields([
   { name: 'image', maxCount: 1 },
   { name: 'file', maxCount: 1 }

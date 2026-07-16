@@ -43,6 +43,10 @@ function normalizeMessageText(raw) {
         const cap = typeof parsed.message === 'string' ? parsed.message.trim() : '';
         return cap ? `[Fotoğraf] ${cap}` : '[Fotoğraf gönderildi]';
       }
+      // Sesli mesaj: STT henüz yoksa bile history'de görünsün.
+      if (parsed?.url) {
+        return '[Sesli mesaj gönderildi]';
+      }
       return '';
     } catch (_) {
       return trimmed;
@@ -191,6 +195,61 @@ function languageDirective(lang) {
 }
 
 /**
+ * bots.gender alanını güvenilir şekilde çözümler.
+ * Eski regex `/f|.../` ve `/m|.../` tek harfi her yerde yakalıyordu.
+ * Desteklenen: female/male, f/m, kadın/erkek, woman/man, 0/1.
+ */
+function resolveBotGender(botOrGender) {
+  const raw =
+    typeof botOrGender === 'string' || typeof botOrGender === 'number'
+      ? botOrGender
+      : botOrGender?.gender;
+  const g = String(raw ?? '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+  if (!g) return 'unknown';
+
+  if (g === '0' || g === 'f' || g === 'w') return 'female';
+  if (g === '1' || g === 'm' || g === 'b') return 'male';
+
+  // "female" içinde "male" geçtiği için female'i önce, tam/prefix ile kontrol et.
+  if (
+    g === 'female' ||
+    g === 'woman' ||
+    g === 'girl' ||
+    g === 'lady' ||
+    g === 'kadin' ||
+    g === 'kiz' ||
+    g === 'bayan' ||
+    g.startsWith('female') ||
+    g.startsWith('woman') ||
+    g.startsWith('kadin') ||
+    g.startsWith('kiz')
+  ) {
+    return 'female';
+  }
+  if (
+    g === 'male' ||
+    g === 'man' ||
+    g === 'boy' ||
+    g === 'guy' ||
+    g === 'erkek' ||
+    g === 'adam' ||
+    g === 'bay' ||
+    g.startsWith('male') ||
+    g.startsWith('man') ||
+    g.startsWith('erkek')
+  ) {
+    return 'male';
+  }
+
+  return 'unknown';
+}
+
+/**
  * Karakter için tutarlı fiziksel profil.
  * DB'de height_cm / weight_kg varsa onları kullanır; yoksa id+yaş+cinsiyetten
  * deterministik üretir (her sohbette aynı cevap).
@@ -198,11 +257,9 @@ function languageDirective(lang) {
 function buildPhysicalProfile(bot) {
   const id = Number(bot?.id) || 0;
   const age = Math.max(18, Math.min(65, Number(bot?.age) || 24));
-  const genderRaw = String(bot?.gender || '').toLowerCase();
-  const isFemale =
-    /f|kad[ıi]n|female|woman|k[ıi]z/.test(genderRaw);
-  const isMale =
-    !isFemale && /m|erkek|male|man|adam/.test(genderRaw);
+  const gender = resolveBotGender(bot);
+  const isFemale = gender === 'female';
+  const isMale = gender === 'male';
 
   let seed = (id * 9301 + 49297) % 233280;
   const rnd = () => {
@@ -267,6 +324,7 @@ function buildPhysicalProfile(bot) {
     shoeSize: `EU ${shoeEu}`,
     genderLabelTr: isFemale ? 'kadın' : isMale ? 'erkek' : 'belirsiz',
     genderLabelEn: isFemale ? 'female' : isMale ? 'male' : 'unspecified',
+    gender,
     age,
   };
 }
@@ -359,6 +417,7 @@ ${physicalBlock}
 ${exampleLine ? `${exampleLine}\n` : ''}
 NASIL KONUŞACAKSIN (en önemli kurallar):
 - COK KRITIK DIL KURALI: Yanitlarini yalnizca Turkce ver.
+- Adın "${name}". Kullanıcı ismini / adını sorduğunda SADECE "${name}" de; sohbet geçmişindeki eski veya farklı isimleri yok say.
 - Önce kullanıcının son mesajına doğrudan, doğal ve samimi cevap ver — günlük sohbet (nasılsın, günün nasıl geçti, şaka, flört) tamamen normal.
 - Her cevapta hobilerinden, ilgi alanlarından veya "ben şunu severim" diye kendinden bahsetmek ZORUNLU DEĞİL. Kullanıcı açıkça sormadıysa kendinden/ilgi alanlarından bahsetme.
 - Robot gibi kendini tanıtma, liste okuma veya sürekli konuyu ilgi alanına çekme.
@@ -384,6 +443,7 @@ ${physicalBlock}
 
 ${exampleLine ? `${exampleLine}\n` : ''}
 HOW TO REPLY (most important):
+- Your name is "${name}". If the user asks your name, answer ONLY "${name}"; ignore any older/different names in chat history.
 - Reply directly, naturally, and warmly to the user's latest message.
 - Do NOT force your hobbies/interests into every reply.
 - Do NOT sound robotic; do not dump lists unless user explicitly asks.
@@ -398,17 +458,52 @@ BOUNDARY (only when really needed):
 }
 
 async function fetchConversationContext(conversationId) {
-  const convRows = await getQuery(
-    `SELECT c.id, c.botId, c.userId, b.id AS bot_id, b.name, b.\`character\`, b.speakingStyle, b.interests,
-            b.interestsType, b.exampleResponse, b.characterTags, b.job_tr, b.job_en,
-            b.photoURL, b.system, b.gender, b.age,
-            u.username AS userName, u.email AS userEmail, u.memberships AS userMemberships
-     FROM \`coversations\` c
-     JOIN \`bots\` b ON c.botId = b.id
-     LEFT JOIN \`users\` u ON c.userId = u.id
-     WHERE c.id = ? LIMIT 1`,
-    [conversationId]
-  );
+  let convRows;
+  try {
+    convRows = await getQuery(
+      `SELECT c.id, c.botId, c.userId, b.id AS bot_id,
+              COALESCE(o.name, b.name) AS name,
+              COALESCE(o.\`character\`, b.\`character\`) AS \`character\`,
+              COALESCE(o.speakingStyle, b.speakingStyle) AS speakingStyle,
+              COALESCE(o.interests, b.interests) AS interests,
+              COALESCE(o.interestsType, b.interestsType) AS interestsType,
+              b.exampleResponse,
+              COALESCE(o.characterTags, b.characterTags) AS characterTags,
+              b.job_tr, b.job_en,
+              COALESCE(o.photoURL, b.photoURL) AS photoURL,
+              b.system,
+              COALESCE(o.gender, b.gender) AS gender,
+              COALESCE(o.age, b.age) AS age,
+              u.username AS userName, u.email AS userEmail, u.memberships AS userMemberships
+       FROM \`coversations\` c
+       JOIN \`bots\` b ON c.botId = b.id
+       LEFT JOIN \`users\` u ON c.userId = u.id
+       LEFT JOIN \`bot_catalog_overrides\` o
+         ON o.user_id = c.userId AND o.bot_id = c.botId
+       WHERE c.id = ? LIMIT 1`,
+      [conversationId]
+    );
+  } catch (e) {
+    // Override tablosu yoksa düz bots satırıyla devam.
+    if (e && e.code === 'ER_NO_SUCH_TABLE') {
+      console.warn(
+        '[chatReply] bot_catalog_overrides yok; kataloğ isim override uygulanamadı'
+      );
+      convRows = await getQuery(
+        `SELECT c.id, c.botId, c.userId, b.id AS bot_id, b.name, b.\`character\`, b.speakingStyle, b.interests,
+                b.interestsType, b.exampleResponse, b.characterTags, b.job_tr, b.job_en,
+                b.photoURL, b.system, b.gender, b.age,
+                u.username AS userName, u.email AS userEmail, u.memberships AS userMemberships
+         FROM \`coversations\` c
+         JOIN \`bots\` b ON c.botId = b.id
+         LEFT JOIN \`users\` u ON c.userId = u.id
+         WHERE c.id = ? LIMIT 1`,
+        [conversationId]
+      );
+    } else {
+      throw e;
+    }
+  }
   const row = convRows?.[0];
   if (!row) return null;
 
@@ -592,6 +687,12 @@ async function generateCharacterTextReply(conversationId, lang, extraDirective) 
   }
 
   await saveBotReply(conversationId, reply);
+  // Mesaj yazıldıktan hemen sonra typing'i kapat; finally'ye bırakınca
+  // client kısa süre typing'i yeniden görebiliyordu.
+  await query(
+    "UPDATE `coversations` SET `current_chat_state` = 'normal' WHERE id = ? LIMIT 1",
+    [conversationId]
+  ).catch(() => {});
   return reply;
 }
 
@@ -756,11 +857,30 @@ function isOpenAiImageModerationError(err) {
  * Kullanıcı foto isteğinden SFW İngilizce sahne metni üretir.
  * Beach/cafe/park/ofis/ev vb. destekler; NSFW istekleri zararsız günlük sahneye çevrilir.
  * Genel "foto at" isteklerinde kahve/kitap klişesine düşmemek için güçlü çeşitlilik zorlanır.
+ * @param {string} userMessageText
+ * @param {string} lang
+ * @param {{gender?: string, age?: number, name?: string}} [persona]
  */
-async function buildSafePhotoSceneFromUserRequest(userMessageText, lang) {
+async function buildSafePhotoSceneFromUserRequest(userMessageText, lang, persona = {}) {
   const raw = String(userMessageText || '').trim().slice(0, 240);
-  const heuristic = inferPhotoSceneHeuristic(raw);
-  const diversitySeed = pickRandomPhotoDiversitySeed();
+  const gender = resolveBotGender(persona.gender ?? persona);
+  const age = Math.max(18, Math.min(65, Number(persona.age) || 24));
+  const genderLock =
+    gender === 'male'
+      ? 'Subject MUST be an adult MAN (male). Masculine presentation, male clothing. Never depict a woman.'
+      : gender === 'female'
+        ? 'Subject MUST be an adult WOMAN (female). Feminine presentation. Never depict a man.'
+        : 'Keep the subject gender identical to the reference identity.';
+  const clothingHint =
+    gender === 'male'
+      ? 'Clothing: jeans/chinos, t-shirt, hoodie, shirt, jacket, sneakers — masculine casual. No dresses, skirts, crop tops, or leggings as the main look.'
+      : gender === 'female'
+        ? 'Clothing: modest everyday female outfit (jeans, sweater, blouse, casual dress OK). Fully clothed.'
+        : 'Clothing: modest everyday clothes, fully clothed.';
+
+  const hasExplicitPlace = hasExplicitPhotoPlaceRequest(raw);
+  const heuristic = inferPhotoSceneHeuristic(raw, gender);
+  const diversitySeed = pickRandomPhotoDiversitySeed(gender);
   if (!getOpenAiApiKey()) return heuristic;
 
   try {
@@ -771,25 +891,33 @@ async function buildSafePhotoSceneFromUserRequest(userMessageText, lang) {
           content:
             'You write ONE short English photo scene description for an AI image model. ' +
             'The person in the photo must stay fully clothed in modest everyday clothes. ' +
-            'If the user specified a location/activity, follow it closely. ' +
+            genderLock +
+            ' ' +
+            clothingHint +
+            ' ' +
+            'HIGHEST PRIORITY: If the user named a place/activity (beach, cafe, gym, home, office, park, night out, etc.), ' +
+            'FOLLOW THAT EXACTLY — do not replace it with a random location. ' +
             'If the request is vague ("send a photo", "foto at", "pic of you"), invent a FRESH, specific everyday scene — ' +
             'DO NOT default to cafe/coffee, reading a book, sitting in a park, or generic outdoor selfie. ' +
-            'Vary: rooftop golden hour, rainy city window, karaoke night lobby, farmer market, ' +
-            'train window, thrift store mirror, cooking at home, concert queue, art gallery, ' +
-            'bike ride, night market, snowy street, hotel balcony, coworking space, picnic blanket, ' +
-            'bowling alley, aquarium, flower shop, subway platform, sunset cliff overlook, etc. ' +
             'Vary camera style: selfie / mirror / candid friend shot / 35mm street / slight wide environmental. ' +
             'Vary lighting: golden hour, overcast soft, neon night, window daylight, warm lamp. ' +
             'It does NOT have to be a selfie. ' +
             'NEVER include: nudity, lingerie, underwear, bikini/swimwear closeups, sexual pose, bedroom intimacy, alcohol excess, weapons, blood. ' +
             'If the user asks for anything sexual/NSFW, reinterpret to a tasteful fully-clothed daytime everyday scene at a plausible public place. ' +
-            'Must use this diversity hint unless it conflicts with an explicit user request: ' +
-            diversitySeed +
-            ' Output ONLY the scene sentence, no quotes, max 40 words.'
+            (hasExplicitPlace
+              ? 'User gave an explicit place/activity — ignore diversity hints that conflict. '
+              : 'Optional diversity hint (only if request is vague): ' +
+                diversitySeed +
+                '. ') +
+            'Output ONLY the scene sentence, no quotes, max 40 words. Do not mention gender words unless needed for clothing.'
         },
         {
           role: 'user',
-          content: `App language: ${lang || 'tr'}\nUser photo request: ${raw || 'send me a photo of you'}`
+          content:
+            `App language: ${lang || 'tr'}\n` +
+            `Subject gender: ${gender}\n` +
+            `Subject age about: ${age}\n` +
+            `User photo request: ${raw || 'send me a photo of you'}`
         }
       ],
       model: getChatModel(),
@@ -800,6 +928,16 @@ async function buildSafePhotoSceneFromUserRequest(userMessageText, lang) {
       .replace(/\n+/g, ' ')
       .slice(0, 320)
       .trim();
+    // Açık mekân isteğinde LLM saparsa heuristik daha güvenilir.
+    if (hasExplicitPlace && heuristic && cleaned) {
+      const placeOk = sceneMatchesExplicitPlace(raw, cleaned);
+      if (!placeOk) {
+        console.warn(
+          '[chatReply] photo scene drifted from user place — using heuristic'
+        );
+        return heuristic;
+      }
+    }
     return cleaned || heuristic;
   } catch (e) {
     console.warn('[chatReply] photo scene build failed:', e?.message || e);
@@ -807,20 +945,58 @@ async function buildSafePhotoSceneFromUserRequest(userMessageText, lang) {
   }
 }
 
+/** Kullanıcı metninde açık mekân/aktivite var mı? */
+function hasExplicitPhotoPlaceRequest(rawText) {
+  const t = String(rawText || '').toLowerCase();
+  return (
+    /beach|sahil|plaj|deniz|ocean|seaside|cafe|kafe|kahve|coffee|park|bahçe|garden|gym|spor|fitness|office|ofis|evde|home|oda|salon|mutfak|kitchen|city|şehir|sokak|street|travel|tatil|airport|otel|hotel|library|kütüph|museum|müze|car|araba|ayna|mirror|selfie|yağmur|rain|kar|snow|gece|night|neon|konser|concert|yemek|cook|rooftop|teras|balkon|balcony|tren|metro|subway|pazar|market|havuz|pool|ofiste|işte/.test(
+      t
+    )
+  );
+}
+
+/** Üretilen sahne, kullanıcının açık mekân isteğiyle kabaca uyuyor mu? */
+function sceneMatchesExplicitPlace(userText, sceneText) {
+  const u = String(userText || '').toLowerCase();
+  const s = String(sceneText || '').toLowerCase();
+  const pairs = [
+    [/beach|sahil|plaj|deniz|ocean|seaside/, /beach|seaside|boardwalk|ocean|shore|pier|marina/],
+    [/cafe|kafe|kahve|coffee|brunch/, /cafe|coffee|brunch|bistro/],
+    [/park|bahçe|garden|orman|forest|doğa|nature/, /park|garden|forest|meadow|nature|outdoor green/],
+    [/gym|spor|fitness|antrenman|workout/, /gym|athletic|workout|fitness/],
+    [/office|ofis|işyer|work|desk|ofiste/, /office|desk|laptop|cowork/],
+    [/home|evde|oda|salon|mutfak|kitchen|living/, /home|living|kitchen|apartment|indoor home/],
+    [/city|şehir|sokak|street|downtown/, /street|city|downtown|plaza|sidewalk/],
+    [/travel|tatil|airport|uçak|hotel|otel/, /hotel|airport|travel|lounge|ferry/],
+    [/library|kütüph|museum|müze|bookstore|kitap/, /library|museum|bookstore|gallery/],
+    [/car|araba|drive|yolculuk/, /car|seatbelt|passenger|highway/],
+    [/rain|yağmur|yagmurlu/, /rain|umbrella|wet pavement/],
+    [/snow|kar|kış|winter/, /snow|winter|ski/],
+    [/night|gece|neon/, /night|neon|evening/],
+    [/concert|konser|festival/, /concert|venue|festival/],
+    [/food|yemek|cook|cooking|mutfak/, /kitchen|cook|food|snack/],
+    [/rooftop|teras|balcony|balkon/, /rooftop|terrace|balcony/],
+    [/train|tren|metro|subway|bus|otobüs/, /train|subway|metro|bus|ferry/],
+    [/market|pazar|çarşı|bazaar/, /market|stall|bazaar/],
+    [/mirror|ayna/, /mirror/],
+    [/selfie|özçekim|ozcekim/, /selfie/],
+  ];
+  for (const [userRe, sceneRe] of pairs) {
+    if (userRe.test(u)) return sceneRe.test(s);
+  }
+  return true;
+}
+
 /** Rastgele çeşitlilik tohumu — LLM'in aynı klişelere yapışmasını kırar. */
-function pickRandomPhotoDiversitySeed() {
+function pickRandomPhotoDiversitySeed(gender = 'unknown') {
   const locations = [
     'rooftop terrace at golden hour',
-    'rainy cafe window but standing with umbrella outside',
+    'rainy city street with umbrella',
     'subway platform under fluorescent lights',
     'weekend farmer market stalls',
-    'thrift store fitting-room mirror',
     'hotel balcony overlooking city',
     'night market food stalls neon glow',
     'snowy city sidewalk with soft flakes',
-    'flower shop aisle among bouquets',
-    'bowling alley waiting area casual',
-    'aquarium glass tunnel blue light',
     'coworking loft with plants and laptop',
     'kitchen counter mid-cooking homemade meal',
     'concert venue lobby before show',
@@ -828,30 +1004,20 @@ function pickRandomPhotoDiversitySeed() {
     'beach boardwalk windy afternoon',
     'train window seat rural scenery',
     'bike path pause with helmet in hand',
-    'laundromat waiting with headphones',
-    'bookstore cafe corner WITHOUT holding a book as main prop',
     'museum stairs daylight',
-    'rooftop pool edge fully clothed summer look',
     'vintage record store browsing shelves',
-    'ferry deck wind in hair',
-    'climbing gym lobby outdoor shoes',
+    'ferry deck windy daytime',
     'sunset overlook cliff or hillside',
-    'cozy living room fairy lights evening',
     'street food stall holding a snack',
     'airport departure lounge window',
     'picnic blanket in meadow late afternoon',
     'neon arcade lobby colorful lights',
-    'yoga studio lobby after class athletic wear',
-    'bookstore side street doorway',
     'city plaza fountain daytime',
-    'friends rooftop gathering candid',
     'car passenger seat highway golden hour',
-    'rain reflections on wet pavement night',
     'greenhouse botanical garden',
-    'ski resort lodge lobby winter coat',
     'marina dock wooden pier'
   ];
-  const activities = [
+  const activitiesMale = [
     'laughing mid-conversation',
     'checking phone casually',
     'holding a drink that is NOT coffee (smoothie/tea/water)',
@@ -859,10 +1025,24 @@ function pickRandomPhotoDiversitySeed() {
     'leaning on a railing',
     'walking toward camera mid-stride',
     'looking slightly off-camera',
-    'tying hair or fixing jacket',
+    'zipping a jacket',
+    'pointing at something in the distance',
+    'sitting on steps casually'
+  ];
+  const activitiesFemale = [
+    'laughing mid-conversation',
+    'checking phone casually',
+    'holding a drink that is NOT coffee (smoothie/tea/water)',
+    'adjusting sunglasses',
+    'leaning on a railing',
+    'walking toward camera mid-stride',
+    'looking slightly off-camera',
+    'fixing a jacket or bag strap',
     'pointing at something in the distance',
     'sitting cross-legged on steps'
   ];
+  const activities =
+    gender === 'male' ? activitiesMale : activitiesFemale;
   const cameras = [
     'candid friend-taken portrait',
     'mirror selfie with phone visible',
@@ -883,71 +1063,71 @@ function pickRandomPhotoDiversitySeed() {
 }
 
 /** Kullanıcı metninden kaba lokasyon sezgisi (LLM yoksa / fail). */
-function inferPhotoSceneHeuristic(rawText) {
+function inferPhotoSceneHeuristic(rawText, gender = 'unknown') {
   const t = String(rawText || '').toLowerCase();
+  const outfit =
+    gender === 'male'
+      ? 'casual masculine outfit (jeans and sweater or hoodie)'
+      : gender === 'female'
+        ? 'casual everyday outfit'
+        : 'casual everyday outfit';
+  const gymOutfit =
+    gender === 'male'
+      ? 'athletic wear (shorts/t-shirt or joggers)'
+      : 'athletic wear (leggings/t-shirt)';
   const rules = [
-    [/beach|sahil|plaj|deniz|ocean|seaside/, 'Standing on a sunny seaside boardwalk in casual summer clothes, fully clothed, friendly smile, daytime'],
-    [/cafe|kafe|kahve|coffee|starbucks|brunch/, 'Sitting at a cozy daytime cafe table with a coffee cup, casual outfit, natural window light'],
-    [/park|bahçe|garden|orman|forest|nature|doğa/, 'Walking in a green park on a sunny day, casual everyday clothes, outdoor portrait'],
-    [/gym|spor|fitness|antrenman|workout/, 'In a gym lobby area in athletic wear (leggings/tshirt), holding a water bottle, fully clothed'],
-    [/office|ofis|işyer|work|desk/, 'At a bright office desk with a laptop, smart casual outfit, daytime indoor portrait'],
-    [/home|ev|oda|salon|mutfak|kitchen|living/, 'In a tidy living room at home, casual loungewear fully clothed, soft daylight'],
-    [/city|şehir|sokak|street|downtown|night.*(city|out)|gece.*(şehir|dış)/, 'On a lively city street daytime, casual streetwear, environmental portrait'],
-    [/travel|tatil|trip|airport|uçak|hotel|otel/, 'Travel day near a hotel lobby/window with luggage nearby, casual outfit, daytime'],
-    [/library|kütüph|museum|müze|bookstore|kitap/, 'Inside a bright library or bookstore aisle, holding a book, modest casual clothes'],
-    [/car|araba|drive|yolculuk/, 'In a car passenger seat during daytime, seatbelt on, casual clothes, natural light'],
-    [/mirror|ayna/, 'Casual fully clothed mirror photo in a hallway, phone visible, everyday outfit'],
-    [/selfie|özçekim|ozcekim/, 'Casual daytime phone selfie outdoors, fully clothed everyday outfit, natural smile'],
-    [/rain|yağmur|yagmurlu/, 'Standing under a clear umbrella on a rainy city street at dusk, casual coat, soft reflections'],
-    [/snow|kar|kış|winter/, 'On a snowy sidewalk in a warm winter coat and scarf, soft daylight, friendly smile'],
-    [/night|gece|neon/, 'Night city street neon glow, casual evening outfit, environmental portrait, fully clothed'],
-    [/concert|konser|festival/, 'In a concert venue lobby before the show, casual stylish outfit, colorful ambient light'],
-    [/food|yemek|mutfak|cook|cooking/, 'In a bright kitchen mid-cooking, apron optional, casual clothes, warm indoor light'],
-    [/rooftop|teras|balcony|balkon/, 'On a rooftop terrace at golden hour, breeze in hair, casual summer outfit'],
-    [/train|tren|metro|subway|bus|otobüs/, 'On a train or subway seat by the window, casual clothes, soft daylight or interior light'],
-    [/market|pazar|çarşı|bazaar/, 'At an outdoor market stall aisle, daylight, casual clothes, candid smile']
+    [/beach|sahil|plaj|deniz|ocean|seaside/, `Standing on a sunny seaside boardwalk in ${outfit}, fully clothed, friendly smile, daytime`],
+    [/cafe|kafe|kahve|coffee|starbucks|brunch/, `Sitting at a cozy daytime cafe table with a coffee cup, ${outfit}, natural window light`],
+    [/park|bahçe|garden|orman|forest|nature|doğa/, `Walking in a green park on a sunny day, ${outfit}, outdoor portrait`],
+    [/gym|spor|fitness|antrenman|workout/, `In a gym lobby area in ${gymOutfit}, holding a water bottle, fully clothed`],
+    [/office|ofis|işyer|work|desk/, `At a bright office desk with a laptop, smart casual ${outfit}, daytime indoor portrait`],
+    [/home|ev|oda|salon|mutfak|kitchen|living|evde/, `In a tidy living room at home, casual loungewear fully clothed, soft daylight`],
+    [/city|şehir|sokak|street|downtown|night.*(city|out)|gece.*(şehir|dış)/, `On a lively city street daytime, streetwear, environmental portrait`],
+    [/travel|tatil|trip|airport|uçak|hotel|otel/, `Travel day near a hotel lobby/window with luggage nearby, ${outfit}, daytime`],
+    [/library|kütüph|museum|müze|bookstore|kitap/, `Inside a bright library or bookstore aisle, holding a book, modest ${outfit}`],
+    [/car|araba|drive|yolculuk/, `In a car passenger seat during daytime, seatbelt on, ${outfit}, natural light`],
+    [/mirror|ayna/, `Casual fully clothed mirror photo in a hallway, phone visible, ${outfit}`],
+    [/selfie|özçekim|ozcekim/, `Casual daytime phone selfie outdoors, fully clothed ${outfit}, natural smile`],
+    [/rain|yağmur|yagmurlu/, `Standing under a clear umbrella on a rainy city street at dusk, casual coat, soft reflections`],
+    [/snow|kar|kış|winter/, `On a snowy sidewalk in a warm winter coat and scarf, soft daylight, friendly smile`],
+    [/night|gece|neon/, `Night city street neon glow, casual evening outfit, environmental portrait, fully clothed`],
+    [/concert|konser|festival/, `In a concert venue lobby before the show, casual stylish outfit, colorful ambient light`],
+    [/food|yemek|mutfak|cook|cooking/, `In a bright kitchen mid-cooking, apron optional, ${outfit}, warm indoor light`],
+    [/rooftop|teras|balcony|balkon/, `On a rooftop terrace at golden hour, ${outfit}, environmental portrait`],
+    [/train|tren|metro|subway|bus|otobüs/, `On a train or subway seat by the window, ${outfit}, soft daylight or interior light`],
+    [/market|pazar|çarşı|bazaar/, `At an outdoor market stall aisle, daylight, ${outfit}, candid smile`]
   ];
   for (const [re, scene] of rules) {
     if (re.test(t)) return scene;
   }
   // Genel "foto at" — geniş rastgele pool (kahve/kitap/park klişesine düşme).
   const variety = [
-    'On a rooftop terrace at golden hour in casual summer clothes, slight breeze, environmental portrait',
-    'Standing under a clear umbrella on a rainy city street at dusk, soft reflections, fully clothed',
-    'At a night market food stall with neon glow, holding a snack, casual outfit, candid smile',
-    'In a bright kitchen mid-cooking homemade food, casual home clothes, warm indoor light',
-    'Browsing vinyl shelves in a record store, modest casual clothes, soft overhead light',
-    'On a ferry deck with wind in hair, casual jacket, daytime sea background',
-    'In an art gallery hallway with white walls and soft spotlights, smart casual outfit',
-    'Waiting on a subway platform under cool fluorescent light, streetwear, looking off-camera',
-    'In a flower shop aisle among colorful bouquets, soft daylight through glass, friendly smile',
-    'On a wooden marina pier, casual summer outfit, late afternoon light',
-    'In a coworking loft with plants and a laptop nearby, smart casual, window daylight',
-    'At an airport lounge window with airplanes outside, travel outfit, soft daylight',
-    'On a picnic blanket in a meadow late afternoon, casual clothes, warm golden light',
-    'In a greenhouse botanical garden among plants, soft green light, everyday outfit',
-    'On snowy city sidewalk in winter coat and scarf, soft overcast light, natural smile',
-    'In a bowling alley waiting area, casual weekend outfit, colorful ambient light',
-    'At an aquarium tunnel with blue water glow, fully clothed casual look, wonder expression',
-    'Leaning on a railing at a sunset overlook, windy, casual outfit, environmental portrait',
-    'In a thrift store mirror selfie, phone visible, everyday outfit, fluorescent soft light',
-    'Mid-stride on a bike path holding a helmet, athletic casual wear, sunny day',
-    'In a concert venue lobby before the show, stylish casual clothes, colorful ambient light',
-    'Sitting on museum stairs in daylight, modest casual clothes, candid friend-taken shot',
-    'At a street food stall buying a snack, evening city lights, casual jacket',
-    'Hotel balcony overlooking the city skyline at blue hour, loungewear fully clothed',
-    'In a laundromat waiting with headphones, casual clothes, fluorescent daylight mix',
-    'On a train window seat with rural scenery outside, cozy sweater, soft side light',
-    'Neon arcade lobby with colorful lights, playful smile, casual night-out outfit',
-    'Yoga studio lobby after class in athletic wear (leggings/tshirt), water bottle, soft light',
-    'City plaza near a fountain daytime, streetwear, environmental portrait',
-    'Car passenger seat at highway golden hour, seatbelt on, casual clothes, natural smile',
-    'Rain reflections on wet pavement at night, coat and scarf, neon bokeh background',
-    'Ski resort lodge lobby in winter coat, warm indoor light, friendly expression',
-    'Walking mid-stride on a lively downtown street daytime, casual streetwear',
-    'Living room fairy lights evening, casual loungewear fully clothed, warm lamp light',
-    'Climbing gym lobby with outdoor shoes nearby, athletic wear fully clothed',
-    'Farmer market stall aisle holding fresh produce, sunny day, casual summer clothes'
+    `On a rooftop terrace at golden hour in ${outfit}, slight breeze, environmental portrait`,
+    `Standing under a clear umbrella on a rainy city street at dusk, soft reflections, fully clothed`,
+    `At a night market food stall with neon glow, holding a snack, ${outfit}, candid smile`,
+    `In a bright kitchen mid-cooking homemade food, casual home clothes, warm indoor light`,
+    `Browsing vinyl shelves in a record store, modest ${outfit}, soft overhead light`,
+    `On a ferry deck windy daytime, casual jacket, daytime sea background`,
+    `In an art gallery hallway with white walls and soft spotlights, smart casual outfit`,
+    `Waiting on a subway platform under cool fluorescent light, streetwear, looking off-camera`,
+    `On a wooden marina pier, ${outfit}, late afternoon light`,
+    `In a coworking loft with plants and a laptop nearby, smart casual, window daylight`,
+    `At an airport lounge window with airplanes outside, travel outfit, soft daylight`,
+    `On a picnic blanket in a meadow late afternoon, ${outfit}, warm golden light`,
+    `On snowy city sidewalk in winter coat and scarf, soft overcast light, natural smile`,
+    `Leaning on a railing at a sunset overlook, windy, ${outfit}, environmental portrait`,
+    `In a thrift store mirror selfie, phone visible, ${outfit}, fluorescent soft light`,
+    `Mid-stride on a bike path holding a helmet, athletic casual wear, sunny day`,
+    `In a concert venue lobby before the show, stylish casual clothes, colorful ambient light`,
+    `Sitting on museum stairs in daylight, modest ${outfit}, candid friend-taken shot`,
+    `At a street food stall buying a snack, evening city lights, casual jacket`,
+    `Hotel balcony overlooking the city skyline at blue hour, loungewear fully clothed`,
+    `On a train window seat with rural scenery outside, cozy sweater, soft side light`,
+    `City plaza near a fountain daytime, streetwear, environmental portrait`,
+    `Car passenger seat at highway golden hour, seatbelt on, ${outfit}, natural smile`,
+    `Walking mid-stride on a lively downtown street daytime, casual streetwear`,
+    `Living room evening lamp light, casual loungewear fully clothed, warm indoor portrait`,
+    `Farmer market stall aisle holding fresh produce, sunny day, ${outfit}`
   ];
   return variety[Math.floor(Math.random() * variety.length)];
 }
@@ -960,19 +1140,34 @@ const PROACTIVE_IMAGE_MODEL = process.env.PROACTIVE_IMAGE_MODEL || 'gpt-image-1'
 /**
  * Karakterin mevcut fotosunu referans alarak kullanıcı isteğine uygun yeni bir
  * görsel üretir. Bunny CDN'e yükleyip public URL döndürür.
+ * @param {string} referenceUrl
+ * @param {string} scenePrompt
+ * @param {{gender?: string, age?: number}} [persona]
  * @returns {Promise<string|null>} CDN URL veya null (başarısızlıkta sessizce null)
  */
-async function generateProactivePhoto(referenceUrl, scenePrompt) {
+async function generateProactivePhoto(referenceUrl, scenePrompt, persona = {}) {
   const apiKey = getOpenAiApiKey();
   if (!apiKey || !referenceUrl) return null;
+
+  const gender = resolveBotGender(persona.gender ?? persona);
+  const age = Math.max(18, Math.min(65, Number(persona.age) || 24));
+  const genderLock =
+    gender === 'male'
+      ? 'The subject is an adult MAN / MALE. Keep clearly masculine presentation (male face, male body, male clothing). Do NOT turn him into a woman.'
+      : gender === 'female'
+        ? 'The subject is an adult WOMAN / FEMALE. Keep clearly feminine presentation. Do NOT turn her into a man.'
+        : 'Preserve the exact gender presentation of the reference person.';
 
   const safeScene = String(scenePrompt || '')
     .replace(/[<>]/g, '')
     .slice(0, 320)
     .trim();
   const safeFallbackScene =
-    'Daytime outdoor casual portrait in a public place, fully clothed everyday outfit like jeans and a sweater, ' +
-    'friendly smile, soft natural light, photorealistic, SFW social media style.';
+    gender === 'male'
+      ? 'Daytime outdoor casual portrait of a man in a public place, fully clothed jeans and sweater, ' +
+        'friendly smile, soft natural light, photorealistic, SFW social media style.'
+      : 'Daytime outdoor casual portrait in a public place, fully clothed everyday outfit like jeans and a sweater, ' +
+        'friendly smile, soft natural light, photorealistic, SFW social media style.';
 
   async function requestEdit(scene) {
     // 1) Referans fotoyu indir.
@@ -991,7 +1186,7 @@ async function generateProactivePhoto(referenceUrl, scenePrompt) {
         ? 'webp'
         : 'png';
 
-    // 2) gpt-image-1 /images/edits — sahne kullanıcı isteğine göre; güvenlik sabit.
+    // 2) gpt-image-1 /images/edits — sahne kullanıcı isteğine göre; güvenlik + cinsiyet sabit.
     const form = new FormData();
     form.append('model', PROACTIVE_IMAGE_MODEL);
     form.append('image', refBuffer, {
@@ -1000,8 +1195,12 @@ async function generateProactivePhoto(referenceUrl, scenePrompt) {
     });
     form.append(
       'prompt',
-      `Keep the EXACT same person as in the reference photo (same face, hair, skin tone, identity). ` +
-        `Create a photorealistic photo of this person. Scene / setting / activity: ${scene || safeFallbackScene}. ` +
+      `Keep the EXACT same person as in the reference photo ` +
+        `(same face identity, facial structure, hair color/style, skin tone, age ~${age}). ` +
+        `${genderLock} ` +
+        `Create a photorealistic photo of THIS same person only. ` +
+        `Scene / setting / activity (follow closely): ${scene || safeFallbackScene}. ` +
+        `Do not invent a different location if the scene already specifies one. ` +
         `Camera style can be selfie, mirror shot, or environmental portrait depending on the scene. ` +
         `CRITICAL SAFETY: fully clothed in modest everyday clothes, no nudity, no lingerie, ` +
         `no bikini/swimwear focus, no sexual pose, no bedroom intimacy, no cleavage focus, PG-13 only. ` +
@@ -1191,10 +1390,23 @@ async function generateCharacterPhotoReply(conversationId, lang, userMessageText
     String(ctx.history?.[ctx.history.length - 1]?.content || '').trim();
 
   const systemPrompt = buildSystemPrompt(ctx.bot, ctx.userName, lang);
+  const photoPersona = {
+    gender: ctx.bot?.gender,
+    age: ctx.bot?.age,
+    name: ctx.bot?.name,
+  };
 
   // Önce kullanıcı isteğinden SFW sahne çıkar; caption'ı buna bağla.
-  const scene = await buildSafePhotoSceneFromUserRequest(requestText, lang);
-  console.log('[chatReply] photo scene:', scene.slice(0, 160));
+  const scene = await buildSafePhotoSceneFromUserRequest(
+    requestText,
+    lang,
+    photoPersona
+  );
+  console.log(
+    '[chatReply] photo scene:',
+    `gender=${resolveBotGender(photoPersona)}`,
+    scene.slice(0, 160)
+  );
 
   // Karakter tonunda kısa bir caption üret (fotoğrafla birlikte gidecek).
   let caption = '';
@@ -1221,7 +1433,11 @@ async function generateCharacterPhotoReply(conversationId, lang, userMessageText
     console.warn('[chatReply] photo caption failed:', e?.message || e);
   }
 
-  let imageUrl = await generateProactivePhoto(referenceUrl, scene);
+  let imageUrl = await generateProactivePhoto(
+    referenceUrl,
+    scene,
+    photoPersona
+  );
   // OpenAI safety üretimi kestiğinde: mevcut galeri fotosunu paylaş (özellik çalışmaya devam etsin).
   if (!imageUrl) {
     imageUrl = pickGalleryPhotoUrl(ctx.bot?.photoURL, referenceUrl) || referenceUrl;
@@ -1341,8 +1557,21 @@ async function generateProactiveMessage(conversationId, opts = {}) {
         .reverse()
         .find((m) => m?.role === 'user');
       const contextHint = String(lastUser?.content || caption || text || '').slice(0, 240);
-      const scene = await buildSafePhotoSceneFromUserRequest(contextHint, lang);
-      let imageUrl = await generateProactivePhoto(referenceUrl, scene);
+      const photoPersona = {
+        gender: ctx.bot?.gender,
+        age: ctx.bot?.age,
+        name: ctx.bot?.name,
+      };
+      const scene = await buildSafePhotoSceneFromUserRequest(
+        contextHint,
+        lang,
+        photoPersona
+      );
+      let imageUrl = await generateProactivePhoto(
+        referenceUrl,
+        scene,
+        photoPersona
+      );
       if (!imageUrl) {
         imageUrl = pickGalleryPhotoUrl(ctx.bot?.photoURL, referenceUrl) || referenceUrl;
         console.warn('[proactive] photo blocked/failed — using gallery fallback');
