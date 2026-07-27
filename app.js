@@ -20,6 +20,20 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(requestLogger);
 
+// DB sağlık kontrolü — tarayıcı/curl ile test: GET /health/db
+app.get('/health/db', async (req, res) => {
+    const { testConnection } = require('./db');
+    const result = await testConnection();
+    const body = {
+        status: result.ok ? 'ok' : 'error',
+        host: process.env.DB_HOST || null,
+        port: Number(process.env.DB_PORT || 3306),
+        database: process.env.DB_NAME || null,
+        user: process.env.DB_USER || null,
+        ...result,
+    };
+    res.status(result.ok ? 200 : 503).json(body);
+});
 
 app.use('/auth',router)
 app.use('/server',config)
@@ -60,6 +74,9 @@ server.listen(PORT,()=>{
     // sohbetler 'bot_typing' durumunda takılı kalmış olabilir; başlangıçta temizle.
     const { query } = require('./db');
     query("UPDATE `coversations` SET `current_chat_state` = 'normal' WHERE `current_chat_state` = 'bot_typing'")
-        .then(() => console.log('Stale bot_typing states reset on startup.'))
-        .catch((err) => console.error('Failed to reset stale bot_typing states:', err?.message || err));
+        .then((ok) => {
+            if (ok) console.log('[DB] Stale bot_typing states reset on startup.');
+            else console.warn('[DB] bot_typing reset atlandı (DB bağlantısı yok).');
+        })
+        .catch((err) => console.error('[DB] bot_typing reset hatası:', err?.message || err));
 });
