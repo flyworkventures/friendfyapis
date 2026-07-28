@@ -71,7 +71,9 @@ async function authenticateRealtime(req) {
     if (!botId || botId <= 0) return { success: false, error: 'Invalid botId' };
 
     // Sesli/görüntülü arama: premium/trial gerekir.
-    // Onboarding deneme görüntüsü (`demo=1` + callMode=video) premium'suz.
+    // Bypass:
+    //  - Onboarding deneme (`demo=1` + callMode=video)
+    //  - Geçici test: ALLOW_FREE_CALLS=true (.env)
     const rawModeEarly = (url.searchParams.get('callMode') || url.searchParams.get('mode') || '')
       .toLowerCase()
       .trim();
@@ -79,7 +81,9 @@ async function authenticateRealtime(req) {
       rawModeEarly === 'video' &&
       (url.searchParams.get('demo') === '1' ||
         url.searchParams.get('demo') === 'true');
-    if (!isDemoVideo) {
+    const allowFreeCalls =
+      String(process.env.ALLOW_FREE_CALLS || '').toLowerCase() === 'true';
+    if (!isDemoVideo && !allowFreeCalls) {
       const users = await getQuery(
         'SELECT memberships FROM `users` WHERE id = ? LIMIT 1',
         [userId]
