@@ -22,6 +22,12 @@ const CHAT_MAX_OUTPUT_TOKENS = Math.min(
   400
 );
 
+/** Karakterin rastgele sesli cevap gönderme olasılığı (0–1). */
+const VOICE_REPLY_RATE = Math.min(
+  Math.max(Number(process.env.CHAT_VOICE_REPLY_RATE ?? '0.22'), 0),
+  1
+);
+
 function getChatModel() {
   return process.env.CHAT_REPLY_MODEL || 'gpt-4o-mini';
 }
@@ -479,6 +485,7 @@ async function fetchConversationContext(conversationId) {
               b.job_tr, b.job_en,
               COALESCE(o.photoURL, b.photoURL) AS photoURL,
               b.system,
+              b.voiceId,
               COALESCE(o.gender, b.gender) AS gender,
               COALESCE(o.age, b.age) AS age,
               u.username AS userName, u.email AS userEmail, u.memberships AS userMemberships
@@ -499,7 +506,7 @@ async function fetchConversationContext(conversationId) {
       convRows = await getQuery(
         `SELECT c.id, c.botId, c.userId, b.id AS bot_id, b.name, b.\`character\`, b.speakingStyle, b.interests,
                 b.interestsType, b.exampleResponse, b.characterTags, b.job_tr, b.job_en,
-                b.photoURL, b.system, b.gender, b.age,
+                b.photoURL, b.system, b.voiceId, b.gender, b.age,
                 u.username AS userName, u.email AS userEmail, u.memberships AS userMemberships
          FROM \`coversations\` c
          JOIN \`bots\` b ON c.botId = b.id
@@ -515,18 +522,42 @@ async function fetchConversationContext(conversationId) {
   if (!row) return null;
 
   const userName = String(row.userName || row.userEmail || 'kullanıcı').trim() || 'kullanıcı';
-  const historyRows = await getQuery(
-    'SELECT sender, message, message_type FROM `messages` WHERE conversationId = ? ORDER BY id DESC LIMIT ?',
-    [conversationId, CHAT_HISTORY_LIMIT]
-  );
+  let historyRows;
+  try {
+    historyRows = await getQuery(
+      `SELECT m.sender, m.message, m.message_type, m.reply_to_message_id,
+              rm.sender AS reply_sender, rm.message AS reply_message,
+              rm.message_type AS reply_message_type
+       FROM \`messages\` m
+       LEFT JOIN \`messages\` rm ON m.reply_to_message_id = rm.id
+       WHERE m.conversationId = ?
+       ORDER BY m.id DESC
+       LIMIT ?`,
+      [conversationId, CHAT_HISTORY_LIMIT]
+    );
+  } catch (_) {
+    historyRows = await getQuery(
+      'SELECT sender, message, message_type FROM `messages` WHERE conversationId = ? ORDER BY id DESC LIMIT ?',
+      [conversationId, CHAT_HISTORY_LIMIT]
+    );
+  }
 
   const history = [...(historyRows || [])]
     .reverse()
     .map((r) => {
       const sender = String(r.sender || '').toLowerCase();
       const role = sender === 'user' ? 'user' : 'assistant';
-      const content = normalizeMessageText(r.message);
+      let content = normalizeMessageText(r.message);
       if (!content) return null;
+      if (r.reply_to_message_id) {
+        const quoted = normalizeMessageText(r.reply_message);
+        const who =
+          String(r.reply_sender || '').toLowerCase() === 'user'
+            ? 'user'
+            : 'assistant';
+        const preview = (quoted || '[media]').slice(0, 100);
+        content = `[Replying to ${who}: "${preview}"] ${content}`;
+      }
       return { role, content };
     })
     .filter(Boolean);
@@ -749,10 +780,341 @@ async function generateCharacterOpeningMessage(conversationId, lang) {
 }
 
 /**
- * Sesli mesaj: transkript üzerinden aynı pipeline.
+ * Sesli cevap: metin üret → ElevenLabs TTS → CDN → voice mesaj kaydet.
+ * Başarısız olursa metin cevaba düşer.
+ * @param {number|string} conversationId
+ * @param {string} lang
+ * @param {{force?: boolean, reason?: string}} [opts]
  */
-async function generateCharacterVoiceReply(conversationId, lang) {
-  return generateCharacterTextReply(conversationId, lang);
+async function generateCharacterVoiceReply(conversationId, lang, opts = {}) {
+  const ctx = await fetchConversationContext(conversationId);
+  if (!ctx) {
+    console.error('[chatReply] voice: conversation not found:', conversationId);
+    return null;
+  }
+
+  await query(
+    "UPDATE `coversations` SET `current_chat_state` = 'bot_record_audio' WHERE id = ? LIMIT 1",
+    [conversationId]
+  ).catch(() => {});
+
+  try {
+    const historyForVoice = buildHistoryForVoiceReply(ctx.history, lang);
+    const voiceDirective = buildVoiceReplyDirective(lang, opts.reason);
+
+    const systemPrompt = buildSystemPrompt(ctx.bot, ctx.userName, lang);
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...historyForVoice,
+      { role: 'system', content: voiceDirective },
+    ];
+
+    let replyText = '';
+    try {
+      replyText = await callOpenAI({
+        messages,
+        model: getChatModel(),
+        maxTokens: Math.min(CHAT_MAX_OUTPUT_TOKENS, 100),
+      });
+    } catch (e) {
+      console.error('[chatReply] voice text generation failed:', e?.message || e);
+    }
+    replyText = enforceCompactReplyStyle(replyText);
+
+    // Model bazen "ses gönderemem" diye meta konuşuyor — bir kez daha dene.
+    if (!replyText || isVoiceMetaRefusal(replyText)) {
+      console.warn(
+        '[chatReply] voice meta/refusal text, regenerating:',
+        String(replyText || '').slice(0, 120)
+      );
+      try {
+        const retry = await callOpenAI({
+          messages: [
+            { role: 'system', content: systemPrompt },
+            ...historyForVoice,
+            { role: 'system', content: voiceDirective },
+            {
+              role: 'system',
+              content: isTurkishLang(lang)
+                ? 'ÖNCEKİ DENEME GEÇERSİZ. Sesli mesajı REDDETME, "gönderemiyorum" DEME. ' +
+                  'Sadece telefonda konuşuyormuş gibi 1-2 doğal cümle yaz. Konuyu sürdür.'
+                : 'PREVIOUS OUTPUT INVALID. Do NOT refuse the voice note. ' +
+                  'Write only 1-2 natural spoken sentences continuing the chat.',
+            },
+          ],
+          model: getChatModel(),
+          maxTokens: Math.min(CHAT_MAX_OUTPUT_TOKENS, 100),
+        });
+        replyText = enforceCompactReplyStyle(retry);
+      } catch (e) {
+        console.error('[chatReply] voice retry failed:', e?.message || e);
+      }
+    }
+
+    if (isVoiceMetaRefusal(replyText)) {
+      replyText = '';
+    }
+    if (!replyText) {
+      // Son çare: sohbeti sürdüren kısa doğal cümle (meta yok).
+      replyText = isTurkishLang(lang)
+        ? 'Heey, sesimi duydun mu? Neler yapıyorsun şimdi?'
+        : 'Hey, can you hear me? What are you up to right now?';
+    }
+
+    try {
+      const audioUrl = await synthesizeAndUploadBotVoice(replyText, ctx.bot?.voiceId);
+      if (!audioUrl) {
+        throw new Error('TTS upload returned empty url');
+      }
+      const saved = await saveBotVoiceReply(conversationId, replyText, audioUrl);
+      if (!saved) throw new Error('saveBotVoiceReply failed');
+      console.log(
+        '[chatReply] voice reply saved',
+        conversationId,
+        'reason=',
+        opts.reason || 'unknown',
+        'text=',
+        replyText.slice(0, 80)
+      );
+    } catch (e) {
+      console.warn(
+        '[chatReply] voice pipeline failed, falling back to text:',
+        e?.message || e
+      );
+      await saveBotReply(conversationId, replyText);
+    }
+    return replyText;
+  } finally {
+    await query(
+      "UPDATE `coversations` SET `current_chat_state` = 'normal' WHERE id = ? LIMIT 1",
+      [conversationId]
+    ).catch(() => {});
+  }
+}
+
+function buildVoiceReplyDirective(lang, reason) {
+  const requested = reason === 'user_request';
+  if (isTurkishLang(lang)) {
+    return (
+      'SES NOTU MODU (zorunlu):\n' +
+      '- Uygulama şu an senin adına gerçek bir SESLİ MESAJ gönderiyor (TTS). Bu zaten oluyor.\n' +
+      (requested
+        ? '- Kullanıcı senden ses istedi; istek KARŞILANDI. Reddetme, bahane uydurma.\n'
+        : '- Rastgele sesli mesaj atıyorsun; doğal konuş.\n') +
+      '- ASLA söyleme: "sesli mesaj gönderemiyorum", "ses atamam", "yazı yazıyorum", ' +
+      '"bu bir ses değil", "mikrofonum yok", "uygulama izin vermiyor", "ses kaydı yapamam".\n' +
+      '- Sesli mesajdan / kayıttan / uygulamadan bahsetme.\n' +
+      '- Telefonda konuşuyormuş gibi 1-2 kısa, samimi cümle yaz.\n' +
+      '- Sadece söylenecek kelimeleri yaz; etiket, tırnak, emoji yok.'
+    );
+  }
+  return (
+    'VOICE NOTE MODE (mandatory):\n' +
+    '- The app is ALREADY sending a real voice message as you (TTS). It is happening now.\n' +
+    (requested
+      ? '- The user asked for audio; the request is fulfilled. Do not refuse.\n'
+      : '- You are sending a spontaneous voice note; speak naturally.\n') +
+    '- NEVER say you cannot send voice/audio, that you are typing, or mention the app/mic.\n' +
+    '- Do not talk about voice messages at all.\n' +
+    '- Write 1-2 short spoken sentences as if on a phone call.\n' +
+    '- Output only the words to speak; no labels, quotes, or emoji.'
+  );
+}
+
+/** Kullanıcının "ses at" isteğini history'den temizle — model reddetmesin. */
+function buildHistoryForVoiceReply(history, lang) {
+  const list = Array.isArray(history) ? history.map((m) => ({ ...m })) : [];
+  if (!list.length) return list;
+
+  // Sondan son kullanıcı mesajını bul.
+  let lastUserIdx = -1;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i]?.role === 'user') {
+      lastUserIdx = i;
+      break;
+    }
+  }
+  if (lastUserIdx < 0) return list;
+
+  const last = String(list[lastUserIdx].content || '');
+  if (!userWantsVoice(last)) return list;
+
+  // Önceki gerçek sohbet bağlamını bul (ses isteği olmayan son user).
+  let priorUser = '';
+  for (let i = lastUserIdx - 1; i >= 0; i--) {
+    if (list[i]?.role === 'user' && !userWantsVoice(list[i].content)) {
+      priorUser = String(list[i].content || '').trim();
+      break;
+    }
+  }
+
+  list[lastUserIdx] = {
+    role: 'user',
+    content: isTurkishLang(lang)
+      ? priorUser
+        ? `(Sesli mesaj istiyor; sen zaten ses atıyorsun. Önceki konusu: ${priorUser.slice(0, 160)}) Devam et, samimi konuş.`
+        : '(Sesli mesaj istiyor; sen zaten ses atıyorsun.) Samimi bir şekilde sohbete devam et, ne yaptığını sorabilirsin.'
+      : priorUser
+        ? `(They asked for a voice note; you are already sending one. Prior topic: ${priorUser.slice(0, 160)}) Continue warmly.`
+        : '(They asked for a voice note; you are already sending one.) Continue the chat warmly.',
+  };
+  return list;
+}
+
+/** "Ses gönderemem" tarzı meta/red cevapları. */
+function isVoiceMetaRefusal(text) {
+  const t = String(text || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '');
+  if (!t) return true;
+  const patterns = [
+    /sesli mesaj gondere?miyorum/,
+    /ses (atamiyorum|gonderemiyorum|yollayamam|gonderemem)/,
+    /ses kaydi (yapamiyorum|atamiyorum)/,
+    /mikrofon/,
+    /ses gonderemem/,
+    /can't send (a )?(voice|audio)/,
+    /cannot send (a )?(voice|audio)/,
+    /unable to send (a )?(voice|audio)/,
+    /i (don't|do not|cant|can't) (send|record) (voice|audio)/,
+    /not (actually )?sending (a )?(voice|audio)/,
+    /bu bir ses (degil|li mesaj degil)/,
+    /yazili (yaziyorum|cevap)/,
+  ];
+  return patterns.some((re) => re.test(t));
+}
+
+/** voices.id veya elevenlabs_id → ElevenLabs voice id. */
+async function resolveElevenLabsVoiceId(raw) {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) {
+    return String(process.env.ELEVENLABS_DEFAULT_VOICE_ID || '').trim();
+  }
+  if (/[a-zA-Z]/.test(trimmed) && trimmed.length >= 10) {
+    return trimmed;
+  }
+  if (/^\d+$/.test(trimmed)) {
+    const rows = await getQuery(
+      'SELECT elevenlabs_id FROM `voices` WHERE id = ? LIMIT 1',
+      [Number(trimmed)]
+    );
+    const resolved = rows?.[0]?.elevenlabs_id;
+    if (resolved) return String(resolved).trim();
+  }
+  const byEl = await getQuery(
+    'SELECT elevenlabs_id FROM `voices` WHERE elevenlabs_id = ? LIMIT 1',
+    [trimmed]
+  );
+  if (byEl?.[0]?.elevenlabs_id) {
+    return String(byEl[0].elevenlabs_id).trim();
+  }
+  return trimmed;
+}
+
+async function synthesizeAndUploadBotVoice(text, rawVoiceId) {
+  const apiKey = String(process.env.ELEVENLABS_API_KEY || '').trim();
+  if (!apiKey) {
+    throw new Error('ELEVENLABS_API_KEY missing');
+  }
+  const voiceId = await resolveElevenLabsVoiceId(rawVoiceId);
+  if (!voiceId) {
+    throw new Error('voiceId missing');
+  }
+  const modelId =
+    process.env.ELEVENLABS_MODEL_ID || 'eleven_multilingual_v2';
+  const maxChars = Math.min(
+    Math.max(parseInt(process.env.TTS_MAX_CHARS || '800', 10) || 800, 40),
+    2500
+  );
+  const speakText = String(text || '').trim().slice(0, maxChars);
+  if (!speakText) throw new Error('empty TTS text');
+
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`;
+  const elRes = await axios.post(
+    url,
+    {
+      text: speakText,
+      model_id: modelId,
+      voice_settings: { stability: 0.4, similarity_boost: 0.8 },
+    },
+    {
+      headers: {
+        'xi-api-key': apiKey,
+        'Content-Type': 'application/json',
+        Accept: 'audio/mpeg',
+      },
+      responseType: 'arraybuffer',
+      timeout: 45000,
+    }
+  );
+  const buf = Buffer.from(elRes.data);
+  if (!buf.length) throw new Error('empty TTS audio');
+
+  const remotePath = `chat-voice/${Date.now()}_${Math.random().toString(36).slice(2, 10)}.mp3`;
+  return uploadBufferToBunny(buf, remotePath, 'audio/mpeg');
+}
+
+async function saveBotVoiceReply(conversationId, text, audioUrl) {
+  const reply = enforceCompactReplyStyle(text) || String(text || '').trim();
+  if (!reply || !audioUrl) return false;
+  const durationSec = estimateSpeechDurationSec(reply);
+  const payload = JSON.stringify({ text: reply, url: audioUrl, durationSec });
+  const inserted = await query(
+    "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
+    [conversationId, 'bot', payload, 'voice']
+  );
+  if (inserted !== true) return false;
+  // Mesaj listesi önizlemesi: voice_message|<saniye>
+  await query(
+    'UPDATE `coversations` SET `lastMessage` = ?, `last_message_at` = NOW() WHERE id = ? LIMIT 1',
+    [`voice_message|${durationSec}`, conversationId]
+  );
+  return true;
+}
+
+/** TTS metninden kaba süre tahmini (sn). */
+function estimateSpeechDurationSec(text) {
+  const words = String(text || '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+  const byWords = Math.round(words * 0.45);
+  const byChars = Math.round(String(text || '').length / 14);
+  return Math.max(2, Math.min(90, Math.max(byWords, byChars, 2)));
+}
+
+/**
+ * Kullanıcı sesli mesaj istedi mi? (çok dilli sezgisel)
+ */
+function userWantsVoice(rawText) {
+  const text = String(rawText || '').toLowerCase().trim();
+  if (!text || text.length > 200) return false;
+
+  const voiceNouns = [
+    'sesli mesaj', 'ses mesajı', 'ses mesaji', 'voice message', 'voice note',
+    'voice memo', 'audio message', 'audiomessage', 'notiz', 'sprachnachricht',
+    'mensaje de voz', 'messaggio vocale', 'message vocal', 'голосовое',
+    '보이스', '음성 메시지', 'ボイス', 'ボイスメッセージ',
+  ];
+  const cues = [
+    'ses at', 'ses atsana', 'ses gönder', 'ses gonder', 'ses yoll', 'mikrofon',
+    'konuşarak', 'konusarak', 'sesle söyle', 'sesle soyle', 'sesli söyle',
+    'sesli soyle', 'ses kaydı', 'ses kaydi',
+    'send voice', 'voice note', 'voice message', 'speak to me', 'say it out loud',
+    'record a', 'audio note', 'send audio',
+    'schicken sprachnachricht', 'sprachnachricht',
+    'manda un audio', 'envía un audio', 'envia un audio', 'envoie un vocal',
+  ];
+
+  if (voiceNouns.some((n) => text.includes(n))) return true;
+  if (cues.some((c) => text.includes(c))) {
+    // "ses" tek başına çok gürültülü; istek fiiliyle birlikte
+    return true;
+  }
+  // Kısa net istekler: "ses?", "ses pls"
+  if (/^(ses|voice|audio)\b/.test(text) && text.length <= 24) return true;
+  return false;
 }
 
 /**
@@ -1480,11 +1842,19 @@ async function generateCharacterPhotoReply(conversationId, lang, userMessageText
 }
 
 /**
- * Kullanıcı metin mesajı için cevap üretir: foto isteği ise görsel, değilse metin.
+ * Kullanıcı metin mesajı için cevap üretir: foto / ses / metin.
  */
 async function generateCharacterReply(conversationId, lang, userMessageText) {
   if (userWantsPhoto(userMessageText)) {
     return generateCharacterPhotoReply(conversationId, lang, userMessageText);
+  }
+  const wantsVoice = userWantsVoice(userMessageText);
+  const randomVoice = !wantsVoice && VOICE_REPLY_RATE > 0 && Math.random() < VOICE_REPLY_RATE;
+  if (wantsVoice || randomVoice) {
+    return generateCharacterVoiceReply(conversationId, lang, {
+      force: Boolean(wantsVoice),
+      reason: wantsVoice ? 'user_request' : 'random',
+    });
   }
   return generateCharacterTextReply(conversationId, lang);
 }
@@ -1603,8 +1973,10 @@ module.exports = {
   generateCharacterPhotoReply,
   generateCharacterReply,
   userWantsPhoto,
+  userWantsVoice,
   generateProactiveMessage,
   buildSystemPrompt,
   saveBotReply,
+  saveBotVoiceReply,
   sanitizeReplyText
 };

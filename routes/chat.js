@@ -125,30 +125,85 @@ router.post('/create-chat',middleware,async (req,res)=>{
 router.post('/get-messages',middleware, async(req,res)=>{
     const {conversationId} = req.body;
    // Proaktif (zamanlanmış) mesajlar, scheduled_at zamanı gelene kadar gizlidir.
-   let messages = await getQuery(
-     "SELECT * FROM `messages` WHERE conversationId = ? AND (`scheduled_at` IS NULL OR `scheduled_at` <= NOW())",
-     [conversationId]
-   );
+   // reply_to JOIN: alıntı önizlemesi için.
+   let messages;
+   try {
+     messages = await getQuery(
+       `SELECT m.*,
+          rm.sender AS reply_sender,
+          rm.message AS reply_message,
+          rm.message_type AS reply_message_type
+        FROM \`messages\` m
+        LEFT JOIN \`messages\` rm ON m.reply_to_message_id = rm.id
+        WHERE m.conversationId = ?
+          AND (m.\`scheduled_at\` IS NULL OR m.\`scheduled_at\` <= NOW())
+        ORDER BY m.id ASC`,
+       [conversationId]
+     );
+   } catch (e) {
+     // Kolon henüz yoksa eski sorguya düş.
+     console.warn('[get-messages] reply join failed, fallback:', e?.message || e);
+     messages = await getQuery(
+       "SELECT * FROM `messages` WHERE conversationId = ? AND (`scheduled_at` IS NULL OR `scheduled_at` <= NOW())",
+       [conversationId]
+     );
+   }
    return res.status(200).json(messages)
 })
 
 router.post('/listen-messages',middleware, async(req,res)=>{
     const {conversationId} = req.body;
    let convData = await getQuery("SELECT `current_chat_state` FROM `coversations` WHERE id = ?",[conversationId]);
-   let messages = await getQuery("SELECT * FROM `messages` WHERE conversationId = ? ORDER BY created_at DESC",[conversationId]);
+   let messages;
+   try {
+     messages = await getQuery(
+       `SELECT m.*,
+          rm.sender AS reply_sender,
+          rm.message AS reply_message,
+          rm.message_type AS reply_message_type
+        FROM \`messages\` m
+        LEFT JOIN \`messages\` rm ON m.reply_to_message_id = rm.id
+        WHERE m.conversationId = ?
+        ORDER BY m.created_at DESC`,
+       [conversationId]
+     );
+   } catch (e) {
+     messages = await getQuery(
+       "SELECT * FROM `messages` WHERE conversationId = ? ORDER BY created_at DESC",
+       [conversationId]
+     );
+   }
 
    let chatState = convData?.[0]?.["current_chat_state"] || 'normal';
 
-   // Self-heal: üretim sırasında crash olursa bot_typing takılı kalabilir.
-   if (chatState === 'bot_typing') {
+  // Self-heal: üretim sırasında crash olursa bot_typing / bot_record_audio takılı kalabilir.
+  if (chatState === 'bot_typing' || chatState === 'bot_record_audio') {
      const stale = await getQuery(
-       "SELECT sender, TIMESTAMPDIFF(SECOND, created_at, NOW()) AS age_sec FROM `messages` WHERE conversationId = ? ORDER BY created_at DESC LIMIT 1",
+       "SELECT sender, message_type, TIMESTAMPDIFF(SECOND, created_at, NOW()) AS age_sec FROM `messages` WHERE conversationId = ? ORDER BY id DESC LIMIT 1",
        [conversationId]
      );
      const newest = stale?.[0];
      const ageSec = newest ? Number(newest.age_sec) : Number.POSITIVE_INFINITY;
      const newestIsBot = newest && newest.sender === 'bot';
-     if ((newestIsBot && ageSec >= 8) || ageSec >= 90) {
+     const newestIsUser = newest && newest.sender === 'user';
+
+     let shouldHeal = false;
+     if (chatState === 'bot_record_audio') {
+       // TTS sürerken en son mesaj kullanıcıdır — erken heal etme (polling kesilmesin).
+       if (newestIsUser) {
+         shouldHeal = ageSec >= 120;
+       } else if (newestIsBot) {
+         // Bot zaten cevap yazdı (voice/text) — kısa süre sonra temizle.
+         shouldHeal = ageSec >= 12;
+       } else {
+         shouldHeal = ageSec >= 120;
+       }
+     } else {
+       // bot_typing
+       shouldHeal = (newestIsBot && ageSec >= 8) || ageSec >= 90;
+     }
+
+     if (shouldHeal) {
        chatState = 'normal';
        query(
          "UPDATE `coversations` SET `current_chat_state` = 'normal' WHERE id = ? LIMIT 1",
@@ -348,7 +403,7 @@ router.post('/generate-proactive', middleware, async (req, res) => {
 
 router.post('/send-message',middleware,async (req,res)=>{
    try {
-    const { sender, message, conversationId, messageType } = req.body;
+    const { sender, message, conversationId, messageType, replyToMessageId } = req.body;
     const lang = normalizeLang(req.body?.lang);
     const id = guidGenerator();
 
@@ -369,10 +424,21 @@ router.post('/send-message',middleware,async (req,res)=>{
       return res.status(usage.status).json(usage.body);
     }
 
-    const result = await query(
-      "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
-      [conversationId, "user", message, resolvedType]
-    );
+    const replyId = Number(replyToMessageId);
+    const hasReply = Number.isFinite(replyId) && replyId > 0;
+
+    let result;
+    if (hasReply) {
+      result = await query(
+        "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`, `reply_to_message_id`) VALUES (?, ?, ?, NOW(), ?, ?);",
+        [conversationId, "user", message, resolvedType, replyId]
+      );
+    } else {
+      result = await query(
+        "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
+        [conversationId, "user", message, resolvedType]
+      );
+    }
 
     if (result !== true) {
       return res.status(500).json({
@@ -380,6 +446,20 @@ router.post('/send-message',middleware,async (req,res)=>{
         success: false
       });
     }
+
+    // Mesaj listesi önizlemesi: kullanıcı mesajı da hemen lastMessage olsun.
+    const previewText =
+      resolvedType === 'image'
+        ? '📷'
+        : resolvedType === 'voice'
+          ? 'voice_message'
+          : resolvedType === 'pdf'
+            ? '📄'
+            : String(message || '').slice(0, 500);
+    await query(
+      'UPDATE `coversations` SET `lastMessage` = ?, `last_message_at` = NOW() WHERE id = ? LIMIT 1',
+      [previewText || null, conversationId]
+    ).catch(() => {});
 
     if (resolvedType === 'pdf') {
       analyzePdfAndReply(conversationId, message, lang).catch((err) => {
@@ -395,7 +475,7 @@ router.post('/send-message',middleware,async (req,res)=>{
     }
 
     if (sender === 'user' && resolvedType === 'text') {
-      // Foto isteği uzun sürebilir; "yazıyor" göstergesi için bot_typing.
+      // Foto/ses cevabı uzun sürebilir; typing / record state.
       query(
         "UPDATE `coversations` SET `current_chat_state` = 'bot_typing' WHERE id = ? LIMIT 1",
         [conversationId]
@@ -426,6 +506,252 @@ router.post('/send-message',middleware,async (req,res)=>{
     });
    }
 })
+
+/** Kullanıcı kendi metin mesajını düzenler (AI yeniden tetiklenmez). */
+router.post('/edit-message', middleware, async (req, res) => {
+  try {
+    const messageId = Number(req.body?.messageId);
+    const conversationId = req.body?.conversationId;
+    const newText = String(req.body?.message ?? '').trim();
+    const userId = jwtUserId(req);
+
+    if (!userId || !conversationId || !Number.isFinite(messageId) || messageId <= 0) {
+      return res.status(400).json({ success: false, msg: 'messageId and conversationId required' });
+    }
+    if (!newText) {
+      return res.status(400).json({ success: false, msg: 'message required' });
+    }
+
+    const owned = await getQuery(
+      `SELECT m.id, m.sender, m.message_type, m.conversationId
+       FROM \`messages\` m
+       INNER JOIN \`coversations\` c ON c.id = m.conversationId
+       WHERE m.id = ? AND m.conversationId = ? AND c.userId = ?
+       LIMIT 1`,
+      [messageId, conversationId, userId]
+    );
+    const row = owned?.[0];
+    if (!row) {
+      return res.status(404).json({ success: false, msg: 'Message not found or unauthorized' });
+    }
+    if (String(row.sender).toLowerCase() !== 'user') {
+      return res.status(403).json({ success: false, msg: 'Only own messages can be edited' });
+    }
+    if (String(row.message_type || 'text').toLowerCase() !== 'text') {
+      return res.status(400).json({ success: false, msg: 'Only text messages can be edited' });
+    }
+
+    const ok = await query(
+      'UPDATE `messages` SET `message` = ? WHERE `id` = ? AND `conversationId` = ? LIMIT 1',
+      [newText, messageId, conversationId]
+    );
+    if (ok !== true) {
+      return res.status(500).json({ success: false, msg: 'SQL' });
+    }
+
+    // Son mesaj buysa conversation preview güncelle.
+    const latest = await getQuery(
+      'SELECT id FROM `messages` WHERE conversationId = ? ORDER BY id DESC LIMIT 1',
+      [conversationId]
+    );
+    if (latest?.[0] && Number(latest[0].id) === messageId) {
+      await query(
+        'UPDATE `coversations` SET `lastMessage` = ?, `last_message_at` = NOW() WHERE id = ? LIMIT 1',
+        [newText.slice(0, 500), conversationId]
+      );
+    }
+
+    return res.status(200).json({ success: true, messageId, message: newText });
+  } catch (error) {
+    console.error('edit-message error:', error?.message || error);
+    return res.status(500).json({ success: false, msg: 'Server error' });
+  }
+});
+
+/** Kullanıcı kendi mesajını siler. */
+router.post('/delete-message', middleware, async (req, res) => {
+  try {
+    const messageId = Number(req.body?.messageId);
+    const conversationId = req.body?.conversationId;
+    const userId = jwtUserId(req);
+
+    if (!userId || !conversationId || !Number.isFinite(messageId) || messageId <= 0) {
+      return res.status(400).json({ success: false, msg: 'messageId and conversationId required' });
+    }
+
+    const owned = await getQuery(
+      `SELECT m.id, m.sender, m.message, m.message_type
+       FROM \`messages\` m
+       INNER JOIN \`coversations\` c ON c.id = m.conversationId
+       WHERE m.id = ? AND m.conversationId = ? AND c.userId = ?
+       LIMIT 1`,
+      [messageId, conversationId, userId]
+    );
+    const row = owned?.[0];
+    if (!row) {
+      return res.status(404).json({ success: false, msg: 'Message not found or unauthorized' });
+    }
+    if (String(row.sender).toLowerCase() !== 'user') {
+      return res.status(403).json({ success: false, msg: 'Only own messages can be deleted' });
+    }
+
+    // Alıntı referanslarını temizle (FK yoksa bile orphan önizleme kalmasın).
+    await query(
+      'UPDATE `messages` SET `reply_to_message_id` = NULL WHERE `reply_to_message_id` = ?',
+      [messageId]
+    ).catch(() => {});
+
+    const ok = await query(
+      'DELETE FROM `messages` WHERE `id` = ? AND `conversationId` = ? LIMIT 1',
+      [messageId, conversationId]
+    );
+    if (ok !== true) {
+      return res.status(500).json({ success: false, msg: 'SQL' });
+    }
+
+    // Conversation lastMessage'ı yenile.
+    const latest = await getQuery(
+      `SELECT message, message_type FROM \`messages\`
+       WHERE conversationId = ?
+         AND (scheduled_at IS NULL OR scheduled_at <= NOW())
+       ORDER BY id DESC LIMIT 1`,
+      [conversationId]
+    );
+    let preview = '';
+    if (latest?.[0]) {
+      const t = String(latest[0].message_type || 'text').toLowerCase();
+      const raw = latest[0].message;
+      if (t === 'voice') {
+        let dur = 0;
+        try {
+          const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          dur = Number(parsed?.durationSec) || 0;
+        } catch (_) {}
+        preview = dur > 0 ? `voice_message|${dur}` : 'voice_message';
+      } else if (t === 'image') preview = '📷';
+      else if (t === 'pdf') preview = '📄';
+      else preview = String(raw || '').slice(0, 500);
+    }
+    await query(
+      'UPDATE `coversations` SET `lastMessage` = ?, `last_message_at` = NOW() WHERE id = ? LIMIT 1',
+      [preview || null, conversationId]
+    );
+
+    return res.status(200).json({ success: true, messageId });
+  } catch (error) {
+    console.error('delete-message error:', error?.message || error);
+    return res.status(500).json({ success: false, msg: 'Server error' });
+  }
+});
+
+/**
+ * Sesli mesajı isteğe bağlı yazıya döker.
+ * Text zaten varsa yeniden STT yapmaz; yoksa CDN'den indirip transcribe eder.
+ */
+router.post('/transcribe-message', middleware, async (req, res) => {
+  try {
+    const messageId = Number(req.body?.messageId);
+    const conversationId = req.body?.conversationId;
+    const userId = jwtUserId(req);
+
+    if (!userId || !conversationId || !Number.isFinite(messageId) || messageId <= 0) {
+      return res.status(400).json({ success: false, msg: 'messageId and conversationId required' });
+    }
+
+    const owned = await getQuery(
+      `SELECT m.id, m.sender, m.message, m.message_type
+       FROM \`messages\` m
+       INNER JOIN \`coversations\` c ON c.id = m.conversationId
+       WHERE m.id = ? AND m.conversationId = ? AND c.userId = ?
+       LIMIT 1`,
+      [messageId, conversationId, userId]
+    );
+    const row = owned?.[0];
+    if (!row) {
+      return res.status(404).json({ success: false, msg: 'Message not found or unauthorized' });
+    }
+    if (String(row.message_type || '').toLowerCase() !== 'voice') {
+      return res.status(400).json({ success: false, msg: 'Only voice messages can be transcribed' });
+    }
+
+    let payload = {};
+    try {
+      payload =
+        typeof row.message === 'string'
+          ? JSON.parse(row.message || '{}')
+          : row.message && typeof row.message === 'object'
+            ? row.message
+            : {};
+    } catch (_) {
+      payload = {};
+    }
+
+    const existingText = String(payload?.text || '').trim();
+    const audioUrl = String(payload?.url || '').trim();
+    if (existingText) {
+      return res.status(200).json({
+        success: true,
+        messageId,
+        text: existingText,
+        cached: true,
+      });
+    }
+    if (!audioUrl) {
+      return res.status(400).json({ success: false, msg: 'Voice URL missing' });
+    }
+
+    let fileBuffer;
+    let mime = 'audio/mpeg';
+    let fileName = `voice_${messageId}.mp3`;
+    try {
+      const audioRes = await axios.get(audioUrl, {
+        responseType: 'arraybuffer',
+        timeout: 60000,
+        maxContentLength: 30 * 1024 * 1024,
+      });
+      fileBuffer = Buffer.from(audioRes.data);
+      const ct = String(audioRes.headers?.['content-type'] || '').toLowerCase();
+      if (ct.startsWith('audio/')) mime = ct.split(';')[0].trim();
+      const urlPath = audioUrl.split('?')[0];
+      const ext = urlPath.includes('.') ? urlPath.split('.').pop() : 'mp3';
+      fileName = `voice_${messageId}.${ext || 'mp3'}`;
+    } catch (dlErr) {
+      console.error('[transcribe-message] download failed:', dlErr?.message || dlErr);
+      return res.status(502).json({ success: false, msg: 'Audio download failed' });
+    }
+
+    let text = '';
+    try {
+      text = await transcribeVoiceMessage(fileBuffer, fileName, mime);
+    } catch (sttErr) {
+      console.warn('[transcribe-message] STT failed:', sttErr?.message || sttErr);
+    }
+    const transcript = String(text || '').trim();
+    if (!transcript) {
+      return res.status(422).json({ success: false, msg: 'Transcription empty' });
+    }
+
+    const nextPayload = {
+      ...payload,
+      text: transcript,
+      url: audioUrl,
+    };
+    await query('UPDATE `messages` SET `message` = ? WHERE id = ? LIMIT 1', [
+      JSON.stringify(nextPayload),
+      messageId,
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      messageId,
+      text: transcript,
+      cached: false,
+    });
+  } catch (error) {
+    console.error('transcribe-message error:', error?.message || error);
+    return res.status(500).json({ success: false, msg: 'Server error' });
+  }
+});
 
 async function analyzePdfAndReply(conversationId, rawMessage, langRaw) {
   const lang = normalizeLang(langRaw);
@@ -626,7 +952,7 @@ router.post('/send-audio-message', middleware, upload.single('file'), async (req
 
     await query(
       'UPDATE `coversations` SET `lastMessage` = ?, `last_message_at` = NOW() WHERE id = ? LIMIT 1',
-      ['🎤', conversation]
+      ['voice_message', conversation]
     );
 
     // Typing'i hemen aç; STT arka planda sürerken client polling tutarlı kalsın.
@@ -660,7 +986,7 @@ router.post('/send-audio-message', middleware, upload.single('file'), async (req
         ]);
         await query(
           'UPDATE `coversations` SET `lastMessage` = ?, `last_message_at` = NOW() WHERE id = ? LIMIT 1',
-          [(transcript || '🎤').slice(0, 500), conversation]
+          ['voice_message', conversation]
         );
 
         try {

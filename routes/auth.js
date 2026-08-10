@@ -333,71 +333,149 @@ router.post('/login', async (req, res) => {
 
 router.post('/guest-login', async (req, res) => {
     try {
-        const guestId = guidGenerator().replace(/-/g, '').slice(0, 16);
+        const deviceId = String(req.body?.deviceId || '').trim();
+        if (!deviceId || deviceId.length < 8) {
+            return res.status(400).json({
+                success: false,
+                msg: 'deviceId is required',
+            });
+        }
+        // Aşırı uzun / saçma id'leri kısalt.
+        const normalizedDeviceId = deviceId.slice(0, 128);
         const nowIso = new Date().toISOString();
         const defaultBirthdateIso = new Date('1970-01-01T00:00:00.000Z').toISOString();
         const onboarding = req.body?.onboarding || {};
 
-        const usernameRaw = String(onboarding.username || '').trim();
-        const username = usernameRaw.length > 0
-            ? usernameRaw.slice(0, 20)
-            : `Guest${guestId.slice(0, 6)}`;
-
-        // Misafir e-postası kullanıcının verdiği isimden türetilir (benzersizlik için kısa id eklenir).
-        const emailSlug = usernameRaw
-            .toLowerCase()
-            .normalize('NFD')
-            .replace(/[\u0300-\u036f]/g, '')
-            .replace(/[^a-z0-9]+/g, '')
-            .slice(0, 20);
-        const emailLocalPart = emailSlug.length > 0
-            ? `${emailSlug}_${guestId.slice(0, 8)}`
-            : `guest_${guestId}`;
-        const email = `${emailLocalPart}@guest.local`;
-        const genderRaw = String(onboarding.gender || '').trim().toLowerCase();
-        const gender = ['male', 'female'].includes(genderRaw) ? genderRaw : 'male';
-        const birthdateForDb = onboarding.birthdate
-            ? formatDateForMySQL(onboarding.birthdate)
-            : formatDateForMySQL(defaultBirthdateIso);
-        const hobbies = serializeHobbiesForDb(onboarding.hobbies);
-
-        await query(
-            "INSERT INTO `users` (`username`, `email`, `password`, `token`, `accountCreatedDate`, `birthdate`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `gender`, `hobbies`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-            [username, email, null, null, nowIso, birthdateForDb, null, null, 1, "guest", null, null, null, gender, hobbies]
+        // Aynı cihaz = aynı misafir hesabı.
+        const existingRows = await getQuery(
+            "SELECT * FROM `users` WHERE `guest_device_id` = ? AND `credential` = 'guest' LIMIT 1",
+            [normalizedDeviceId]
         );
+        let userRow = existingRows?.[0] || null;
+        let isNewUser = false;
 
-        const createdUserRows = await getQuery("SELECT * FROM `users` WHERE email = ? LIMIT 1", [email]);
-        const createdUser = createdUserRows?.[0];
+        if (!userRow) {
+            isNewUser = true;
+            const guestId = guidGenerator().replace(/-/g, '').slice(0, 16);
+            const usernameRaw = String(onboarding.username || '').trim();
+            const username = usernameRaw.length > 0
+                ? usernameRaw.slice(0, 20)
+                : `Guest${guestId.slice(0, 6)}`;
 
-        if (!createdUser) {
+            const emailSlug = usernameRaw
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/[^a-z0-9]+/g, '')
+                .slice(0, 20);
+            const emailLocalPart = emailSlug.length > 0
+                ? `${emailSlug}_${guestId.slice(0, 8)}`
+                : `guest_${guestId}`;
+            const email = `${emailLocalPart}@guest.local`;
+            const genderRaw = String(onboarding.gender || '').trim().toLowerCase();
+            const gender = ['male', 'female'].includes(genderRaw) ? genderRaw : 'male';
+            const birthdateForDb = onboarding.birthdate
+                ? formatDateForMySQL(onboarding.birthdate)
+                : formatDateForMySQL(defaultBirthdateIso);
+            const hobbies = serializeHobbiesForDb(onboarding.hobbies);
+
+            try {
+                await query(
+                    "INSERT INTO `users` (`username`, `email`, `password`, `token`, `accountCreatedDate`, `birthdate`, `memberships`, `ownAgents`, `verificated`, `credential`, `guest_device_id`, `refreshToken`, `phoneNumber`, `lastLogins`, `gender`, `hobbies`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                    [username, email, null, null, nowIso, birthdateForDb, null, null, 1, "guest", normalizedDeviceId, null, null, null, gender, hobbies]
+                );
+            } catch (insertErr) {
+                // Race: aynı deviceId ile paralel insert → mevcut kaydı al.
+                const raceRows = await getQuery(
+                    "SELECT * FROM `users` WHERE `guest_device_id` = ? AND `credential` = 'guest' LIMIT 1",
+                    [normalizedDeviceId]
+                );
+                if (raceRows?.[0]) {
+                    userRow = raceRows[0];
+                    isNewUser = false;
+                } else {
+                    throw insertErr;
+                }
+            }
+
+            if (!userRow) {
+                const createdUserRows = await getQuery(
+                    "SELECT * FROM `users` WHERE `guest_device_id` = ? AND `credential` = 'guest' LIMIT 1",
+                    [normalizedDeviceId]
+                );
+                userRow = createdUserRows?.[0] || null;
+            }
+        }
+
+        if (!userRow) {
             return res.status(500).json({
                 msg: "Guest user could not be created",
                 success: false
             });
         }
 
-        const token = signAccessTokenForUser(createdUser);
-        const refreshToken = signRefreshTokenForUser(createdUser);
+        // Mevcut misafirde onboarding profili boşsa ve body'de geldiyse güncelle.
+        if (!isNewUser && onboarding && typeof onboarding === 'object') {
+            const usernameRaw = String(onboarding.username || '').trim();
+            const genderRaw = String(onboarding.gender || '').trim().toLowerCase();
+            const gender = ['male', 'female'].includes(genderRaw) ? genderRaw : null;
+            const hobbies = serializeHobbiesForDb(onboarding.hobbies);
+            const updates = [];
+            const params = [];
+            const looksGuestName = /^Guest[a-f0-9]{0,6}$/i.test(String(userRow.username || ''));
+            if (usernameRaw && looksGuestName) {
+                updates.push('`username` = ?');
+                params.push(usernameRaw.slice(0, 20));
+            }
+            if (gender) {
+                updates.push('`gender` = ?');
+                params.push(gender);
+            }
+            if (hobbies != null && (!userRow.hobbies || String(userRow.hobbies).trim() === '')) {
+                updates.push('`hobbies` = ?');
+                params.push(hobbies);
+            }
+            if (onboarding.birthdate) {
+                updates.push('`birthdate` = ?');
+                params.push(formatDateForMySQL(onboarding.birthdate));
+            }
+            if (updates.length) {
+                params.push(userRow.id);
+                await query(
+                    `UPDATE \`users\` SET ${updates.join(', ')} WHERE id = ? LIMIT 1`,
+                    params
+                );
+                const refreshed = await getQuery(
+                    'SELECT * FROM `users` WHERE id = ? LIMIT 1',
+                    [userRow.id]
+                );
+                userRow = refreshed?.[0] || userRow;
+            }
+        }
+
+        const token = signAccessTokenForUser(userRow);
+        const refreshToken = signRefreshTokenForUser(userRow);
         if (token && refreshToken) {
             await query('UPDATE `users` SET `token` = ?, `refreshToken` = ? WHERE id = ? LIMIT 1', [
                 token,
                 refreshToken,
-                createdUser.id
+                userRow.id
             ]);
         }
 
         return res.status(200).json({
             success: true,
-            user: mapGuestUserRow(createdUser, {
-                username,
-                email,
+            isNewUser,
+            user: mapGuestUserRow(userRow, {
                 token,
                 refreshToken,
-                accountCreatedDate: nowIso,
-                birthdate: onboarding.birthdate
-                    ? new Date(onboarding.birthdate).toISOString()
+                accountCreatedDate: userRow.accountCreatedDate
+                    ? new Date(userRow.accountCreatedDate).toISOString()
+                    : nowIso,
+                birthdate: userRow.birthdate
+                    ? new Date(userRow.birthdate).toISOString()
                     : defaultBirthdateIso,
-                gender,
+                gender: userRow.gender || 'male',
             })
         });
     } catch (error) {
