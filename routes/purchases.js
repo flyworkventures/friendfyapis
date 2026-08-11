@@ -9,7 +9,11 @@ const {
     parseMembershipsArray,
     buildDeviceFreeTrialMembership,
     replaceServerDeviceTrial,
-    DEVICE_TRIAL_PRODUCT_ID
+    buildReferralFreeTrialMembership,
+    upsertReferralTrial,
+    DEVICE_TRIAL_PRODUCT_ID,
+    REFERRAL_TRIAL_PRODUCT_ID,
+    REFERRAL_TRIAL_DAYS
 } = require('./lib/membershipsSync');
 const { assertJwtMatchesUserId, normalizeUserId } = require('./lib/assertJwtUserId');
 const {
@@ -20,6 +24,10 @@ const {
     verifyWebhookAuth,
     applyRevenueCatEvent
 } = require('./lib/revenuecatWebhook');
+const {
+    isValidReferralCode,
+    normalizeReferralCodeInput
+} = require('./lib/referralCode');
 
 /**
  * Cihaz başına otomatik 3 günlük deneme artık varsayılan olarak KAPALI.
@@ -185,6 +193,148 @@ router.post('/claim-free-trial', middleware, async (req, res) => {
             });
         }
         console.error('claim-free-trial error:', error);
+        return res.status(500).json({
+            success: false,
+            msg: 'Server error'
+        });
+    }
+});
+
+/**
+ * Referans kodu gir → 3 gün freeTrial.
+ * - Kendi kodu kullanılabilir (self claim; kod arkadaşlar için "kullanılmış" olmaz)
+ * - Başkasının henüz kullanılmamış kodu kullanılabilir (kod yanar)
+ * - Kullanıcı başına tek redeem
+ */
+router.post('/redeem-referral-code', middleware, async (req, res) => {
+    try {
+        const { userId, code: codeRaw } = req.body || {};
+        const gate = assertJwtMatchesUserId(req, userId);
+        if (!gate.ok) {
+            return res.status(gate.status).json(gate.json);
+        }
+
+        const code = normalizeReferralCodeInput(codeRaw);
+        if (!isValidReferralCode(code)) {
+            return res.status(400).json({
+                success: false,
+                code: 'INVALID_CODE',
+                msg: 'Invalid referral code format'
+            });
+        }
+
+        const already = await getQuery(
+            'SELECT id FROM `referral_code_redemptions` WHERE `redeemed_by_user_id` = ? LIMIT 1',
+            [gate.jwtUserId]
+        );
+        if (already && already.length > 0) {
+            return res.status(409).json({
+                success: false,
+                code: 'ALREADY_REDEEMED',
+                msg: 'You have already redeemed a referral code'
+            });
+        }
+
+        const owners = await getQuery(
+            'SELECT id, referral_code, memberships FROM `users` WHERE `referral_code` = ? LIMIT 1',
+            [code]
+        );
+        if (!owners || owners.length === 0) {
+            return res.status(404).json({
+                success: false,
+                code: 'CODE_NOT_FOUND',
+                msg: 'Referral code not found'
+            });
+        }
+
+        const owner = owners[0];
+        const ownerId = normalizeUserId(owner.id);
+        const isSelfClaim = ownerId === gate.jwtUserId;
+
+        if (!isSelfClaim) {
+            const used = await getQuery(
+                'SELECT id FROM `referral_code_redemptions` WHERE `code` = ? AND `is_self_claim` = 0 LIMIT 1',
+                [code]
+            );
+            if (used && used.length > 0) {
+                return res.status(409).json({
+                    success: false,
+                    code: 'CODE_ALREADY_USED',
+                    msg: 'This referral code has already been used'
+                });
+            }
+        }
+
+        const redeemers = await getQuery(
+            'SELECT id, memberships FROM `users` WHERE id = ? LIMIT 1',
+            [userId]
+        );
+        if (!redeemers || redeemers.length === 0) {
+            return res.status(404).json({
+                success: false,
+                msg: 'User not found'
+            });
+        }
+
+        const trial = buildReferralFreeTrialMembership();
+        const dbArr = parseMembershipsArray(redeemers[0].memberships);
+        const mergedArr = upsertReferralTrial(dbArr, trial);
+        const membershipsJson = JSON.stringify(mergedArr);
+
+        const insertOk = await query(
+            `INSERT INTO \`referral_code_redemptions\`
+              (\`code\`, \`code_owner_user_id\`, \`redeemed_by_user_id\`, \`is_self_claim\`)
+             VALUES (?, ?, ?, ?)`,
+            [code, ownerId, gate.jwtUserId, isSelfClaim ? 1 : 0]
+        );
+        if (!insertOk) {
+            return res.status(500).json({
+                success: false,
+                code: 'REDEEM_INSERT_FAILED',
+                msg: 'Could not record referral redemption'
+            });
+        }
+
+        const updOk = await query(
+            'UPDATE `users` SET `memberships` = ? WHERE id = ? LIMIT 1',
+            [membershipsJson, userId]
+        );
+        if (!updOk) {
+            return res.status(500).json({
+                success: false,
+                code: 'USER_UPDATE_FAILED',
+                msg: 'Could not update user memberships'
+            });
+        }
+
+        const updated = await getQuery('SELECT * FROM `users` WHERE id = ? LIMIT 1', [
+            userId
+        ]);
+
+        return res.status(200).json({
+            success: true,
+            msg: 'Referral premium granted',
+            days: REFERRAL_TRIAL_DAYS,
+            referralTrialProductId: REFERRAL_TRIAL_PRODUCT_ID,
+            isSelfClaim,
+            user: updated[0]
+        });
+    } catch (error) {
+        if (error && error.code === 'ER_NO_SUCH_TABLE') {
+            return res.status(503).json({
+                success: false,
+                code: 'MIGRATION_REQUIRED',
+                msg: 'Run scripts/apply_referral_redemptions.js'
+            });
+        }
+        if (error && error.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({
+                success: false,
+                code: 'ALREADY_REDEEMED',
+                msg: 'You have already redeemed a referral code'
+            });
+        }
+        console.error('redeem-referral-code error:', error);
         return res.status(500).json({
             success: false,
             msg: 'Server error'

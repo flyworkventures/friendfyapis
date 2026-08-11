@@ -6,9 +6,18 @@ const ALLOWED_MEMBERSHIP_TYPES = new Set(['paid', 'trial', 'freeTrial']);
 const DEVICE_TRIAL_PRODUCT_ID =
     process.env.DEVICE_TRIAL_MEMBERSHIP_PRODUCT_ID || 'friendify_device_free_trial_v1';
 
+const REFERRAL_TRIAL_PRODUCT_ID =
+    process.env.REFERRAL_TRIAL_MEMBERSHIP_PRODUCT_ID ||
+    'friendify_referral_free_trial_v1';
+
 const TRIAL_DAYS = Math.min(
     365,
     Math.max(1, Number(process.env.DEVICE_TRIAL_DAYS) || 3)
+);
+
+const REFERRAL_TRIAL_DAYS = Math.min(
+    365,
+    Math.max(1, Number(process.env.REFERRAL_TRIAL_DAYS) || 3)
 );
 
 function getDeviceTrialPepper() {
@@ -150,10 +159,38 @@ function replaceServerDeviceTrial(dbArr, newTrial) {
     return rest;
 }
 
+function buildReferralFreeTrialMembership() {
+    const start = new Date();
+    const end = new Date(start);
+    end.setDate(end.getDate() + REFERRAL_TRIAL_DAYS);
+    return {
+        startDate: start.toISOString(),
+        endDate: end.toISOString(),
+        productId: REFERRAL_TRIAL_PRODUCT_ID,
+        type: 'freeTrial',
+        isActive: true,
+        purchasedAt: start.toISOString()
+    };
+}
+
+function upsertReferralTrial(dbArr, newTrial) {
+    const rest = dbArr.filter(
+        (m) =>
+            !(
+                isFreeTrialEntry(m) &&
+                String(m.productId || '') === REFERRAL_TRIAL_PRODUCT_ID
+            )
+    );
+    rest.push(newTrial);
+    return rest;
+}
+
 module.exports = {
     ALLOWED_MEMBERSHIP_TYPES,
     DEVICE_TRIAL_PRODUCT_ID,
+    REFERRAL_TRIAL_PRODUCT_ID,
     TRIAL_DAYS,
+    REFERRAL_TRIAL_DAYS,
     normalizeDeviceFingerprint,
     hashDeviceFingerprint,
     normalizeMembership,
@@ -161,5 +198,7 @@ module.exports = {
     mergeMembershipsDbWithClient,
     buildDeviceFreeTrialMembership,
     replaceServerDeviceTrial,
+    buildReferralFreeTrialMembership,
+    upsertReferralTrial,
     isFreeTrialEntry
 };

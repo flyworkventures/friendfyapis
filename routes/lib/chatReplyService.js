@@ -369,6 +369,38 @@ function physicalProfileBlock(bot, trMode) {
   );
 }
 
+/** slug → { tr, en } — Flutter AgentTraitLabels ile uyumlu. */
+const ZODIAC_LABELS = {
+  aries: { tr: 'Koç', en: 'Aries' },
+  taurus: { tr: 'Boğa', en: 'Taurus' },
+  gemini: { tr: 'İkizler', en: 'Gemini' },
+  cancer: { tr: 'Yengeç', en: 'Cancer' },
+  leo: { tr: 'Aslan', en: 'Leo' },
+  virgo: { tr: 'Başak', en: 'Virgo' },
+  libra: { tr: 'Terazi', en: 'Libra' },
+  scorpio: { tr: 'Akrep', en: 'Scorpio' },
+  sagittarius: { tr: 'Yay', en: 'Sagittarius' },
+  capricorn: { tr: 'Oğlak', en: 'Capricorn' },
+  aquarius: { tr: 'Kova', en: 'Aquarius' },
+  pisces: { tr: 'Balık', en: 'Pisces' },
+};
+
+const RELATIONSHIP_LABELS = {
+  friend: { tr: 'Arkadaş', en: 'Friend' },
+  flirt: { tr: 'Flört', en: 'Flirt' },
+  mentor: { tr: 'Mentor', en: 'Mentor' },
+  coach: { tr: 'Koç', en: 'Coach' },
+  sibling: { tr: 'Kardeş', en: 'Sibling' },
+  coworker: { tr: 'İş Arkadaşı', en: 'Coworker' },
+};
+
+function traitLabel(slug, map, trMode) {
+  if (!slug) return '';
+  const row = map[slug];
+  if (!row) return slug;
+  return (trMode ? row.tr : row.en) || row.en || row.tr || slug;
+}
+
 function buildSystemPrompt(bot, userName, lang) {
   const trMode = isTurkishLang(lang);
   // Sistem karakterlerinde (system 1/2) ismi konuşma diline göre yerelleştir;
@@ -383,6 +415,18 @@ function buildSystemPrompt(bot, userName, lang) {
   const speakingStyle = String(bot?.speakingStyle || '').trim();
   const job = String(bot?.job_tr || bot?.job_en || '').trim();
   const example = String(bot?.exampleResponse || '').trim();
+  const zodiacSlug = String(bot?.zodiac || '').trim().toLowerCase();
+  const relationshipSlug = String(
+    bot?.relationship_type || bot?.relationshipType || ''
+  )
+    .trim()
+    .toLowerCase();
+  const zodiacLabel = traitLabel(zodiacSlug, ZODIAC_LABELS, trMode);
+  const relationshipLabel = traitLabel(
+    relationshipSlug,
+    RELATIONSHIP_LABELS,
+    trMode
+  );
 
   const topicItems = resolveInterestTopics(bot);
   const tagItems = parseBotStringList(bot?.characterTags);
@@ -401,6 +445,20 @@ function buildSystemPrompt(bot, userName, lang) {
   if (job) {
     backgroundLines.push(`Kimliğin: ${job}.`);
   }
+  if (zodiacLabel) {
+    backgroundLines.push(
+      trMode
+        ? `Burcun: ${zodiacLabel}. Bu burcun tipik özelliklerini (karakter, tepki, flört/ilişki tavrı) doğal şekilde yansıt; her mesajda "ben X burcuyum" deme.`
+        : `Zodiac sign: ${zodiacLabel}. Reflect typical traits of this sign (temperament, reactions, flirty/relational tone) naturally; do not announce your sign every message.`
+    );
+  }
+  if (relationshipLabel) {
+    backgroundLines.push(
+      trMode
+        ? `Kullanıcıyla ilişkinizin türü: ${relationshipLabel}. Mesajlarında ve aramalarda bu ilişki dinamiğine göre konuş (mesafe, samimiyet, flört seviyesi buna göre).`
+        : `Your relationship type with the user: ${relationshipLabel}. Speak in chats and calls according to this dynamic (distance, warmth, flirt level).`
+    );
+  }
 
   const exampleLine = example
     ? `Ton referansı: "${example.slice(0, 220)}"`
@@ -412,6 +470,13 @@ function buildSystemPrompt(bot, userName, lang) {
 
   const physicalBlock = physicalProfileBlock(bot, trMode);
 
+  const trTraitLines = [];
+  if (zodiacLabel) trTraitLines.push(`Burç: ${zodiacLabel}`);
+  if (relationshipLabel) trTraitLines.push(`İlişki türü: ${relationshipLabel}`);
+  const enTraitLines = [];
+  if (zodiacLabel) enTraitLines.push(`Zodiac: ${zodiacLabel}`);
+  if (relationshipLabel) enTraitLines.push(`Relationship type: ${relationshipLabel}`);
+
   if (trMode) {
     return `${languageDirective(lang)}
 ${RESPONSE_GENERATION_ADULT_POLICY}
@@ -419,6 +484,7 @@ Sen "${name}" adlı bir karaktersin. Karşındaki kişi: ${userName}.
 
 Kişilik: ${character || '(tanımlı değil)'}
 Konuşma tarzı: ${speakingStyle || '(tanımlı değil)'}
+${trTraitLines.length ? `${trTraitLines.join('\n')}\n` : ''}
 ${backgroundBlock ? `\n${backgroundBlock}\n` : ''}
 ${physicalBlock}
 
@@ -433,7 +499,7 @@ NASIL KONUŞACAKSIN (en önemli kurallar):
 - Robot gibi kendini tanıtma, liste okuma veya sürekli konuyu ilgi alanına çekme.
 - Kısa yaz: MAKSIMUM 2 kısa cümle ve MAKSIMUM ~220 karakter, samimi WhatsApp tonu.
 - Emoji, ikon, sembol (😊 ❤️ ✨ vb.) ve metin ifadeleri (:) :D ;) <3) KULLANMA; yalnızca düz yazı.
-- Kullanıcının sohbetinde söylemediği kişisel bilgilerini uydurma; ama SENİN yukarıdaki fiziksel özelliklerin ve karakter kartın gerçektir — kullanıcı sorduğunda bunlara göre cevap ver.
+- Kullanıcının sohbetinde söylemediği kişisel bilgilerini uydurma; ama SENİN yukarıdaki fiziksel özelliklerin, burcun, ilişki türün ve karakter kartın gerçektir — kullanıcı sorduğunda bunlara göre cevap ver.
 
 SINIR (sadece gerektiğinde):
 - Kullanıcı tamamen alakasız ve uzun bir uzmanlık isterse (tıbbi teşhis, hukuk, ödev çözümü vb.) karakterinde kalarak kısaca geçiştir; bunu "cevap veremem" gibi robotik bir reddetmeyle değil, gerçek bir insanın "bilmem ki, pek anlamam ondan" tavrıyla yap.
@@ -448,6 +514,7 @@ You are "${name}". You're chatting with: ${userName}.
 
 Personality: ${character || '(not defined)'}
 Speaking style: ${speakingStyle || '(not defined)'}
+${enTraitLines.length ? `${enTraitLines.join('\n')}\n` : ''}
 ${backgroundBlock ? `\nBackground context (do not force in every reply):\n${backgroundBlock}\n` : ''}
 ${physicalBlock}
 
@@ -461,7 +528,7 @@ HOW TO REPLY (most important):
 - Do NOT sound robotic; do not dump lists unless user explicitly asks.
 - Keep it short: at most 2 short sentences and around max 220 chars.
 - No emoji, symbols, or emoticons. Plain text only.
-- Do not invent facts about the USER; your own physical traits and character card above are real — answer from them when asked.
+- Do not invent facts about the USER; your own physical traits, zodiac, relationship type, and character card above are real — answer from them when asked.
 
 BOUNDARY (only when really needed):
 - If user asks for completely unrelated deep expert output (e.g. medical diagnosis, legal advice), decline softly in character without robotic refusal style.
@@ -488,6 +555,8 @@ async function fetchConversationContext(conversationId) {
               b.voiceId,
               COALESCE(o.gender, b.gender) AS gender,
               COALESCE(o.age, b.age) AS age,
+              COALESCE(o.zodiac, b.zodiac) AS zodiac,
+              COALESCE(o.relationship_type, b.relationship_type) AS relationship_type,
               u.username AS userName, u.email AS userEmail, u.memberships AS userMemberships
        FROM \`coversations\` c
        JOIN \`bots\` b ON c.botId = b.id
@@ -506,7 +575,7 @@ async function fetchConversationContext(conversationId) {
       convRows = await getQuery(
         `SELECT c.id, c.botId, c.userId, b.id AS bot_id, b.name, b.\`character\`, b.speakingStyle, b.interests,
                 b.interestsType, b.exampleResponse, b.characterTags, b.job_tr, b.job_en,
-                b.photoURL, b.system, b.voiceId, b.gender, b.age,
+                b.photoURL, b.system, b.voiceId, b.gender, b.age, b.zodiac, b.relationship_type,
                 u.username AS userName, u.email AS userEmail, u.memberships AS userMemberships
          FROM \`coversations\` c
          JOIN \`bots\` b ON c.botId = b.id
@@ -1511,7 +1580,7 @@ const PROACTIVE_IMAGE_MODEL = process.env.PROACTIVE_IMAGE_MODEL || 'gpt-image-1'
  * görsel üretir. Bunny CDN'e yükleyip public URL döndürür.
  * @param {string} referenceUrl
  * @param {string} scenePrompt
- * @param {{gender?: string, age?: number}} [persona]
+ * @param {{gender?: string, age?: number, botId?: number|string, name?: string}} [persona]
  * @returns {Promise<string|null>} CDN URL veya null (başarısızlıkta sessizce null)
  */
 async function generateProactivePhoto(referenceUrl, scenePrompt, persona = {}) {
@@ -1520,6 +1589,11 @@ async function generateProactivePhoto(referenceUrl, scenePrompt, persona = {}) {
 
   const gender = resolveBotGender(persona.gender ?? persona);
   const age = Math.max(18, Math.min(65, Number(persona.age) || 24));
+  const botIdNum = Number(persona.botId);
+  const proactiveFolder =
+    Number.isFinite(botIdNum) && botIdNum > 0
+      ? `proactive/${botIdNum}`
+      : 'proactive';
   const genderLock =
     gender === 'male'
       ? 'The subject is an adult MAN / MALE. Keep clearly masculine presentation (male face, male body, male clothing). Do NOT turn him into a woman.'
@@ -1593,8 +1667,8 @@ async function generateProactivePhoto(referenceUrl, scenePrompt, persona = {}) {
     if (!b64) return null;
     const outBuffer = Buffer.from(b64, 'base64');
 
-    // 3) Bunny CDN'e yükle.
-    const remotePath = `proactive/${Date.now()}_${Math.random()
+    // 3) Bunny CDN'e yükle — karakter klasörü: proactive/{botId}/
+    const remotePath = `${proactiveFolder}/${Date.now()}_${Math.random()
       .toString(36)
       .slice(2, 10)}.png`;
     return uploadBufferToBunny(outBuffer, remotePath, 'image/png');
@@ -1763,6 +1837,7 @@ async function generateCharacterPhotoReply(conversationId, lang, userMessageText
     gender: ctx.bot?.gender,
     age: ctx.bot?.age,
     name: ctx.bot?.name,
+    botId: ctx.bot?.id ?? ctx.bot?.botId,
   };
 
   // Önce kullanıcı isteğinden SFW sahne çıkar; caption'ı buna bağla.
@@ -1938,6 +2013,7 @@ async function generateProactiveMessage(conversationId, opts = {}) {
         gender: ctx.bot?.gender,
         age: ctx.bot?.age,
         name: ctx.bot?.name,
+        botId: ctx.bot?.id ?? ctx.bot?.botId,
       };
       const scene = await buildSafePhotoSceneFromUserRequest(
         contextHint,

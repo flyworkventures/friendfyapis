@@ -150,6 +150,20 @@ async function createAgent(body) {
     const character = body.character ?? body.extras?.character ?? '';
     const age = Number(body.age ?? body.extras?.age) || 18;
     const gender = body.gender ?? body.extras?.gender ?? 'female';
+    const zodiacRaw = body.zodiac ?? body.zodiacSign ?? body.extras?.zodiac ?? null;
+    const zodiac =
+        zodiacRaw == null || String(zodiacRaw).trim() === ''
+            ? null
+            : String(zodiacRaw).trim().toLowerCase();
+    const relRaw =
+        body.relationship_type ??
+        body.relationshipType ??
+        body.extras?.relationshipType ??
+        null;
+    const relationshipType =
+        relRaw == null || String(relRaw).trim() === ''
+            ? null
+            : String(relRaw).trim().toLowerCase();
     const voiceId = String(body.voiceId ?? body.extras?.voiceId ?? '').trim();
     const country = body.country ?? body.extras?.country ?? '';
     const speakingStyle = body.speakingStyle ?? body.extras?.speakingStyle ?? '';
@@ -174,15 +188,17 @@ async function createAgent(body) {
     if (hasOrigin && ins.system === 0) {
         insertSql = `
             INSERT INTO bots
-            (name, \`character\`, age, gender, interests, interestsType, photoURL,
+            (name, \`character\`, age, gender, zodiac, relationship_type, interests, interestsType, photoURL,
              characterTags, speakingStyle, voiceId, country, rive_avatar, creatorId, system, user_agent_origin, exampleResponse)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
         values = [
             name,
             String(character),
             age,
             String(gender),
+            zodiac,
+            relationshipType,
             interests,
             interestsType,
             photoURL,
@@ -199,15 +215,17 @@ async function createAgent(body) {
     } else {
         insertSql = `
             INSERT INTO bots
-            (name, \`character\`, age, gender, interests, interestsType, photoURL,
+            (name, \`character\`, age, gender, zodiac, relationship_type, interests, interestsType, photoURL,
              characterTags, speakingStyle, voiceId, country, rive_avatar, creatorId, system, exampleResponse)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
         values = [
             name,
             String(character),
             age,
             String(gender),
+            zodiac,
+            relationshipType,
             interests,
             interestsType,
             photoURL,

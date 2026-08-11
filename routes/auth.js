@@ -10,6 +10,7 @@ const {
     mergeMembershipsDbWithClient
 } = require('./lib/membershipsSync');
 const { assertJwtMatchesUserId } = require('./lib/assertJwtUserId');
+const { allocateUniqueReferralCode } = require('./lib/referralCode');
 
 // Token süreleri: access uzun (uygulama güncellemesine kadar sorunsuz kullanım)
 const ACCESS_TOKEN_EXPIRY = '365d';   // 1 yıl
@@ -87,7 +88,8 @@ router.post('/signup', [
 
         } else {
             let hashedPassword = await bcrypt.hash(password, 10);
-            await query("INSERT INTO `users` (`email`, `password`, `token`, `accountCreatedDate`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`) VALUES ( ?,?,?,?,?,?,?,?,?,?,?);",[ email,hashedPassword, null, null, null, null, null, credential, null, null, null])
+            const referralCode = await allocateUniqueReferralCode();
+            await query("INSERT INTO `users` (`email`, `password`, `token`, `accountCreatedDate`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `referral_code`) VALUES ( ?,?,?,?,?,?,?,?,?,?,?,?);",[ email,hashedPassword, null, null, null, null, null, credential, null, null, null, referralCode])
             
             const insertedRows = await getQuery('SELECT id, email FROM `users` WHERE email = ? LIMIT 1', [email]);
             const newUser = insertedRows[0];
@@ -160,9 +162,10 @@ router.post('/signup', [
             const hobbies = serializeHobbiesForDb(parsedUser.hobbies);
 
             const signupUsername = String(parsedUser.username || '').trim().slice(0, 20);
+            const referralCode = await allocateUniqueReferralCode();
             await query(
-                "INSERT INTO `users` (`username`, `email`, `password`, `token`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `country`, `gender` , `birthdate`, `appleUserIdentifier`, `appleToken`, `hobbies`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-                [signupUsername,userEmail, hashedPassword, null,  null, null, "1", credential, null, null, null,parsedUser.counrty || null,parsedUser.gender  , birthdate, appleUid, appleToken, hobbies]
+                "INSERT INTO `users` (`username`, `email`, `password`, `token`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `country`, `gender` , `birthdate`, `appleUserIdentifier`, `appleToken`, `hobbies`, `referral_code`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                [signupUsername,userEmail, hashedPassword, null,  null, null, "1", credential, null, null, null,parsedUser.counrty || null,parsedUser.gender  , birthdate, appleUid, appleToken, hobbies, referralCode]
             );
 
             const insertedRows = await getQuery('SELECT id, email FROM `users` WHERE email = ? LIMIT 1', [userEmail]);
@@ -380,9 +383,10 @@ router.post('/guest-login', async (req, res) => {
             const hobbies = serializeHobbiesForDb(onboarding.hobbies);
 
             try {
+                const referralCode = await allocateUniqueReferralCode();
                 await query(
-                    "INSERT INTO `users` (`username`, `email`, `password`, `token`, `accountCreatedDate`, `birthdate`, `memberships`, `ownAgents`, `verificated`, `credential`, `guest_device_id`, `refreshToken`, `phoneNumber`, `lastLogins`, `gender`, `hobbies`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-                    [username, email, null, null, nowIso, birthdateForDb, null, null, 1, "guest", normalizedDeviceId, null, null, null, gender, hobbies]
+                    "INSERT INTO `users` (`username`, `email`, `password`, `token`, `accountCreatedDate`, `birthdate`, `memberships`, `ownAgents`, `verificated`, `credential`, `guest_device_id`, `refreshToken`, `phoneNumber`, `lastLogins`, `gender`, `hobbies`, `referral_code`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                    [username, email, null, null, nowIso, birthdateForDb, null, null, 1, "guest", normalizedDeviceId, null, null, null, gender, hobbies, referralCode]
                 );
             } catch (insertErr) {
                 // Race: aynı deviceId ile paralel insert → mevcut kaydı al.
@@ -1007,6 +1011,158 @@ router.post('/delete-account', middleware, async (req, res) => {
             msg: "Server error",
             success: false,
             error: error.message
+        });
+    }
+});
+
+function toDateKey(d) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+}
+
+function parseDayKey(day) {
+    if (typeof day !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
+    const [y, m, d] = day.split('-').map(Number);
+    const dt = new Date(y, m - 1, d);
+    if (Number.isNaN(dt.getTime())) return null;
+    return toDateKey(dt);
+}
+
+function mondayOf(dayKey) {
+    const [y, m, d] = dayKey.split('-').map(Number);
+    const dt = new Date(y, m - 1, d);
+    const weekday = dt.getDay(); // 0=Sun
+    const diff = weekday === 0 ? -6 : 1 - weekday;
+    dt.setDate(dt.getDate() + diff);
+    return toDateKey(dt);
+}
+
+function addDays(dayKey, n) {
+    const [y, m, d] = dayKey.split('-').map(Number);
+    const dt = new Date(y, m - 1, d);
+    dt.setDate(dt.getDate() + n);
+    return toDateKey(dt);
+}
+
+function consecutiveEndingOn(dateSet, dayKey) {
+    let count = 0;
+    let cursor = dayKey;
+    while (dateSet.has(cursor)) {
+        count += 1;
+        cursor = addDays(cursor, -1);
+    }
+    return count;
+}
+
+function buildWeekPayload(dateSet, weekStart) {
+    const days = [];
+    for (let i = 0; i < 7; i += 1) {
+        const date = addDays(weekStart, i);
+        const opened = dateSet.has(date);
+        const consecutiveCount = opened ? consecutiveEndingOn(dateSet, date) : 0;
+        let style = 'empty';
+        if (opened) style = consecutiveCount > 3 ? 'streak' : 'normal';
+        days.push({ date, opened, consecutiveCount, style });
+    }
+    return days;
+}
+
+async function loadUserStreakDates(userId, fromDate) {
+    const rows = await getQuery(
+        'SELECT `day_date` FROM `login_streak_days` WHERE `user_id` = ? AND `day_date` >= ? ORDER BY `day_date` ASC',
+        [userId, fromDate]
+    );
+    const set = new Set();
+    for (const row of rows || []) {
+        const raw = row.day_date;
+        const key = raw instanceof Date ? toDateKey(raw) : String(raw).slice(0, 10);
+        if (key) set.add(key);
+    }
+    return set;
+}
+
+router.post('/record-login-streak', middleware, async (req, res) => {
+    try {
+        const { userId, day, days: backfillDays } = req.body || {};
+        if (!userId) {
+            return res.status(400).json({ success: false, msg: 'User ID is required' });
+        }
+        const authCheck = assertJwtMatchesUserId(req, userId);
+        if (!authCheck.ok) {
+            return res.status(authCheck.status).json(authCheck.json);
+        }
+
+        const todayKey = parseDayKey(day) || toDateKey(new Date());
+        const toInsert = new Set([todayKey]);
+        if (Array.isArray(backfillDays)) {
+            for (const d of backfillDays) {
+                const key = parseDayKey(d);
+                if (key) toInsert.add(key);
+            }
+        }
+
+        for (const d of toInsert) {
+            await query(
+                'INSERT IGNORE INTO `login_streak_days` (`user_id`, `day_date`) VALUES (?, ?)',
+                [userId, d]
+            );
+        }
+
+        const weekStart = mondayOf(todayKey);
+        // Consecutive hesabı için haftadan ~90 gün geriye bak.
+        const lookback = addDays(weekStart, -90);
+        const dateSet = await loadUserStreakDates(userId, lookback);
+        const days = buildWeekPayload(dateSet, weekStart);
+        const currentStreak = consecutiveEndingOn(dateSet, todayKey);
+
+        return res.status(200).json({
+            success: true,
+            currentStreak,
+            weekStart,
+            days,
+        });
+    } catch (error) {
+        console.error('record-login-streak error:', error);
+        return res.status(500).json({
+            success: false,
+            msg: 'Server error',
+            error: error.message,
+        });
+    }
+});
+
+router.post('/get-login-streak', middleware, async (req, res) => {
+    try {
+        const { userId, day } = req.body || {};
+        if (!userId) {
+            return res.status(400).json({ success: false, msg: 'User ID is required' });
+        }
+        const authCheck = assertJwtMatchesUserId(req, userId);
+        if (!authCheck.ok) {
+            return res.status(authCheck.status).json(authCheck.json);
+        }
+
+        const todayKey = parseDayKey(day) || toDateKey(new Date());
+        const weekStart = mondayOf(todayKey);
+        const lookback = addDays(weekStart, -90);
+        const dateSet = await loadUserStreakDates(userId, lookback);
+        const days = buildWeekPayload(dateSet, weekStart);
+        const currentStreak = consecutiveEndingOn(dateSet, todayKey);
+
+        return res.status(200).json({
+            success: true,
+            currentStreak,
+            weekStart,
+            days,
+        });
+    } catch (error) {
+        console.error('get-login-streak error:', error);
+        return res.status(500).json({
+            success: false,
+            msg: 'Server error',
+            error: error.message,
         });
     }
 });

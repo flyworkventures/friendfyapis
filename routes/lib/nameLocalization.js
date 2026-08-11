@@ -88,17 +88,41 @@ for (const key of Object.keys(NAME_MAP)) {
     NAME_MAP_LOWER[key.toLowerCase()] = NAME_MAP[key];
 }
 
+// Her dil varyantı → entry (Kayra / Cora / 蔻拉 hepsi aynı haritaya çözülür)
+const VARIANT_TO_ENTRY = {};
+for (const entry of Object.values(NAME_MAP)) {
+    for (const v of Object.values(entry)) {
+        const t = String(v || '').trim();
+        if (!t) continue;
+        VARIANT_TO_ENTRY[t] = entry;
+        VARIANT_TO_ENTRY[t.toLocaleLowerCase('tr')] = entry;
+        VARIANT_TO_ENTRY[t.toLowerCase()] = entry;
+    }
+}
+
+function findNameEntry(name) {
+    const raw = String(name || '').trim();
+    if (!raw) return null;
+    return (
+        NAME_MAP[raw] ||
+        NAME_MAP_LOWER[raw.toLocaleLowerCase('tr')] ||
+        NAME_MAP_LOWER[raw.toLowerCase()] ||
+        VARIANT_TO_ENTRY[raw] ||
+        VARIANT_TO_ENTRY[raw.toLocaleLowerCase('tr')] ||
+        VARIANT_TO_ENTRY[raw.toLowerCase()] ||
+        null
+    );
+}
+
 /**
  * Sistem karakteri ismini hedef dile göre döndürür.
  * Haritada olmayan isimler (ör. kullanıcı karakterleri) olduğu gibi döner.
+ * Zaten yerelleşmiş bir varyant gelse bile (Kayra → es:Cora) doğru dile çevrilir.
  */
 function localizeName(name, lang) {
     const raw = String(name || '').trim();
     if (!raw) return raw;
-    const entry =
-        NAME_MAP[raw] ||
-        NAME_MAP_LOWER[raw.toLocaleLowerCase('tr')] ||
-        NAME_MAP_LOWER[raw.toLowerCase()];
+    const entry = findNameEntry(raw);
     if (!entry) return raw;
     const l = normalizeLang(lang);
     return entry[l] || entry.en || raw;
@@ -118,10 +142,7 @@ function rewriteNamesInText(text, canonicalName, lang) {
     if (!rawText || !canonical) return rawText;
 
     const localized = localizeName(canonical, lang);
-    const entry =
-        NAME_MAP[canonical] ||
-        NAME_MAP_LOWER[canonical.toLocaleLowerCase('tr')] ||
-        NAME_MAP_LOWER[canonical.toLowerCase()];
+    const entry = findNameEntry(canonical);
 
     const variants = new Set();
     variants.add(canonical);

@@ -111,6 +111,8 @@ function rowToPanelAgent(botRow, userRow = null) {
             character: botRow.character ?? null,
             age: botRow.age != null ? Number(botRow.age) : null,
             gender: botRow.gender ?? null,
+            zodiac: botRow.zodiac ?? null,
+            relationshipType: botRow.relationship_type ?? null,
             country: botRow.country ?? null,
             voiceId: botRow.voiceId ?? null,
             speakingStyle: botRow.speakingStyle ?? null,
@@ -175,6 +177,27 @@ function panelAgentBodyToDb(body, { isCreate = false, existingRow = null } = {})
     if (body.gender !== undefined || body.extras?.gender !== undefined) {
         const v = body.gender ?? body.extras?.gender;
         set('gender', v == null ? 'female' : String(v));
+    }
+    if (
+        body.zodiac !== undefined ||
+        body.zodiacSign !== undefined ||
+        body.extras?.zodiac !== undefined
+    ) {
+        const v = body.zodiac ?? body.zodiacSign ?? body.extras?.zodiac;
+        const t = v == null ? null : String(v).trim().toLowerCase();
+        set('zodiac', t === '' ? null : t);
+    }
+    if (
+        body.relationship_type !== undefined ||
+        body.relationshipType !== undefined ||
+        body.extras?.relationshipType !== undefined
+    ) {
+        const v =
+            body.relationship_type ??
+            body.relationshipType ??
+            body.extras?.relationshipType;
+        const t = v == null ? null : String(v).trim().toLowerCase();
+        set('relationship_type', t === '' ? null : t);
     }
     if (body.country !== undefined || body.extras?.country !== undefined) {
         const v = body.country ?? body.extras?.country;

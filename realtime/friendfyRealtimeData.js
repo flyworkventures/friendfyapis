@@ -34,11 +34,17 @@ function mapBotRow(row) {
     system: row.system,
     voiceId: row.voiceId,
     gender: row.gender,
+    age: row.age,
+    zodiac: row.zodiac ?? null,
+    relationship_type: row.relationship_type ?? null,
     character: row.character,
     speakingStyle: row.speakingStyle,
     interests: row.interests,
     interestsType: row.interestsType,
     characterTags: row.characterTags,
+    exampleResponse: row.exampleResponse,
+    job_tr: row.job_tr,
+    job_en: row.job_en,
     job: row.job_tr || row.job_en || '',
     mainPrompt: row.system || '',
     names: buildLocalizedNames(row),
@@ -73,7 +79,7 @@ async function authenticateRealtime(req) {
     // Sesli/görüntülü arama: premium/trial gerekir.
     // Bypass:
     //  - Onboarding deneme (`demo=1` + callMode=video)
-    //  - Geçici test: ALLOW_FREE_CALLS=true (.env)
+    //  - Geçici test: ALLOW_FREE_CALLS=true (.env) — şimdilik default true
     const rawModeEarly = (url.searchParams.get('callMode') || url.searchParams.get('mode') || '')
       .toLowerCase()
       .trim();
@@ -81,8 +87,8 @@ async function authenticateRealtime(req) {
       rawModeEarly === 'video' &&
       (url.searchParams.get('demo') === '1' ||
         url.searchParams.get('demo') === 'true');
-    const allowFreeCalls =
-      String(process.env.ALLOW_FREE_CALLS || '').toLowerCase() === 'true';
+    const allowFreeCallsEnv = String(process.env.ALLOW_FREE_CALLS ?? 'true').toLowerCase();
+    const allowFreeCalls = allowFreeCallsEnv !== 'false';
     if (!isDemoVideo && !allowFreeCalls) {
       const users = await getQuery(
         'SELECT memberships FROM `users` WHERE id = ? LIMIT 1',
@@ -126,6 +132,18 @@ async function getBotById(botId, userId = null) {
         if (o.character != null && String(o.character).trim()) {
           row.character = o.character;
         }
+        if (o.speakingStyle != null && String(o.speakingStyle).trim()) {
+          row.speakingStyle = o.speakingStyle;
+        }
+        if (o.gender != null && String(o.gender).trim()) row.gender = o.gender;
+        if (o.age != null) row.age = o.age;
+        if (o.zodiac != null && String(o.zodiac).trim()) row.zodiac = o.zodiac;
+        if (o.relationship_type != null && String(o.relationship_type).trim()) {
+          row.relationship_type = o.relationship_type;
+        }
+        if (o.interests != null) row.interests = o.interests;
+        if (o.interestsType != null) row.interestsType = o.interestsType;
+        if (o.characterTags != null) row.characterTags = o.characterTags;
       }
     } catch (e) {
       if (!(e && e.code === 'ER_NO_SUCH_TABLE')) {

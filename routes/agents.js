@@ -72,6 +72,34 @@ function parseRiveAvatarFromBody(body, existingRow = null) {
     return t === '' ? null : t;
 }
 
+/** İstemci: zodiac | zodiacSign. Boş → null. Gövdede yoksa existing korunur (update). */
+function parseZodiacFromBody(body, existingRow = null) {
+    if (!body || typeof body !== 'object') {
+        return existingRow != null ? existingRow.zodiac ?? null : null;
+    }
+    const raw = body.zodiac ?? body.zodiacSign;
+    if (raw === undefined) {
+        return existingRow != null ? existingRow.zodiac ?? null : null;
+    }
+    if (raw === null) return null;
+    const t = String(raw).trim().toLowerCase();
+    return t === '' ? null : t;
+}
+
+/** İstemci: relationship_type | relationshipType. Boş → null. */
+function parseRelationshipTypeFromBody(body, existingRow = null) {
+    if (!body || typeof body !== 'object') {
+        return existingRow != null ? existingRow.relationship_type ?? null : null;
+    }
+    const raw = body.relationship_type ?? body.relationshipType;
+    if (raw === undefined) {
+        return existingRow != null ? existingRow.relationship_type ?? null : null;
+    }
+    if (raw === null) return null;
+    const t = String(raw).trim().toLowerCase();
+    return t === '' ? null : t;
+}
+
 function normalizeArrayLike(value) {
     if (value == null) return [];
     if (Array.isArray(value)) return value;
@@ -310,6 +338,12 @@ function applyCatalogOverride(agent, overrideRow) {
             ? Number(overrideRow.age)
             : base.age;
     base.gender = overrideRow.gender ?? base.gender;
+    if (overrideRow.zodiac !== undefined) {
+        base.zodiac = overrideRow.zodiac;
+    }
+    if (overrideRow.relationship_type !== undefined) {
+        base.relationship_type = overrideRow.relationship_type;
+    }
     base.interests = overrideRow.interests ?? base.interests;
     base.interestsType = overrideRow.interestsType ?? base.interestsType;
     base.photoURL = overrideRow.photoURL ?? base.photoURL;
@@ -595,12 +629,16 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
 
         const hasOriginCol = await botsHasUserAgentOriginColumn();
         const riveVal = parseRiveAvatarFromBody(req.body, null);
+        const zodiacVal = parseZodiacFromBody(req.body, null);
+        const relationshipTypeVal = parseRelationshipTypeFromBody(req.body, null);
 
         const baseValues = [
             parsedName.value,
             character || '',
             Number(age) || 18,
             gender || 'female',
+            zodiacVal,
+            relationshipTypeVal,
             normalizedInterests,
             normalizedInterestsType,
             serializePhotoUrlsFromBody({ photoURL, photoURLs }),
@@ -618,9 +656,9 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
         if (hasOriginCol) {
             insertSql = `
             INSERT INTO bots 
-            (name, \`character\`, age, gender, interests, interestsType, photoURL, 
+            (name, \`character\`, age, gender, zodiac, relationship_type, interests, interestsType, photoURL, 
              characterTags, speakingStyle, voiceId, country, rive_avatar, creatorId, system, user_agent_origin)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
             values = [...baseValues, 'friend_create'];
         } else {
@@ -629,9 +667,9 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             );
             insertSql = `
             INSERT INTO bots 
-            (name, \`character\`, age, gender, interests, interestsType, photoURL, 
+            (name, \`character\`, age, gender, zodiac, relationship_type, interests, interestsType, photoURL, 
              characterTags, speakingStyle, voiceId, country, rive_avatar, creatorId, system)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
             values = baseValues;
         }
@@ -724,6 +762,8 @@ routes.post('/update-agent', middleware, async (req, res) => {
         const normalizedCharacterTags = JSON.stringify(normalizeArrayLike(characterTags));
         const photoSerialized = serializePhotoUrlsFromBody({ photoURL, photoURLs });
         const riveResolved = parseRiveAvatarFromBody(req.body, bot);
+        const zodiacResolved = parseZodiacFromBody(req.body, bot);
+        const relationshipTypeResolved = parseRelationshipTypeFromBody(req.body, bot);
         const resolvedVoiceId =
             voiceId !== undefined && voiceId !== null
                 ? await resolveVoiceIdForStorage(voiceId)
@@ -745,12 +785,14 @@ routes.post('/update-agent', middleware, async (req, res) => {
         // Kendi custom agent (system=0): yalnızca şu anki kullanıcı (JWT) sahibi olmalı — şablon creatorId ile ilgisi yok
         if (sys === 0 && normalizeAgentUserId(bot.creatorId) === actorId) {
             const ok = await query(
-                `UPDATE \`bots\` SET name=?, \`character\`=?, age=?, gender=?, interests=?, interestsType=?, photoURL=?, characterTags=?, speakingStyle=?, voiceId=?, country=?, rive_avatar=? WHERE id=? AND creatorId=? AND system=0 LIMIT 1`,
+                `UPDATE \`bots\` SET name=?, \`character\`=?, age=?, gender=?, zodiac=?, relationship_type=?, interests=?, interestsType=?, photoURL=?, characterTags=?, speakingStyle=?, voiceId=?, country=?, rive_avatar=? WHERE id=? AND creatorId=? AND system=0 LIMIT 1`,
                 [
                     resolvedName,
                     character || '',
                     Number(age) || 18,
                     gender || 'female',
+                    zodiacResolved,
+                    relationshipTypeResolved,
                     normalizedInterests,
                     normalizedInterestsType,
                     photoSerialized,
@@ -780,19 +822,23 @@ routes.post('/update-agent', middleware, async (req, res) => {
 
         if (sys === 1 || sys === 2) {
             const riveForCatalog = parseRiveAvatarFromBody(req.body, bot);
+            const zodiacForCatalog = parseZodiacFromBody(req.body, bot);
+            const relationshipForCatalog = parseRelationshipTypeFromBody(req.body, bot);
             const hasRiveOverrideCol = await botCatalogOverridesHasRiveAvatarColumn();
             let upsertSql;
             let upsertParams;
             if (hasRiveOverrideCol) {
                 upsertSql = `
                 INSERT INTO \`bot_catalog_overrides\`
-                (user_id, bot_id, name, \`character\`, age, gender, interests, interestsType, photoURL, characterTags, speakingStyle, voiceId, country, rive_avatar)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                (user_id, bot_id, name, \`character\`, age, gender, zodiac, relationship_type, interests, interestsType, photoURL, characterTags, speakingStyle, voiceId, country, rive_avatar)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON DUPLICATE KEY UPDATE
                 name=VALUES(name),
                 \`character\`=VALUES(\`character\`),
                 age=VALUES(age),
                 gender=VALUES(gender),
+                zodiac=VALUES(zodiac),
+                relationship_type=VALUES(relationship_type),
                 interests=VALUES(interests),
                 interestsType=VALUES(interestsType),
                 photoURL=VALUES(photoURL),
@@ -809,6 +855,8 @@ routes.post('/update-agent', middleware, async (req, res) => {
                     character || '',
                     Number(age) || 18,
                     gender || 'female',
+                    zodiacForCatalog,
+                    relationshipForCatalog,
                     normalizedInterests,
                     normalizedInterestsType,
                     photoSerialized,
@@ -824,13 +872,15 @@ routes.post('/update-agent', middleware, async (req, res) => {
                 );
                 upsertSql = `
                 INSERT INTO \`bot_catalog_overrides\`
-                (user_id, bot_id, name, \`character\`, age, gender, interests, interestsType, photoURL, characterTags, speakingStyle, voiceId, country)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                (user_id, bot_id, name, \`character\`, age, gender, zodiac, relationship_type, interests, interestsType, photoURL, characterTags, speakingStyle, voiceId, country)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON DUPLICATE KEY UPDATE
                 name=VALUES(name),
                 \`character\`=VALUES(\`character\`),
                 age=VALUES(age),
                 gender=VALUES(gender),
+                zodiac=VALUES(zodiac),
+                relationship_type=VALUES(relationship_type),
                 interests=VALUES(interests),
                 interestsType=VALUES(interestsType),
                 photoURL=VALUES(photoURL),
@@ -846,6 +896,8 @@ routes.post('/update-agent', middleware, async (req, res) => {
                     character || '',
                     Number(age) || 18,
                     gender || 'female',
+                    zodiacForCatalog,
+                    relationshipForCatalog,
                     normalizedInterests,
                     normalizedInterestsType,
                     photoSerialized,
