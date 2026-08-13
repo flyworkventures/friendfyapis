@@ -1186,6 +1186,118 @@ function userWantsVoice(rawText) {
   return false;
 }
 
+function looksLikeVoiceMessageRequest(rawText) {
+  const text = String(rawText || '').toLowerCase();
+  return [
+    'sesli mesaj', 'ses mesajı', 'ses mesaji', 'voice message', 'voice note',
+    'voice memo', 'audio message', 'sprachnachricht', 'mensaje de voz',
+    'messaggio vocale', 'message vocal',
+  ].some((n) => text.includes(n));
+}
+
+/** Kullanıcı görüntülü arama istedi mi? */
+function userWantsVideoCall(rawText) {
+  const text = String(rawText || '').toLowerCase().trim();
+  if (!text || text.length > 220) return false;
+  if (looksLikeVoiceMessageRequest(text)) return false;
+
+  const cues = [
+    'görüntülü ara', 'goruntulu ara', 'görüntülü arama', 'goruntulu arama',
+    'görüntülü konuş', 'goruntulu konus', 'görüntülü konuşalım', 'goruntulu konusalim',
+    'video ara', 'video arama', 'video call', 'videocall', 'facetime', 'face time',
+    'camera call', 'call me on video', 'call me video', 'video ile ara',
+    'kamerayla ara', 'kamera ile ara',
+  ];
+  if (cues.some((c) => text.includes(c))) return true;
+  if ((text.includes('görüntülü') || text.includes('goruntulu')) &&
+      (text.includes('ara') || text.includes('arama') || text.includes('konuş') ||
+        text.includes('konus') || text.includes('call'))) {
+    return true;
+  }
+  if ((text.includes('video') || text.includes('facetime')) &&
+      (text.includes('ara') || text.includes('call') || text.includes('arama'))) {
+    return true;
+  }
+  return false;
+}
+
+/** Kullanıcı sesli arama istedi mi? (sesli mesaj değil) */
+function userWantsVoiceCall(rawText) {
+  const text = String(rawText || '').toLowerCase().trim();
+  if (!text || text.length > 220) return false;
+  if (looksLikeVoiceMessageRequest(text)) return false;
+  if (userWantsVideoCall(text)) return false;
+
+  const cues = [
+    'beni ara', 'ara beni', 'sesli ara', 'sesli arama', 'telefon et', 'telefonla ara',
+    'call me', 'phone me', 'ring me', 'give me a call', 'can you call', 'please call',
+    'voice call', 'call me voice', 'arama yap', 'hemen ara', 'şimdi ara', 'simdi ara',
+    'tekrar dene', 'tekrar ara', 'yine dene', 'yine ara', 'bir daha ara',
+    'call again', 'try again', 'try calling',
+  ];
+  if (cues.some((c) => text.includes(c))) return true;
+  if (/^(beni\s+)?ara(\s+beni)?[.!?]*$/.test(text)) return true;
+  if (/^(call me|ring me)[.!?]*$/.test(text)) return true;
+  if (/^(tekrar|yine)\s+(dener\s+misin|dener\s+misiniz|ara|arar\s+mısın|arar\s+misin)[.!?]*$/.test(text)) {
+    return true;
+  }
+  if (/(^|\s)(beni\s+)?ara(r\s+mısın|r\s+misin)?(\s|$)/.test(text)) {
+    if (text.includes('araba') || text.includes('arada') || text.includes('aralık') ||
+        text.includes('aralik')) {
+      return false;
+    }
+    return text.includes('beni') || text.includes('sesli') || text.includes('telefon') ||
+      text.includes('call') || text.includes('lütfen') || text.includes('lutfen') ||
+      text.length <= 40;
+  }
+  return false;
+}
+
+function buildCallAckDirective(lang, kind) {
+  const isVideo = kind === 'video';
+  if (isTurkishLang(lang)) {
+    return (
+      'Kullanıcı senden ' + (isVideo ? 'GÖRÜNTÜLÜ' : 'SESLİ') +
+      ' ARAMA istiyor ve uygulama onu hemen arayacak.\n' +
+      '- Tek kısa cümleyle "tamam, seni arıyorum" de (karakterine uygun).\n' +
+      '- Soru sorma, reddetme, "aramam / yapamam" deme.\n' +
+      '- Sesli mesaj veya metin sohbetine yönlendirme.'
+    );
+  }
+  return (
+    'The user asked you to ' + (isVideo ? 'VIDEO' : 'VOICE') +
+    ' CALL them and the app will ring them right away.\n' +
+    '- Reply with ONE short in-character line agreeing you are calling now.\n' +
+    '- Do not ask questions, refuse, or say you cannot call.\n' +
+    '- Do not offer a voice note or text chat instead.'
+  );
+}
+
+/** Arama izni kapalı: "arıyorum" deme, ayarlardan açmasını söyle. */
+function buildCallPermissionDirective(lang, kind) {
+  const isVideo = kind === 'video';
+  if (isTurkishLang(lang)) {
+    return (
+      'Kullanıcı senden ' + (isVideo ? 'görüntülü' : 'sesli') +
+      ' arama istedi AMA uygulamada gelen arama izni KAPALI; arama başlatılamaz.\n' +
+      '- Karakterine uygun, kısa ve samimi söyle: arayabilmen için Bildirim / Arama ayarlarından ' +
+      (isVideo ? 'görüntülü arama' : 'gelen arama') +
+      ' iznini açması gerektiğini belirt.\n' +
+      '- "Seni arıyorum / arıyorum / şu an arıyorum" DEME — yalan olur.\n' +
+      '- Teknik jargon kullanma; 1-2 kısa cümle yeter.'
+    );
+  }
+  return (
+    'The user asked for a ' + (isVideo ? 'video' : 'voice') +
+    ' call BUT incoming-call permission is OFF in the app; you cannot call.\n' +
+    '- In character, briefly tell them to enable ' +
+    (isVideo ? 'video call' : 'incoming call') +
+    ' permission in Notification / Call settings.\n' +
+    '- Do NOT say you are calling them now — that would be false.\n' +
+    '- Keep it to 1-2 short sentences, no tech jargon.'
+  );
+}
+
 /**
  * Görsel mesaj: vision + kısa karakter cevabı; ayrıca bot metin mesajı ekler.
  */
@@ -1917,9 +2029,36 @@ async function generateCharacterPhotoReply(conversationId, lang, userMessageText
 }
 
 /**
- * Kullanıcı metin mesajı için cevap üretir: foto / ses / metin.
+ * Kullanıcı metin mesajı için cevap üretir: arama onayı / foto / ses / metin.
+ * @param {{ callInviteAllowed?: boolean }} [opts]
  */
-async function generateCharacterReply(conversationId, lang, userMessageText) {
+async function generateCharacterReply(conversationId, lang, userMessageText, opts = {}) {
+  const callAllowed = opts.callInviteAllowed !== false;
+  // Arama isteği sesli mesajdan önce: "sesli ara" ≠ "sesli mesaj".
+  if (userWantsVideoCall(userMessageText)) {
+    console.log(
+      `[chatReply] user requested VIDEO call conv=${conversationId} allowed=${callAllowed}`
+    );
+    return generateCharacterTextReply(
+      conversationId,
+      lang,
+      callAllowed
+        ? buildCallAckDirective(lang, 'video')
+        : buildCallPermissionDirective(lang, 'video')
+    );
+  }
+  if (userWantsVoiceCall(userMessageText)) {
+    console.log(
+      `[chatReply] user requested VOICE call conv=${conversationId} allowed=${callAllowed}`
+    );
+    return generateCharacterTextReply(
+      conversationId,
+      lang,
+      callAllowed
+        ? buildCallAckDirective(lang, 'voice')
+        : buildCallPermissionDirective(lang, 'voice')
+    );
+  }
   if (userWantsPhoto(userMessageText)) {
     return generateCharacterPhotoReply(conversationId, lang, userMessageText);
   }
@@ -2050,6 +2189,8 @@ module.exports = {
   generateCharacterReply,
   userWantsPhoto,
   userWantsVoice,
+  userWantsVoiceCall,
+  userWantsVideoCall,
   generateProactiveMessage,
   buildSystemPrompt,
   saveBotReply,

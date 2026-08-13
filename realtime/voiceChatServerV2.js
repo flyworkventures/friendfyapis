@@ -82,8 +82,8 @@ function isAiPlaybackBlockingMic(ctx) {
 // milliseconds we trigger a gentle "are you still there?" check-in. We use
 // a longer wait for the FIRST check-in (user might be thinking) and a
 // shorter wait before the second/final one.
-const IDLE_CHECKIN_FIRST_MS = 14000;
-const IDLE_CHECKIN_FOLLOWUP_MS = 7000;
+const IDLE_CHECKIN_FIRST_MS = 8000;
+const IDLE_CHECKIN_FOLLOWUP_MS = 5000;
 // Number of check-in attempts before saying goodbye and ending the call.
 const MAX_CHECKINS = 2;
 // How long to wait AFTER the goodbye audio has fully played on the client
@@ -96,7 +96,7 @@ const HANGUP_GRACE_MS = 80;
 // response when asked to generate a check-in out of thin air).
 //
 // Flow when the user goes silent:
-//   first  → wait 5s → second → wait 5s → goodbye → hangup (no extra wait)
+//   first  → wait 8s → second → wait 5s → goodbye → hangup (no extra wait)
 const IDLE_PHRASES = {
   tr: {
     first: ['Orada mısın?', 'Seni duyamıyorum, her şey yolunda mı?', 'Devam etmek ister misin?'],
@@ -1363,6 +1363,7 @@ class VoiceChatServerV2 {
           // to OpenAI resumes immediately after the interrupt.
           ctx.turnAudioBytes = 0;
           ctx.playbackDoneReceived = true;
+          ctx.playbackDoneNotBefore = 0;
           this._cancelPlaybackDoneFallback(ctx);
         }
         this._sendJson(ctx.ws, { type: 'barge_in' });
@@ -1372,6 +1373,11 @@ class VoiceChatServerV2 {
         });
         this._cancelIdleTimer(ctx);
         ctx.checkinCount = 0;
+        // False barge-in / mid-sentence cut: ensure silence still gets
+        // "Orada mısın?" — real speech cancels this via transcript path.
+        if (!ctx.isAISpeaking && !ctx.endAfterResponse) {
+          this._scheduleIdleCheckin(ctx);
+        }
         break;
       default:
         break;
@@ -1383,11 +1389,14 @@ class VoiceChatServerV2 {
     if (ctx.closed) return;
     // Client sometimes reports playback_done while native audio is still
     // playing (queue empty but speaker active). If the server-side byte
-    // timer is still pending, ignore the early client signal for idle.
+    // timer is still pending, ignore the early client signal for idle —
+    // BUT only when the fallback timer can still deliver a later signal.
+    // After barge-in abort the fallback is gone; ignoring then starves idle.
     if (
       source === 'client' &&
       ctx.playbackDoneNotBefore &&
-      Date.now() < ctx.playbackDoneNotBefore
+      Date.now() < ctx.playbackDoneNotBefore &&
+      ctx.playbackDoneFallback
     ) {
       return;
     }
@@ -1411,8 +1420,6 @@ class VoiceChatServerV2 {
         payload: { state: 'listening', reason: 'ai_response_complete' },
       });
     }
-
-    if (ctx.isAISpeaking) return;
 
     ctx.lastPlaybackDoneAt = Date.now();
     if (ctx.endAfterResponse) {
@@ -2230,6 +2237,9 @@ class VoiceChatServerV2 {
     // immediately after abort (barge-in audio pre-roll must reach OpenAI).
     ctx.turnAudioBytes = 0;
     ctx.playbackDoneReceived = true;
+    // Clear notBefore so a follow-up client playback_done isn't ignored
+    // after we cancelled the fallback timer (idle would never start).
+    ctx.playbackDoneNotBefore = 0;
     // İptal edilen response için bekleyen ai_response_complete sinyalini
     // de düşür — yoksa sonraki playback_done eski utterance için fırlatır.
     ctx.pendingAiResponseCompleteUtteranceId = null;
@@ -2378,6 +2388,11 @@ class VoiceChatServerV2 {
 
   _triggerIdleCheckin(ctx) {
     if (ctx.closed || ctx.isAISpeaking) return;
+    // Kullanıcı şu an konuşuyorsa (VAD açık) üstüne binme.
+    if (ctx.speechStartedAt > 0) {
+      this._scheduleIdleCheckin(ctx);
+      return;
+    }
     if (!ctx.ws || ctx.ws.readyState !== WebSocket.OPEN) return;
     ctx.checkinCount += 1;
     const lang = ctx.language || ctx.user?.nativeLang || 'tr';

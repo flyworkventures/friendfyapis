@@ -480,7 +480,13 @@ router.post('/send-message',middleware,async (req,res)=>{
         "UPDATE `coversations` SET `current_chat_state` = 'bot_typing' WHERE id = ? LIMIT 1",
         [conversationId]
       ).catch(() => {});
-      generateCharacterReply(conversationId, lang, message)
+      const callInviteAllowed = req.body?.callInviteAllowed;
+      generateCharacterReply(conversationId, lang, message, {
+        callInviteAllowed:
+          callInviteAllowed === false || callInviteAllowed === 'false'
+            ? false
+            : true,
+      })
         .catch((err) => {
           console.error('[send-message] character reply error:', err?.message || err);
         })

@@ -79,7 +79,7 @@ async function authenticateRealtime(req) {
     // Sesli/görüntülü arama: premium/trial gerekir.
     // Bypass:
     //  - Onboarding deneme (`demo=1` + callMode=video)
-    //  - Geçici test: ALLOW_FREE_CALLS=true (.env) — şimdilik default true
+    //  - Test: ALLOW_FREE_CALLS=true (.env) — default kapalı
     const rawModeEarly = (url.searchParams.get('callMode') || url.searchParams.get('mode') || '')
       .toLowerCase()
       .trim();
@@ -87,8 +87,8 @@ async function authenticateRealtime(req) {
       rawModeEarly === 'video' &&
       (url.searchParams.get('demo') === '1' ||
         url.searchParams.get('demo') === 'true');
-    const allowFreeCallsEnv = String(process.env.ALLOW_FREE_CALLS ?? 'true').toLowerCase();
-    const allowFreeCalls = allowFreeCallsEnv !== 'false';
+    const allowFreeCallsEnv = String(process.env.ALLOW_FREE_CALLS ?? 'false').toLowerCase();
+    const allowFreeCalls = allowFreeCallsEnv === 'true';
     if (!isDemoVideo && !allowFreeCalls) {
       const users = await getQuery(
         'SELECT memberships FROM `users` WHERE id = ? LIMIT 1',
