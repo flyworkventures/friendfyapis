@@ -124,31 +124,83 @@ router.post('/create-chat',middleware,async (req,res)=>{
 
 router.post('/get-messages',middleware, async(req,res)=>{
     const {conversationId} = req.body;
-   // Proaktif (zamanlanmış) mesajlar, scheduled_at zamanı gelene kadar gizlidir.
-   // reply_to JOIN: alıntı önizlemesi için.
-   let messages;
-   try {
-     messages = await getQuery(
-       `SELECT m.*,
-          rm.sender AS reply_sender,
-          rm.message AS reply_message,
-          rm.message_type AS reply_message_type
-        FROM \`messages\` m
-        LEFT JOIN \`messages\` rm ON m.reply_to_message_id = rm.id
-        WHERE m.conversationId = ?
-          AND (m.\`scheduled_at\` IS NULL OR m.\`scheduled_at\` <= NOW())
-        ORDER BY m.id ASC`,
-       [conversationId]
-     );
-   } catch (e) {
-     // Kolon henüz yoksa eski sorguya düş.
-     console.warn('[get-messages] reply join failed, fallback:', e?.message || e);
-     messages = await getQuery(
-       "SELECT * FROM `messages` WHERE conversationId = ? AND (`scheduled_at` IS NULL OR `scheduled_at` <= NOW())",
-       [conversationId]
-     );
-   }
-   return res.status(200).json(messages)
+    // Cursor sayfalama (opsiyonel, geriye dönük uyumlu): `limit` gönderilmezse
+    // eski davranış korunur (tüm geçmiş tek seferde döner, eski client sürümleri
+    // için). `limit` gönderilirse yalnızca son N mesaj (veya `beforeId`'den
+    // önceki N mesaj) döner ve `{ messages, hasMore }` şeklinde cevap verilir.
+    const limitRaw = Number(req.body?.limit);
+    const limit = Number.isInteger(limitRaw) && limitRaw > 0 && limitRaw <= 200 ? limitRaw : null;
+    const beforeIdRaw = Number(req.body?.beforeId);
+    const beforeId = Number.isInteger(beforeIdRaw) ? beforeIdRaw : null;
+
+    // Proaktif (zamanlanmış) mesajlar, scheduled_at zamanı gelene kadar gizlidir.
+    // reply_to JOIN: alıntı önizlemesi için.
+    if (limit) {
+      const cursorClauseJoin = beforeId ? 'AND m.id < ?' : '';
+      const cursorClausePlain = beforeId ? 'AND id < ?' : '';
+      const params = beforeId
+        ? [conversationId, beforeId, limit + 1]
+        : [conversationId, limit + 1];
+      let rows;
+      try {
+        rows = await getQuery(
+          `SELECT * FROM (
+             SELECT m.*,
+                rm.sender AS reply_sender,
+                rm.message AS reply_message,
+                rm.message_type AS reply_message_type
+              FROM \`messages\` m
+              LEFT JOIN \`messages\` rm ON m.reply_to_message_id = rm.id
+              WHERE m.conversationId = ? ${cursorClauseJoin}
+                AND (m.\`scheduled_at\` IS NULL OR m.\`scheduled_at\` <= NOW())
+              ORDER BY m.id DESC
+              LIMIT ?
+           ) sub ORDER BY sub.id ASC`,
+          params
+        );
+      } catch (e) {
+        console.warn('[get-messages] reply join failed, fallback:', e?.message || e);
+        rows = await getQuery(
+          `SELECT * FROM (
+             SELECT * FROM \`messages\`
+             WHERE conversationId = ? ${cursorClausePlain}
+               AND (\`scheduled_at\` IS NULL OR \`scheduled_at\` <= NOW())
+             ORDER BY id DESC
+             LIMIT ?
+           ) sub ORDER BY sub.id ASC`,
+          params
+        );
+      }
+      // limit+1 satır çekildi; fazladan gelen (en eski) satır sadece "daha
+      // eskisi var mı" sinyali — asıl sayfaya dahil edilmiyor.
+      const hasMore = rows.length > limit;
+      const messages = hasMore ? rows.slice(1) : rows;
+      return res.status(200).json({ messages, hasMore });
+    }
+
+    let messages;
+    try {
+      messages = await getQuery(
+        `SELECT m.*,
+           rm.sender AS reply_sender,
+           rm.message AS reply_message,
+           rm.message_type AS reply_message_type
+         FROM \`messages\` m
+         LEFT JOIN \`messages\` rm ON m.reply_to_message_id = rm.id
+         WHERE m.conversationId = ?
+           AND (m.\`scheduled_at\` IS NULL OR m.\`scheduled_at\` <= NOW())
+         ORDER BY m.id ASC`,
+        [conversationId]
+      );
+    } catch (e) {
+      // Kolon henüz yoksa eski sorguya düş.
+      console.warn('[get-messages] reply join failed, fallback:', e?.message || e);
+      messages = await getQuery(
+        "SELECT * FROM `messages` WHERE conversationId = ? AND (`scheduled_at` IS NULL OR `scheduled_at` <= NOW())",
+        [conversationId]
+      );
+    }
+    return res.status(200).json(messages)
 })
 
 router.post('/listen-messages',middleware, async(req,res)=>{
