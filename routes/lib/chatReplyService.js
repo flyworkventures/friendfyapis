@@ -390,7 +390,6 @@ const RELATIONSHIP_LABELS = {
   flirt: { tr: 'Flört', en: 'Flirt' },
   mentor: { tr: 'Mentor', en: 'Mentor' },
   coach: { tr: 'Koç', en: 'Coach' },
-  sibling: { tr: 'Kardeş', en: 'Sibling' },
   coworker: { tr: 'İş Arkadaşı', en: 'Coworker' },
 };
 
@@ -421,9 +420,14 @@ function buildSystemPrompt(bot, userName, lang) {
   )
     .trim()
     .toLowerCase();
+  // "kardeş/sibling" ilişki dinamiği istenmiyor — prompt'a dahil etme.
+  const normalizedRelationshipSlug =
+    relationshipSlug === 'sibling' || relationshipSlug === 'brother' || relationshipSlug === 'sister'
+      ? ''
+      : relationshipSlug;
   const zodiacLabel = traitLabel(zodiacSlug, ZODIAC_LABELS, trMode);
   const relationshipLabel = traitLabel(
-    relationshipSlug,
+    normalizedRelationshipSlug,
     RELATIONSHIP_LABELS,
     trMode
   );
@@ -600,6 +604,7 @@ async function fetchConversationContext(conversationId) {
        FROM \`messages\` m
        LEFT JOIN \`messages\` rm ON m.reply_to_message_id = rm.id
        WHERE m.conversationId = ?
+         AND (m.\`scheduled_at\` IS NULL OR m.\`scheduled_at\` <= NOW())
        ORDER BY m.id DESC
        LIMIT ?`,
       [conversationId, CHAT_HISTORY_LIMIT]
@@ -2093,9 +2098,9 @@ async function generateProactiveMessage(conversationId, opts = {}) {
     role: 'system',
     content: isTurkishLang(lang)
       ? 'Kullanici bir suredir yazmadi. Simdi SEN ona ilk mesaji atiyorsun. ' +
-        'Onceden konustugunuz bir seye dogal bir gonderme yap ve kisa tut (en fazla 2 cumle).'
+        'Kullaniciin en son mesajinin temasini ve tonunu yakala; dogal bir devam yap ve kisa tut (en fazla 2 cumle).'
       : 'The user has been silent for a while. You are sending the first message now. ' +
-        'Naturally reference prior context and keep it short (max 2 sentences).'
+        'Pick up the topic and tone from the user’s most recent message and keep it short (max 2 sentences).'
   };
 
   const messages = [
