@@ -88,7 +88,7 @@ async function countTodayUserMessages(userId, kind) {
      WHERE c.userId = ?
        AND m.sender = 'user'
        AND m.message_type IN (${placeholders})
-       AND DATE(m.created_at) = CURDATE()`,
+       AND m.created_at >= CURDATE() AND m.created_at < CURDATE() + INTERVAL 1 DAY`,
     [userId, ...types]
   );
   return Number(rows?.[0]?.cnt || 0);

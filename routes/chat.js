@@ -178,33 +178,58 @@ router.post('/get-messages',middleware, async(req,res)=>{
       return res.status(200).json({ messages, hasMore });
     }
 
+    // Savunma amaçlı üst sınır: limit parametresi hiç gönderilmezse bile
+    // (eski client sürümü/gelecekte unutulmuş bir çağrı) tüm geçmişi tek
+    // seferde dönmek yerine en yeni 1000 mesajla sınırlandırıyoruz.
+    const LEGACY_MESSAGES_CAP = 1000;
     let messages;
     try {
-      messages = await getQuery(
-        `SELECT m.*,
-           rm.sender AS reply_sender,
-           rm.message AS reply_message,
-           rm.message_type AS reply_message_type
-         FROM \`messages\` m
-         LEFT JOIN \`messages\` rm ON m.reply_to_message_id = rm.id
-         WHERE m.conversationId = ?
-           AND (m.\`scheduled_at\` IS NULL OR m.\`scheduled_at\` <= NOW())
-         ORDER BY m.id ASC`,
-        [conversationId]
+      const rows = await getQuery(
+        `SELECT * FROM (
+           SELECT m.*,
+              rm.sender AS reply_sender,
+              rm.message AS reply_message,
+              rm.message_type AS reply_message_type
+            FROM \`messages\` m
+            LEFT JOIN \`messages\` rm ON m.reply_to_message_id = rm.id
+            WHERE m.conversationId = ?
+              AND (m.\`scheduled_at\` IS NULL OR m.\`scheduled_at\` <= NOW())
+            ORDER BY m.id DESC
+            LIMIT ?
+         ) sub ORDER BY sub.id ASC`,
+        [conversationId, LEGACY_MESSAGES_CAP]
       );
+      messages = rows;
     } catch (e) {
       // Kolon henüz yoksa eski sorguya düş.
       console.warn('[get-messages] reply join failed, fallback:', e?.message || e);
-      messages = await getQuery(
-        "SELECT * FROM `messages` WHERE conversationId = ? AND (`scheduled_at` IS NULL OR `scheduled_at` <= NOW())",
-        [conversationId]
+      const rows = await getQuery(
+        `SELECT * FROM (
+           SELECT * FROM \`messages\`
+           WHERE conversationId = ? AND (\`scheduled_at\` IS NULL OR \`scheduled_at\` <= NOW())
+           ORDER BY id DESC
+           LIMIT ?
+         ) sub ORDER BY sub.id ASC`,
+        [conversationId, LEGACY_MESSAGES_CAP]
       );
+      messages = rows;
     }
     return res.status(200).json(messages)
 })
 
 router.post('/listen-messages',middleware, async(req,res)=>{
     const {conversationId} = req.body;
+    // Opsiyonel delta modu: `afterMessageId` gönderilirse sadece o id'den
+    // sonraki (yeni) mesajlar döner — her poll'da tüm geçmişi dönmek yerine.
+    // Gönderilmezse eski davranış korunur (eski client sürümleri için).
+    const afterIdRaw = Number(req.body?.afterMessageId);
+    const afterId = Number.isInteger(afterIdRaw) ? afterIdRaw : null;
+    const cursorClauseJoin = afterId !== null ? 'AND m.id > ?' : '';
+    const cursorClausePlain = afterId !== null ? 'AND id > ?' : '';
+    const queryParams = afterId !== null ? [conversationId, afterId] : [conversationId];
+    // afterMessageId hiç gönderilmezse (eski client) savunma amaçlı üst sınır.
+    const LEGACY_LISTEN_CAP = 1000;
+
    let convData = await getQuery("SELECT `current_chat_state` FROM `coversations` WHERE id = ?",[conversationId]);
    let messages;
    try {
@@ -215,14 +240,16 @@ router.post('/listen-messages',middleware, async(req,res)=>{
           rm.message_type AS reply_message_type
         FROM \`messages\` m
         LEFT JOIN \`messages\` rm ON m.reply_to_message_id = rm.id
-        WHERE m.conversationId = ?
-        ORDER BY m.created_at DESC`,
-       [conversationId]
+        WHERE m.conversationId = ? ${cursorClauseJoin}
+        ORDER BY m.created_at DESC
+        ${afterId === null ? 'LIMIT ' + LEGACY_LISTEN_CAP : ''}`,
+       queryParams
      );
    } catch (e) {
      messages = await getQuery(
-       "SELECT * FROM `messages` WHERE conversationId = ? ORDER BY created_at DESC",
-       [conversationId]
+       `SELECT * FROM \`messages\` WHERE conversationId = ? ${cursorClausePlain} ORDER BY created_at DESC
+        ${afterId === null ? 'LIMIT ' + LEGACY_LISTEN_CAP : ''}`,
+       queryParams
      );
    }
 
@@ -293,15 +320,26 @@ router.post('/get-conversations', middleware, async (req, res) => {
       return res.status(200).json([]);
     }
 
-    // 2️⃣ Her conversation için bot verisini al
-    const responseData = [];
-    for (const conv of convData) {
-      const botData = await getQuery("SELECT * FROM `bots` WHERE id = ?", [conv.botId]);
-      responseData.push({
-        conversationData: conv,
-        botData: localizeBotName(botData[0] || null, lang)
-      });
+    // 2️⃣ Her conversation için bot verisini tek toplu sorguyla al (N+1 yerine)
+    const botIds = [...new Set(convData.map((c) => c.botId))];
+    let botsById = new Map();
+    if (botIds.length > 0) {
+      const placeholders = botIds.map(() => '?').join(', ');
+      const botsRows = await getQuery(
+        `SELECT * FROM \`bots\` WHERE id IN (${placeholders})`,
+        botIds
+      );
+      botsById = new Map(botsRows.map((b) => [b.id, b]));
     }
+    const responseData = convData.map((conv) => {
+      const botRow = botsById.get(conv.botId);
+      return {
+        conversationData: conv,
+        // localizeBotName satır içinde mutasyon yapıyor — aynı bot'a sahip
+        // birden fazla konuşma varsa paylaşılan objeyi bozmamak için kopyala.
+        botData: botRow ? localizeBotName({ ...botRow }, lang) : null,
+      };
+    });
 
     // 3️⃣ Sonuçları döndür
     res.status(200).json(responseData);
@@ -339,25 +377,37 @@ router.post('/search-conversations', middleware, async (req, res) => {
       return res.status(200).json([]);
     }
 
-    // 2️⃣ Her conversation için bot verisini al ve arama kriterine göre filtrele
+    // 2️⃣ Her conversation için bot verisini tek toplu sorguyla al (N+1 yerine),
+    // sonra arama kriterine göre filtrele.
+    const botIds = [...new Set(convData.map((c) => c.botId))];
+    let botsById = new Map();
+    if (botIds.length > 0) {
+      const placeholders = botIds.map(() => '?').join(', ');
+      const botsRows = await getQuery(
+        `SELECT * FROM \`bots\` WHERE id IN (${placeholders})`,
+        botIds
+      );
+      botsById = new Map(botsRows.map((b) => [b.id, b]));
+    }
+
     const responseData = [];
+    const needle = searchQuery.toLowerCase();
     for (const conv of convData) {
-      const botData = await getQuery("SELECT * FROM `bots` WHERE id = ?", [conv.botId]);
-      
-      if (botData && botData[0]) {
-        const bot = localizeBotName(botData[0], lang);
-        const lastMessage = conv.lastMessage || '';
-        
-        // Bot adı (yerelleştirilmiş) veya son mesajda arama yap (case-insensitive)
-        if (
-          bot.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-          lastMessage.toLowerCase().includes(searchQuery.toLowerCase())
-        ) {
-          responseData.push({
-            conversationData: conv,
-            botData: bot
-          });
-        }
+      const botRow = botsById.get(conv.botId);
+      if (!botRow) continue;
+      // localizeBotName satır içinde mutasyon yapıyor — paylaşılan objeyi bozmamak için kopyala.
+      const bot = localizeBotName({ ...botRow }, lang);
+      const lastMessage = conv.lastMessage || '';
+
+      // Bot adı (yerelleştirilmiş) veya son mesajda arama yap (case-insensitive)
+      if (
+        bot.name.toLowerCase().includes(needle) ||
+        lastMessage.toLowerCase().includes(needle)
+      ) {
+        responseData.push({
+          conversationData: conv,
+          botData: bot
+        });
       }
     }
 
@@ -1284,39 +1334,29 @@ router.post('/send-image-message', middleware, upload.fields([
       });
     }
 
-    let aiExplanation = '';
-    try {
-      aiExplanation =
-        (await generateCharacterImageReply(
-          conversationId,
-          cdnFileUrl,
-          textMessage,
-          insertedId,
-          lang
-        )) || '';
-    } catch (aiError) {
-      console.error('send-image-message ai reply error:', {
-        requestId,
-        message: aiError?.message || 'unknown'
+    // send-message (metin) ile aynı desen: vision-LLM cevabı 5-35sn sürebiliyor
+    // — bunu HTTP yanıtını beklettirerek değil, arka planda üretip client'ın
+    // zaten 700ms'de bir çektiği listen-messages ile teslim ederek yapıyoruz.
+    // generateCharacterImageReply kendi içinde hem ayrı bir bot mesajı
+    // (saveBotReply) ekliyor hem de bu görsel mesajının aiExplanation
+    // alanını güncelliyor.
+    query(
+      "UPDATE `coversations` SET `current_chat_state` = 'bot_typing' WHERE id = ? LIMIT 1",
+      [conversationId]
+    ).catch(() => {});
+    generateCharacterImageReply(conversationId, cdnFileUrl, textMessage, insertedId, lang)
+      .catch((aiError) => {
+        console.error('send-image-message ai reply error:', {
+          requestId,
+          message: aiError?.message || 'unknown'
+        });
+      })
+      .finally(() => {
+        query(
+          "UPDATE `coversations` SET `current_chat_state` = 'normal' WHERE id = ? LIMIT 1",
+          [conversationId]
+        ).catch(() => {});
       });
-      return res.status(502).json({
-        success: false,
-        error: 'AI_REPLY_FAILED',
-        message: 'Image uploaded but character reply failed',
-        requestId
-      });
-    }
-
-    const enrichedPayload = JSON.stringify({
-      imageURL: cdnFileUrl,
-      message: textMessage,
-      aiExplanation,
-      date: new Date().toISOString()
-    });
-    await getQuery(
-      'UPDATE `messages` SET `message` = ? WHERE `id` = ? LIMIT 1',
-      [enrichedPayload, insertedId]
-    );
 
     const insertedRows = await getQuery(
       'SELECT id, conversationId, sender, message, message_type, created_at FROM `messages` WHERE id = ? LIMIT 1',

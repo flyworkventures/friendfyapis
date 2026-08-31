@@ -243,15 +243,13 @@ async function loadCandidateBots(targetGender) {
     );
   }
 
-  // Feed hızı için: mesaj tablosu / CDN taraması YOK — yalnızca bot galerisi.
-  // Proactive URL varsa onu tercih et; yoksa karakter fotoğrafları.
+  // Feed hızı için: yalnızca proactive görseller — profil foto story olmasın.
   const bots = [];
   for (const b of rows || []) {
     const all = toPhotoUrlArray(b.photoURL);
     const proactive = onlyProactive(all);
-    const photoURLs = proactive.length ? proactive : all;
-    if (!photoURLs.length) continue;
-    bots.push({ ...b, photoURLs });
+    if (!proactive.length) continue;
+    bots.push({ ...b, photoURLs: proactive });
   }
   return bots;
 }
@@ -389,7 +387,13 @@ async function ensureSeeded(userId, userGender) {
       if (added >= toAdd) break;
       const existing = activeCountByBot.get(Number(bot.id)) || 0;
       if (existing >= MAX_STORIES_PER_CHARACTER) continue;
-      const candidates = shuffle(bot.photoURLs).filter((u) => !usedMedia.has(u));
+      const urls = await loadBotProactiveMediaUrls(bot.id, bot.photoURL, {
+        allowCdnList: false,
+      });
+      const proactiveUrls = urls.filter((u) => /\/proactive\//i.test(u));
+      const candidates = shuffle(
+        proactiveUrls.filter((u) => !usedMedia.has(u)),
+      );
       if (!candidates.length) continue;
       const mediaUrl = candidates[0];
       const id = await insertFeedStory({
@@ -524,25 +528,26 @@ router.post('/feed', middleware, async (req, res) => {
       return res.status(404).json({ success: false, msg: 'User not found' });
     }
 
-    // 1) Hızlı yol: mevcut feed'i hemen oku
+    // 1) Mevcut feed + gerekirse seed
     await enforceMaxStoriesPerCharacter(userId);
     let feed = await buildFeed(userId, lang);
     const charCount = (feed.characters || []).length;
 
-    // 2) Hiç / yetersiz story varsa kısa seed (bloklar); aksi halde arka planda
     if (charCount < FIRST_SEED_MIN) {
       await ensureSeeded(userId, user.gender);
       feed = await buildFeed(userId, lang);
-    } else {
-      setImmediate(() => {
-        ensureSeeded(userId, user.gender).catch((e) =>
-          console.warn('[stories] bg seed:', e?.message || e)
-        );
-        repairStoriesWithProactive(userId).catch((e) =>
-          console.warn('[stories] bg repair:', e?.message || e)
-        );
-      });
     }
+
+    // 2) Profil foto URL'lerini proactive story medyasına çevir (feed dönmeden önce)
+    await repairStoriesWithProactive(userId);
+    feed = await buildFeed(userId, lang);
+
+    // 3) Günlük seed / repair arka planda
+    setImmediate(() => {
+      ensureSeeded(userId, user.gender)
+        .then(() => repairStoriesWithProactive(userId))
+        .catch((e) => console.warn('[stories] bg seed/repair:', e?.message || e));
+    });
 
     return res.status(200).json({ success: true, feed });
   } catch (error) {

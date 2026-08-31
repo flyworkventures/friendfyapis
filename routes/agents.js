@@ -3,6 +3,27 @@ const middleware = require('../middleware/checkAuth')
 const { getQuery , query, insertQuery} = require('../db')
 const { normalizeLang, localizeAgents, localizeAgentRow } = require('./lib/agentLocalization');
 
+// Sistem karakter kataloğu (bots system IN (1,2)) hemen hemen hiç değişmeyen
+// referans veri ama her app açılışında sorgulanıyordu. 5dk TTL ile
+// veritabanı round-trip'ini atlıyoruz; kullanıcıya özel override/lokalizasyon
+// katmanları cache'lenen satırların taze kopyaları üzerinde çalışmaya devam
+// ediyor (attachPhotoUrls/applyCatalogOverride her ikisi de spread ile yeni
+// obje döndürüyor, cache'deki orijinal satırları mutasyona uğratmıyorlar).
+const SYSTEM_AGENTS_CACHE_TTL_MS = 5 * 60 * 1000;
+let systemAgentsCache = null;
+let systemAgentsCachedAt = 0;
+
+async function loadSystemAgentsBase() {
+    const isFresh =
+        systemAgentsCache &&
+        Date.now() - systemAgentsCachedAt < SYSTEM_AGENTS_CACHE_TTL_MS;
+    if (isFresh) return systemAgentsCache;
+    const agents = await getQuery('SELECT * FROM `bots` WHERE system IN (1, 2)', []);
+    systemAgentsCache = agents;
+    systemAgentsCachedAt = Date.now();
+    return systemAgentsCache;
+}
+
 function toPhotoUrlArray(rawValue) {
     if (Array.isArray(rawValue)) {
         return rawValue.filter((v) => typeof v === 'string' && v.trim() !== '');
@@ -486,7 +507,7 @@ routes.post('/get-user-agents',middleware,async (req,res)=>{
 routes.post('/get-system-agents', middleware, async (req, res) => {
     try {
         const lang = normalizeLang(req.body?.lang);
-        const agents = await getQuery('SELECT * FROM `bots` WHERE system IN (1, 2)', []);
+        const agents = await loadSystemAgentsBase();
         const userId = await resolveJwtSubjectUserId(req);
         const overridesMap = await loadCatalogOverridesMap(userId);
         const merged = agents.map((a) => {

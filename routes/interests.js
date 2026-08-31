@@ -3,6 +3,26 @@ const { getQuery } = require('../db');
 
 const SUPPORTED_LANGS = ['tr', 'en', 'de', 'fr', 'pt', 'it', 'zh', 'ja', 'ru', 'hi', 'ko'];
 
+// Tamamen statik katalog verisi — her iki endpoint de aynı satırları
+// paylaşıyor. 30dk TTL ile her çağrıda tekrarlanan sorguyu atlıyoruz.
+const INTERESTS_CACHE_TTL_MS = 30 * 60 * 1000;
+let interestsRowsCache = null;
+let interestsRowsCachedAt = 0;
+
+async function loadInterestRows() {
+  const isFresh =
+    interestsRowsCache &&
+    Date.now() - interestsRowsCachedAt < INTERESTS_CACHE_TTL_MS;
+  if (isFresh) return interestsRowsCache;
+  const rows = await getQuery(
+    'SELECT id, slug, emoji, sort_order, interest_tr, interest_en, interest_de, interest_fr, interest_pt, interest_it, interest_zh, interest_ja, interest_ru, interest_hi, interest_ko FROM `interests` ORDER BY sort_order ASC, id ASC',
+    []
+  );
+  interestsRowsCache = rows;
+  interestsRowsCachedAt = Date.now();
+  return interestsRowsCache;
+}
+
 function pickLabel(row, lang) {
   const key = `interest_${lang}`;
   if (row[key]) return row[key];
@@ -12,10 +32,7 @@ function pickLabel(row, lang) {
 // Tüm ilgi alanları (tüm diller)
 router.post('/list', async (req, res) => {
   try {
-    const rows = await getQuery(
-      'SELECT id, slug, emoji, sort_order, interest_tr, interest_en, interest_de, interest_fr, interest_pt, interest_it, interest_zh, interest_ja, interest_ru, interest_hi, interest_ko FROM `interests` ORDER BY sort_order ASC, id ASC',
-      []
-    );
+    const rows = await loadInterestRows();
     return res.status(200).json({
       success: true,
       count: rows.length,
@@ -41,10 +58,7 @@ async function sendLocalizedList(req, res) {
       });
     }
 
-    const rows = await getQuery(
-      'SELECT id, slug, emoji, sort_order, interest_tr, interest_en, interest_de, interest_fr, interest_pt, interest_it, interest_zh, interest_ja, interest_ru, interest_hi, interest_ko FROM `interests` ORDER BY sort_order ASC, id ASC',
-      []
-    );
+    const rows = await loadInterestRows();
 
     const interests = rows.map((row) => ({
       id: row.id,

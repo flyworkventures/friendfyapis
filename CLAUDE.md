@@ -40,7 +40,7 @@ Mindcoach pattern'ine göre çalışıyor: OpenAI Realtime → text.delta → El
 2. **Echo guard her zaman aktif.** `_findEchoMatch(raw, echoCandidates, 0.6)` koşulsuz çağrılmalı. Önceki sürüm `echoGuardActive ? null : _findEchoMatch(...)` şeklinde ters mantık içeriyordu → AI konuşurken (yankı en olası anda) yankıyı yakalamıyordu, kendi sesini user input zannedip aynı yanıtı tekrar üretiyordu.
 3. **Greeting fallback timing.**
    - Voice call: 1200ms — voice'de avatar yok, client `session.ready` alır almaz `avatar.ready` gönderir, greeting hemen başlar; fallback sadece bağlantı sorunu için.
-   - Video call: 30000ms — Rive avatar CDN'den 8MB+ inebiliyor; client gerçekten `avatar.ready` gönderene kadar AI konuşmaya başlamasın (ağzı kıpırdamayan rive üzerine ses gelmesin).
+   - Video call: 6000ms — Rive avatar CDN'den 8MB+ inebiliyor; client gerçekten `avatar.ready` gönderene kadar AI konuşmaya başlamasın (ağzı kıpırdamayan rive üzerine ses gelmesin). Client tarafında da 4sn (`_scheduleAvatarReadyFallback`) ve 8sn (`_riveReadyFallbackTimer`, fotoğraf fallback) ayrı güvenlik zamanlayıcıları var.
 
 ### Trigger Akışı
 - Sunucu OpenAI connect olur olmaz `setTimeout(greetingDelayMs, _triggerGreeting)` arms.

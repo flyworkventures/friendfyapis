@@ -12,7 +12,10 @@ const pool = mysql.createPool({
   database: process.env.DB_NAME || 'flywork1_friendify',
   waitForConnections: true,
   connectionLimit: parseInt(process.env.DB_POOL_LIMIT, 10) || 10,
-  queueLimit: 0,
+  // 0 = sonsuz kuyruk: havuz doygunlukta yeni istekleri süresiz bekletip
+  // art arda yavaş yanıt/timeout üretirdi. Sınırlı kuyrukla doygunlukta
+  // hızlı-başarısız (ECONNREFUSED benzeri "Queue limit reached" hatası).
+  queueLimit: parseInt(process.env.DB_POOL_QUEUE_LIMIT, 10) || 50,
   enableKeepAlive: true,
   connectTimeout: parseInt(process.env.DB_CONNECT_TIMEOUT_MS, 10) || 10000,
   dateStrings: ['DATE'],
@@ -68,4 +71,29 @@ async function insertQuery(sql, values) {
   }
 }
 
-module.exports = { pool, getQuery, query, insertQuery, testConnection };
+/**
+ * Birden fazla yazma işlemini tek bir transaction'da çalıştırır — herhangi
+ * biri başarısız olursa hepsi rollback edilir. `callback` bir mysql2
+ * connection alır (getQuery/query değil, `conn.query(sql, values)` kullanın).
+ */
+async function transaction(callback) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const result = await callback(conn);
+    await conn.commit();
+    return result;
+  } catch (error) {
+    try {
+      await conn.rollback();
+    } catch (rollbackError) {
+      log.error('SQL rollback hatası', rollbackError.message);
+    }
+    log.error('SQL transaction hatası', error.message);
+    throw error;
+  } finally {
+    conn.release();
+  }
+}
+
+module.exports = { pool, getQuery, query, insertQuery, transaction, testConnection };

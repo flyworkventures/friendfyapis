@@ -50,6 +50,14 @@ function _q(p) {
   return `"${String(p).replace(/"/g, '\\"')}"`;
 }
 
+async function safeUnlink(p) {
+  try {
+    await fs.promises.unlink(p);
+  } catch (_) {
+    // dosya zaten yoksa/silinemezse yoksay — sadece geçici temizlik.
+  }
+}
+
 function execPromise(cmd) {
   return new Promise((resolve, reject) => {
     exec(cmd, (err, stdout, stderr) => {
@@ -77,10 +85,10 @@ async function generateVisemesFromWavFile(wavPath) {
     await execPromise(
       `${_q(RHUBARB_BIN)} ${_q(wavPath)} -f json -o ${_q(jsonPath)}`
     );
-    const raw = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    const raw = JSON.parse(await fs.promises.readFile(jsonPath, 'utf8'));
     return _mapRhubarbToVisemes(raw);
   } finally {
-    if (fs.existsSync(jsonPath)) fs.unlinkSync(jsonPath);
+    await safeUnlink(jsonPath);
   }
 }
 
@@ -94,7 +102,7 @@ async function generateVisemesFromPcm24k(pcmBuffer, opts = {}) {
   const pcmPath = path.join(TEMP_DIR, `${id}.pcm`);
   const wavPath = path.join(TEMP_DIR, `${id}.wav`);
   try {
-    fs.writeFileSync(pcmPath, pcmBuffer);
+    await fs.promises.writeFile(pcmPath, pcmBuffer);
     await execPromise(
       `${_q(FFMPEG_BIN)} -y -f s16le -ar 24000 -ac 1 -i ${_q(pcmPath)} -ac 1 -ar 16000 ${_q(wavPath)}`
     );
@@ -108,8 +116,8 @@ async function generateVisemesFromPcm24k(pcmBuffer, opts = {}) {
     // If external tools are unavailable, degrade gracefully to local fallback.
     return generateEnergyVisemesFromPcm24k(pcmBuffer);
   } finally {
-    if (fs.existsSync(pcmPath)) fs.unlinkSync(pcmPath);
-    if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
+    await safeUnlink(pcmPath);
+    await safeUnlink(wavPath);
   }
 }
 
@@ -171,12 +179,12 @@ async function generateVisemesFromAudioUrl(audioUrl) {
     const response = await fetch(audioUrl);
     if (!response.ok) throw new Error('Audio download failed');
     const buffer = Buffer.from(await response.arrayBuffer());
-    fs.writeFileSync(inputPath, buffer);
+    await fs.promises.writeFile(inputPath, buffer);
     await execPromise(`ffmpeg -y -i ${_q(inputPath)} -ac 1 -ar 16000 ${_q(wavPath)}`);
     return await generateVisemesFromWavFile(wavPath);
   } finally {
-    if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-    if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
+    await safeUnlink(inputPath);
+    await safeUnlink(wavPath);
   }
 }
 

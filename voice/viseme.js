@@ -93,6 +93,14 @@ function finalizeVisemeTimelineForClient(input) {
   return stabilized;
 }
 
+async function safeUnlink(p) {
+  try {
+    await fs.promises.unlink(p);
+  } catch (_) {
+    // dosya zaten yoksa/silinemezse yoksay — sadece geçici temizlik.
+  }
+}
+
 function execFilePromise(file, args) {
   return new Promise((resolve, reject) => {
     execFile(file, args, (err) => (err ? reject(err) : resolve()));
@@ -116,12 +124,10 @@ async function runVisemePipeline(inputPath, id) {
     }
     await execFilePromise(getFfmpegPath(), ['-y', '-i', inputPath, '-ac', '1', '-ar', '16000', wavPath]);
     await execFilePromise(getRhubarbPath(), [wavPath, '-f', 'json', '-o', jsonPath]);
-    const raw = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    const raw = JSON.parse(await fs.promises.readFile(jsonPath, 'utf8'));
     return { visemes: mapRhubarbToVisemes(raw) };
   } finally {
-    [wavPath, jsonPath].forEach((p) => {
-      if (fs.existsSync(p)) fs.unlinkSync(p);
-    });
+    await Promise.all([wavPath, jsonPath].map(safeUnlink));
   }
 }
 
@@ -139,11 +145,11 @@ async function generateVisemesFromAudioUrl(audioUrl) {
       responseType: 'arraybuffer',
       timeout: 20000
     });
-    fs.writeFileSync(inputPath, Buffer.from(response.data));
+    await fs.promises.writeFile(inputPath, Buffer.from(response.data));
     const result = await runVisemePipeline(inputPath, id);
     return result;
   } finally {
-    if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+    await safeUnlink(inputPath);
   }
 }
 
@@ -155,11 +161,11 @@ async function generateVisemesFromAudioBuffer(audioBuffer, inputExt = 'mp3') {
   const safeExt = String(inputExt || 'mp3').replace(/[^a-z0-9]/gi, '') || 'mp3';
   const inputPath = path.join(TEMP_DIR, `${id}.${safeExt}`);
   try {
-    fs.writeFileSync(inputPath, audioBuffer);
+    await fs.promises.writeFile(inputPath, audioBuffer);
     const result = await runVisemePipeline(inputPath, id);
     return result;
   } finally {
-    if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+    await safeUnlink(inputPath);
   }
 }
 

@@ -541,10 +541,9 @@ BOUNDARY (only when really needed):
 - Stay in character as a real human chat partner at all times.`;
 }
 
-async function fetchConversationContext(conversationId) {
-  let convRows;
+async function _loadConvRowForContext(conversationId) {
   try {
-    convRows = await getQuery(
+    return await getQuery(
       `SELECT c.id, c.botId, c.userId, b.id AS bot_id,
               COALESCE(o.name, b.name) AS name,
               COALESCE(o.\`character\`, b.\`character\`) AS \`character\`,
@@ -576,7 +575,7 @@ async function fetchConversationContext(conversationId) {
       console.warn(
         '[chatReply] bot_catalog_overrides yok; kataloğ isim override uygulanamadı'
       );
-      convRows = await getQuery(
+      return await getQuery(
         `SELECT c.id, c.botId, c.userId, b.id AS bot_id, b.name, b.\`character\`, b.speakingStyle, b.interests,
                 b.interestsType, b.exampleResponse, b.characterTags, b.job_tr, b.job_en,
                 b.photoURL, b.system, b.voiceId, b.gender, b.age, b.zodiac, b.relationship_type,
@@ -587,17 +586,14 @@ async function fetchConversationContext(conversationId) {
          WHERE c.id = ? LIMIT 1`,
         [conversationId]
       );
-    } else {
-      throw e;
     }
+    throw e;
   }
-  const row = convRows?.[0];
-  if (!row) return null;
+}
 
-  const userName = String(row.userName || row.userEmail || 'kullanıcı').trim() || 'kullanıcı';
-  let historyRows;
+async function _loadHistoryRowsForContext(conversationId) {
   try {
-    historyRows = await getQuery(
+    return await getQuery(
       `SELECT m.sender, m.message, m.message_type, m.reply_to_message_id,
               rm.sender AS reply_sender, rm.message AS reply_message,
               rm.message_type AS reply_message_type
@@ -610,11 +606,26 @@ async function fetchConversationContext(conversationId) {
       [conversationId, CHAT_HISTORY_LIMIT]
     );
   } catch (_) {
-    historyRows = await getQuery(
+    return await getQuery(
       'SELECT sender, message, message_type FROM `messages` WHERE conversationId = ? ORDER BY id DESC LIMIT ?',
       [conversationId, CHAT_HISTORY_LIMIT]
     );
   }
+}
+
+async function fetchConversationContext(conversationId) {
+  // Bu iki sorgu birbirinden bağımsız (ikisi de sadece conversationId'ye
+  // ihtiyaç duyuyor) — sıralı await yerine paralel çalıştırıyoruz, her
+  // biri kendi fallback mantığını koruyor.
+  const [convRows, historyRows] = await Promise.all([
+    _loadConvRowForContext(conversationId),
+    _loadHistoryRowsForContext(conversationId),
+  ]);
+
+  const row = convRows?.[0];
+  if (!row) return null;
+
+  const userName = String(row.userName || row.userEmail || 'kullanıcı').trim() || 'kullanıcı';
 
   const history = [...(historyRows || [])]
     .reverse()
@@ -1969,36 +1980,38 @@ async function generateCharacterPhotoReply(conversationId, lang, userMessageText
     scene.slice(0, 160)
   );
 
-  // Karakter tonunda kısa bir caption üret (fotoğrafla birlikte gidecek).
-  let caption = '';
-  try {
-    const captionRaw = await callOpenAI({
-      messages: [
-        { role: 'system', content: systemPrompt },
-        ...ctx.history,
-        {
-          role: 'system',
-          content:
-            'Kullanıcı senden bir fotoğraf istedi ve sen ona o isteğe uygun bir fotoğraf ' +
-            'gönderiyorsun. Fotoğraf sahnesi (bilgi için): ' +
-            scene +
-            '. YALNIZCA fotoğrafın kısa, doğal ve samimi alt yazısını (caption) yaz; ' +
-            'en fazla 1 cümle, sohbet bağlamına ve sahneye uygun. Tırnak veya "caption:" gibi ön ek KULLANMA.'
-        }
-      ],
-      model: getChatModel(),
-      maxTokens: 60
-    });
-    caption = enforceCompactReplyStyle(captionRaw) || '';
-  } catch (e) {
-    console.warn('[chatReply] photo caption failed:', e?.message || e);
-  }
-
-  let imageUrl = await generateProactivePhoto(
-    referenceUrl,
-    scene,
-    photoPersona
-  );
+  // Caption üretimi ve görsel üretimi ikisi de yalnızca `scene`'e bağımlı,
+  // birbirlerine değil — sıralı yerine paralel çalıştırıyoruz (en yavaş adım
+  // görsel üretimi olduğu için caption'ı beklemek saf kayıp).
+  const [caption, initialImageUrl] = await Promise.all([
+    (async () => {
+      try {
+        const captionRaw = await callOpenAI({
+          messages: [
+            { role: 'system', content: systemPrompt },
+            ...ctx.history,
+            {
+              role: 'system',
+              content:
+                'Kullanıcı senden bir fotoğraf istedi ve sen ona o isteğe uygun bir fotoğraf ' +
+                'gönderiyorsun. Fotoğraf sahnesi (bilgi için): ' +
+                scene +
+                '. YALNIZCA fotoğrafın kısa, doğal ve samimi alt yazısını (caption) yaz; ' +
+                'en fazla 1 cümle, sohbet bağlamına ve sahneye uygun. Tırnak veya "caption:" gibi ön ek KULLANMA.'
+            }
+          ],
+          model: getChatModel(),
+          maxTokens: 60
+        });
+        return enforceCompactReplyStyle(captionRaw) || '';
+      } catch (e) {
+        console.warn('[chatReply] photo caption failed:', e?.message || e);
+        return '';
+      }
+    })(),
+    generateProactivePhoto(referenceUrl, scene, photoPersona),
+  ]);
+  let imageUrl = initialImageUrl;
   // OpenAI safety üretimi kestiğinde: mevcut galeri fotosunu paylaş (özellik çalışmaya devam etsin).
   if (!imageUrl) {
     imageUrl = pickGalleryPhotoUrl(ctx.bot?.photoURL, referenceUrl) || referenceUrl;

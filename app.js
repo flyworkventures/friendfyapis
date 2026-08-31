@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express')
 const http = require('http')
+const compression = require('compression')
 const router = require('./routes/auth')
 const config = require('./server/config')
 const agents = require('./routes/agents')
@@ -19,6 +20,7 @@ const { createVisemeRouter } = require('./voice/viseme')
 const requestLogger = require('./middleware/requestLogger')
 const app = express();
 
+app.use(compression());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(requestLogger);

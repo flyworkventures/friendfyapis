@@ -4,7 +4,7 @@ const users = require('../fakedb/users');
 const UserModel = require('../models/user_model');
 const bcrypt = require('bcrypt')
 const JWT = require('jsonwebtoken')
-const { getQuery , query} = require('../db')
+const { getQuery , query, transaction} = require('../db')
 const {
     normalizeMembership,
     mergeMembershipsDbWithClient
@@ -988,17 +988,14 @@ router.post('/delete-account', middleware, async (req, res) => {
             });
         }
 
-        // Kullanıcının mesajlarını sil
-        await query("DELETE FROM `messages` WHERE conversationId IN (SELECT id FROM `coversations` WHERE userId = ?)", [userId]);
-        
-        // Kullanıcının konuşmalarını sil
-        await query("DELETE FROM `coversations` WHERE userId = ?", [userId]);
-        
-        // Kullanıcının oluşturduğu botları sil
-        await query("DELETE FROM `bots` WHERE creatorId = ?", [userId]);
-        
-        // Kullanıcıyı sil
-        await query("DELETE FROM `users` WHERE id = ?", [userId]);
+        // Tüm silme işlemleri tek transaction'da — biri başarısız olursa
+        // hepsi rollback edilir, yetim mesaj/konuşma satırı kalmaz.
+        await transaction(async (conn) => {
+            await conn.query("DELETE FROM `messages` WHERE conversationId IN (SELECT id FROM `coversations` WHERE userId = ?)", [userId]);
+            await conn.query("DELETE FROM `coversations` WHERE userId = ?", [userId]);
+            await conn.query("DELETE FROM `bots` WHERE creatorId = ?", [userId]);
+            await conn.query("DELETE FROM `users` WHERE id = ?", [userId]);
+        });
 
         return res.status(200).json({
             msg: "Account deleted successfully",

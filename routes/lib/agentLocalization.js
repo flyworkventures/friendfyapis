@@ -21,7 +21,12 @@ const LANG_NAMES = {
 
 const translationCache = new Map();
 
+// TTL'siz olduğunda admin panelden yapılan interest düzenlemeleri process
+// restart olana kadar hiç yansımıyordu (bkz. performans denetimi) — 15dk TTL
+// ile bu artık en fazla 15dk gecikmeyle görünür oluyor.
+const INTEREST_CATALOG_TTL_MS = 15 * 60 * 1000;
 let interestCatalogCache = null;
+let interestCatalogCachedAt = 0;
 
 function normalizeLang(raw) {
     const lang = String(raw || 'en').toLowerCase().split(/[-_]/)[0];
@@ -56,7 +61,10 @@ function pickInterestLabel(row, lang) {
 }
 
 async function loadInterestCatalog() {
-    if (interestCatalogCache) return interestCatalogCache;
+    const isFresh =
+        interestCatalogCache &&
+        Date.now() - interestCatalogCachedAt < INTEREST_CATALOG_TTL_MS;
+    if (isFresh) return interestCatalogCache;
 
     const rows = await getQuery(
         'SELECT slug, interest_tr, interest_en, interest_de, interest_fr, interest_pt, interest_it, interest_zh, interest_ja, interest_ru, interest_hi, interest_ko FROM `interests` ORDER BY sort_order ASC, id ASC',
@@ -84,6 +92,7 @@ async function loadInterestCatalog() {
     }
 
     interestCatalogCache = { slugToLabels, labelToSlug };
+    interestCatalogCachedAt = Date.now();
     return interestCatalogCache;
 }
 
