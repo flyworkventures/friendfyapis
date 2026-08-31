@@ -25,6 +25,7 @@ const {
   enforceDailySendLimit,
   jwtUserId,
 } = require('./lib/dailyUsageLimits');
+const { assertJwtMatchesUserId } = require('./lib/assertJwtUserId');
 const { scheduleProactivePush } = require('../services/oneSignalPush');
 
 /** Sistem karakterinin (system 1/2) ismini dile göre yerelleştirir; kullanıcı karakterine dokunmaz. */
@@ -239,6 +240,8 @@ router.post('/listen-messages',middleware, async(req,res)=>{
 
    let convData = await getQuery("SELECT `current_chat_state` FROM `coversations` WHERE id = ?",[conversationId]);
    let messages;
+   const scheduledFilterJoin = 'AND (m.`scheduled_at` IS NULL OR m.`scheduled_at` <= NOW())';
+   const scheduledFilterPlain = 'AND (`scheduled_at` IS NULL OR `scheduled_at` <= NOW())';
    try {
      messages = await getQuery(
        `SELECT m.*,
@@ -247,14 +250,14 @@ router.post('/listen-messages',middleware, async(req,res)=>{
           rm.message_type AS reply_message_type
         FROM \`messages\` m
         LEFT JOIN \`messages\` rm ON m.reply_to_message_id = rm.id
-        WHERE m.conversationId = ? ${cursorClauseJoin}
+        WHERE m.conversationId = ? ${cursorClauseJoin} ${scheduledFilterJoin}
         ORDER BY m.created_at DESC
         ${afterId === null ? 'LIMIT ' + LEGACY_LISTEN_CAP : ''}`,
        queryParams
      );
    } catch (e) {
      messages = await getQuery(
-       `SELECT * FROM \`messages\` WHERE conversationId = ? ${cursorClausePlain} ORDER BY created_at DESC
+       `SELECT * FROM \`messages\` WHERE conversationId = ? ${cursorClausePlain} ${scheduledFilterPlain} ORDER BY created_at DESC
         ${afterId === null ? 'LIMIT ' + LEGACY_LISTEN_CAP : ''}`,
        queryParams
      );
@@ -432,6 +435,71 @@ router.post('/search-conversations', middleware, async (req, res) => {
 
 
 
+
+/**
+ * Proaktif bildirime tıklanınca: henüz görünmeyen (scheduled_at) bot mesajlarını
+ * hemen sohbette göster.
+ * body: { userId, agentId } veya { userId, conversationId }
+ */
+router.post('/release-scheduled-messages', middleware, async (req, res) => {
+  try {
+    const { userId, agentId, conversationId: conversationIdRaw } = req.body || {};
+    const gate = assertJwtMatchesUserId(req, userId);
+    if (!gate.ok) {
+      return res.status(gate.status).json(gate.json);
+    }
+
+    let conversationId = conversationIdRaw;
+    if (!conversationId && agentId) {
+      const convRows = await getQuery(
+        'SELECT id FROM `coversations` WHERE userId = ? AND botId = ? LIMIT 1',
+        [userId, agentId]
+      );
+      conversationId = convRows?.[0]?.id;
+    }
+
+    if (!conversationId) {
+      return res.status(404).json({
+        success: false,
+        msg: 'conversation not found',
+      });
+    }
+
+    await query(
+      `UPDATE \`messages\`
+       SET \`scheduled_at\` = NULL
+       WHERE \`conversationId\` = ?
+         AND \`sender\` = 'bot'
+         AND \`scheduled_at\` IS NOT NULL`,
+      [conversationId]
+    );
+
+    const latestRows = await getQuery(
+      `SELECT message, message_type FROM \`messages\`
+       WHERE conversationId = ? AND sender = 'bot'
+       ORDER BY id DESC LIMIT 1`,
+      [conversationId]
+    );
+    const latest = latestRows?.[0];
+    if (latest) {
+      const preview =
+        latest.message_type === 'image'
+          ? '📷'
+          : latest.message_type === 'voice'
+            ? 'voice_message'
+            : String(latest.message || '').slice(0, 500);
+      await query(
+        'UPDATE `coversations` SET `lastMessage` = ?, `last_message_at` = NOW() WHERE id = ? LIMIT 1',
+        [preview || null, conversationId]
+      ).catch(() => {});
+    }
+
+    return res.status(200).json({ success: true, conversationId });
+  } catch (error) {
+    console.error('release-scheduled-messages error:', error?.message || error);
+    return res.status(500).json({ success: false, msg: 'Server error' });
+  }
+});
 
 /**
  * Proaktif karakter mesajı üretir ve gelecekte görünmek üzere (scheduled_at)
