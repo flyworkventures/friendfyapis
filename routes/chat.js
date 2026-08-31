@@ -27,6 +27,7 @@ const {
 } = require('./lib/dailyUsageLimits');
 const { assertJwtMatchesUserId } = require('./lib/assertJwtUserId');
 const { scheduleProactivePush } = require('../services/oneSignalPush');
+const { insertScheduledInboxNotification } = require('./lib/notificationInbox');
 
 /** Sistem karakterinin (system 1/2) ismini dile göre yerelleştirir; kullanıcı karakterine dokunmaz. */
 function localizeBotName(bot, lang) {
@@ -578,15 +579,33 @@ router.post('/generate-proactive', middleware, async (req, res) => {
     }
 
     const botRows = await getQuery(
-      'SELECT name, photoURL FROM `agents` WHERE id = ? LIMIT 1',
+      'SELECT name, photoURL, `system` FROM `bots` WHERE id = ? LIMIT 1',
       [agentId]
     );
-    const agentName = String(botRows?.[0]?.name || 'Friendify').trim();
+    const bot = botRows?.[0];
+    const agentName = String(bot?.name || 'Friendify').trim();
+    const displayTitle = localizeName(agentName, lang) || agentName;
     const sendAfter = new Date(Date.now() + scheduledInMinutes * 60 * 1000);
+    const inboxPayload = JSON.stringify({
+      category: 'character',
+      action: 'proactiveMessage',
+      agentId: Number(agentId),
+      conversationId,
+    });
+
+    // Bildirimler sayfası: push/yerel bildirim zamanında görünsün (tıklama şart değil).
+    await insertScheduledInboxNotification({
+      userId,
+      title: displayTitle,
+      body: content.text,
+      type: 'reminder',
+      payload: inboxPayload,
+      visibleAt: sendAfter,
+    });
 
     const pushResult = await scheduleProactivePush({
       userId,
-      title: agentName,
+      title: displayTitle,
       body: content.text,
       agentId: Number(agentId),
       conversationId,
