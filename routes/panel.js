@@ -129,13 +129,33 @@ router.get('/users', async (req, res) => {
         );
         const total = Number(countRow?.total) || 0;
 
-        const rows = await getQuery(
-            `SELECT * FROM \`users\`${whereSql} ORDER BY id DESC LIMIT ? OFFSET ?`,
-            [...listParams, limit, offset]
-        );
+        const cursorRaw = req.query.cursor;
+        const cursorId =
+            cursorRaw != null && String(cursorRaw).trim() !== ''
+                ? parseInt(String(cursorRaw), 10)
+                : null;
+        const useCursor =
+            !search && Number.isFinite(cursorId) && cursorId > 0;
+
+        let rows;
+        if (useCursor) {
+            rows = await getQuery(
+                'SELECT * FROM `users` WHERE id < ? ORDER BY id DESC LIMIT ?',
+                [cursorId, limit]
+            );
+        } else {
+            rows = await getQuery(
+                `SELECT * FROM \`users\`${whereSql} ORDER BY id DESC LIMIT ? OFFSET ?`,
+                [...listParams, limit, offset]
+            );
+        }
 
         const users = (rows || []).map(rowToPanelUser).filter(Boolean);
         const totalPages = total === 0 ? 0 : Math.ceil(total / limit);
+        const nextCursor =
+            users.length === limit && users.length > 0
+                ? users[users.length - 1].id
+                : null;
 
         return res.status(200).json({
             contractVersion: '2',
@@ -144,7 +164,9 @@ router.get('/users', async (req, res) => {
                 page,
                 limit,
                 total,
-                totalPages
+                totalPages,
+                nextCursor,
+                cursor: useCursor ? cursorId : null
             }
         });
     } catch (error) {

@@ -2,7 +2,13 @@ const router = require('express').Router();
 const middleware = require('../middleware/checkAuth')
 const { getQuery , query, insertQuery} = require('../db')
 const axios = require('axios')
-const multer = require('multer');
+const {
+  createMulterUpload,
+  readMulterFileBuffer,
+  readMulterFileHead,
+  multerFileReadStream,
+  unlinkMulterFile,
+} = require('../lib/multerUpload');
 const FormData  = require("form-data");
 const {
   generateCharacterTextReply,
@@ -19,6 +25,7 @@ const {
   enforceDailySendLimit,
   jwtUserId,
 } = require('./lib/dailyUsageLimits');
+const { scheduleProactivePush } = require('../services/oneSignalPush');
 
 /** Sistem karakterinin (system 1/2) ismini dile göre yerelleştirir; kullanıcı karakterine dokunmaz. */
 function localizeBotName(bot, lang) {
@@ -278,8 +285,8 @@ router.post('/listen-messages',middleware, async(req,res)=>{
          shouldHeal = ageSec >= 120;
        }
      } else {
-       // bot_typing
-       shouldHeal = (newestIsBot && ageSec >= 8) || ageSec >= 90;
+       // bot_typing — coklu balon sirasinda da typing acik kalabilir.
+       shouldHeal = (newestIsBot && ageSec >= 15) || ageSec >= 120;
      }
 
      if (shouldHeal) {
@@ -472,29 +479,67 @@ router.post('/generate-proactive', middleware, async (req, res) => {
     // scheduled_at = NOW() + N dakika. Görsel varsa image mesajı, yoksa text.
     const hasImage = Boolean(content.imageUrl);
     const messageType = hasImage ? 'image' : 'text';
-    const messagePayload = hasImage
-      ? JSON.stringify({
-          imageURL: content.imageUrl,
-          message: content.caption || content.text,
-          aiExplanation: '',
-          date: null
-        })
-      : content.text;
+    const textBubbles = Array.isArray(content.bubbles) && content.bubbles.length
+      ? content.bubbles
+      : [content.text];
 
-    const insertedId = await insertQuery(
-      'INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `scheduled_at`, `message_type`) ' +
-        'VALUES (?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? MINUTE), ?)',
-      [conversationId, 'bot', messagePayload, scheduledInMinutes, messageType]
+    let firstInsertedId = null;
+    if (hasImage) {
+      const messagePayload = JSON.stringify({
+        imageURL: content.imageUrl,
+        message: content.caption || content.text,
+        aiExplanation: '',
+        date: null,
+      });
+      firstInsertedId = await insertQuery(
+        'INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `scheduled_at`, `message_type`) ' +
+          'VALUES (?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? MINUTE), ?)',
+        [conversationId, 'bot', messagePayload, scheduledInMinutes, messageType]
+      );
+    } else {
+      for (let i = 0; i < textBubbles.length; i++) {
+        const bubble = String(textBubbles[i] || '').trim();
+        if (!bubble) continue;
+        const insertedId = await insertQuery(
+          'INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `scheduled_at`, `message_type`) ' +
+            'VALUES (?, ?, ?, NOW(), DATE_ADD(DATE_ADD(NOW(), INTERVAL ? MINUTE), INTERVAL ? SECOND), ?)',
+          [conversationId, 'bot', bubble, scheduledInMinutes, i * 2, messageType]
+        );
+        if (firstInsertedId == null) firstInsertedId = insertedId;
+      }
+    }
+
+    const botRows = await getQuery(
+      'SELECT name, photoURL FROM `agents` WHERE id = ? LIMIT 1',
+      [agentId]
     );
+    const agentName = String(botRows?.[0]?.name || 'Friendify').trim();
+    const sendAfter = new Date(Date.now() + scheduledInMinutes * 60 * 1000);
+
+    const pushResult = await scheduleProactivePush({
+      userId,
+      title: agentName,
+      body: content.text,
+      agentId: Number(agentId),
+      conversationId,
+      messageId: firstInsertedId,
+      sendAfter,
+      imageUrl: content.imageUrl || null,
+      lang,
+    });
+
+    const pushScheduled = pushResult?.ok === true;
 
     return res.status(200).json({
       success: true,
       conversationId,
-      messageId: insertedId,
+      messageId: firstInsertedId,
       text: content.text,
       imageUrl: content.imageUrl || null,
       caption: content.caption || null,
-      scheduledInMinutes
+      scheduledInMinutes,
+      pushScheduled,
+      pushFallbackLocal: !pushScheduled,
     });
   } catch (error) {
     console.error('generate-proactive error:', error?.message || error);
@@ -954,7 +999,7 @@ return result;
 
 }
 
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = createMulterUpload();
 const ALLOWED_IMAGE_MIME_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/heic'];
 
 function detectImageMimeFromMagicBytes(buffer) {
@@ -1012,7 +1057,10 @@ router.post('/send-audio-message', middleware, upload.single('file'), async (req
       return res.status(usage.status).json(usage.body);
     }
 
-    const fileBuffer = req.file.buffer;
+    const fileBuffer = await readMulterFileBuffer(req.file);
+    if (!fileBuffer) {
+      return res.status(400).json({ error: 'Ses dosyası okunamadı.' });
+    }
     const mime = String(req.file.mimetype || 'audio/m4a').toLowerCase();
     const ext =
       mime.includes('webm') ? 'webm'
@@ -1258,12 +1306,14 @@ router.post('/send-image-message', middleware, upload.fields([
     );
 
     const normalizedMimeType = String(uploadedImage.mimetype || '').toLowerCase();
-    const detectedMimeType = detectImageMimeFromMagicBytes(uploadedImage.buffer);
+    const fileHead = await readMulterFileHead(uploadedImage);
+    const detectedMimeType = detectImageMimeFromMagicBytes(fileHead);
     const resolvedMimeType = ALLOWED_IMAGE_MIME_TYPES.includes(normalizedMimeType)
       ? normalizedMimeType
       : detectedMimeType;
 
     if (!resolvedMimeType || !ALLOWED_IMAGE_MIME_TYPES.includes(resolvedMimeType)) {
+      await unlinkMulterFile(uploadedImage);
       return res.status(400).json({
         success: false,
         error: 'INVALID_FILE_TYPE',
@@ -1285,7 +1335,10 @@ router.post('/send-image-message', middleware, upload.fields([
     const cdnFileUrl = `https://fakefriend.b-cdn.net/${randomId}.${safeExt}`;
 
     try {
-      const uploadResponse = await axios.put(cdnUploadUrl, uploadedImage.buffer, {
+      const uploadBody =
+        multerFileReadStream(uploadedImage) ||
+        (await readMulterFileBuffer(uploadedImage));
+      const uploadResponse = await axios.put(cdnUploadUrl, uploadBody, {
         headers: {
           AccessKey: '68664abb-b19e-47e7-acd67dba78a5-e90a-4386',
           'Content-Type': resolvedMimeType
@@ -1310,6 +1363,8 @@ router.post('/send-image-message', middleware, upload.fields([
         message: 'Image upload failed on upstream provider',
         requestId
       });
+    } finally {
+      await unlinkMulterFile(uploadedImage);
     }
 
     const initialPayload = JSON.stringify({

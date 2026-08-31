@@ -209,7 +209,7 @@ function normalizeHistoryText(raw) {
   return t;
 }
 
-async function getChatHistory(chatId, limit = 20) {
+async function getChatHistory(chatId, limit = 40) {
   const rows = await getQuery(
     'SELECT sender, message, message_type FROM `messages` WHERE conversationId = ? ORDER BY id DESC LIMIT ?',
     [chatId, limit]

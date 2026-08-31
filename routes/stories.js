@@ -1,6 +1,4 @@
 const express = require('express');
-const multer = require('multer');
-const router = express.Router();
 const middleware = require('../middleware/checkAuth');
 const { getQuery, query, insertQuery } = require('../db');
 const { assertJwtMatchesUserId } = require('./lib/assertJwtUserId');
@@ -8,12 +6,14 @@ const {
   uploadBufferToBunny,
   listBunnyImageUrls,
 } = require('../lib/bunnyStorage');
+const { createMulterUpload, hasMulterPayload, readMulterFileBuffer } = require('../lib/multerUpload');
 const { generateCharacterReply } = require('./lib/chatReplyService');
 const { normalizeLang } = require('./lib/agentLocalization');
 const { localizeName } = require('./lib/nameLocalization');
 
-const upload = multer({
-  storage: multer.memoryStorage(),
+const router = express.Router();
+
+const upload = createMulterUpload({
   limits: { fileSize: 12 * 1024 * 1024 },
 });
 
@@ -102,6 +102,90 @@ function extractUrlsFromMessage(raw) {
  */
 const _proactiveUrlCache = new Map(); // botId -> { at, urls }
 
+async function loadBotProactiveMediaUrlsBatch(
+  botIds,
+  photoByBotId = new Map(),
+  { allowCdnList = true } = {}
+) {
+  const ids = [
+    ...new Set(
+      (botIds || [])
+        .map((id) => Number(id))
+        .filter((id) => Number.isFinite(id) && id > 0)
+    ),
+  ];
+  const result = new Map();
+  if (!ids.length) return result;
+
+  const missing = [];
+  for (const id of ids) {
+    const cached = _proactiveUrlCache.get(id);
+    if (cached && Date.now() - cached.at < 10 * 60 * 1000) {
+      result.set(id, cached.urls);
+    } else {
+      missing.push(id);
+    }
+  }
+
+  if (!missing.length) return result;
+
+  const urlsByBot = new Map(missing.map((id) => [id, new Set()]));
+  const msgCountByBot = new Map(missing.map((id) => [id, 0]));
+
+  try {
+    const placeholders = missing.map(() => '?').join(',');
+    const msgRows = await getQuery(
+      `SELECT c.botId AS botId, m.message FROM \`messages\` m
+       INNER JOIN \`coversations\` c ON c.id = m.conversationId
+       WHERE c.botId IN (${placeholders})
+         AND m.sender = 'bot'
+         AND m.message LIKE '%/proactive/%'
+       ORDER BY m.id DESC
+       LIMIT ?`,
+      [...missing, missing.length * 40]
+    );
+    for (const row of msgRows || []) {
+      const bid = Number(row.botId);
+      if (!urlsByBot.has(bid)) continue;
+      const count = msgCountByBot.get(bid) || 0;
+      if (count >= 40) continue;
+      msgCountByBot.set(bid, count + 1);
+      for (const u of extractUrlsFromMessage(row.message)) {
+        if (/\/proactive\//i.test(u)) urlsByBot.get(bid).add(u);
+      }
+    }
+  } catch (_) {}
+
+  const cdnPromises = [];
+  for (const id of missing) {
+    const urls = urlsByBot.get(id);
+    for (const u of onlyProactive(toPhotoUrlArray(photoByBotId.get(id)))) {
+      urls.add(u);
+    }
+    if (allowCdnList && urls.size === 0) {
+      cdnPromises.push(
+        listBunnyImageUrls(`proactive/${id}/`)
+          .then((listed) => ({ id, listed }))
+          .catch(() => ({ id, listed: [] }))
+      );
+    }
+  }
+
+  const cdnResults = await Promise.all(cdnPromises);
+  for (const { id, listed } of cdnResults) {
+    const urls = urlsByBot.get(id);
+    for (const u of listed) urls.add(u);
+  }
+
+  for (const id of missing) {
+    const list = [...urlsByBot.get(id)];
+    _proactiveUrlCache.set(id, { at: Date.now(), urls: list });
+    result.set(id, list);
+  }
+
+  return result;
+}
+
 async function loadBotProactiveMediaUrls(botId, photoURL, { allowCdnList = true } = {}) {
   const id = Number(botId);
   if (!Number.isFinite(id) || id <= 0) return [];
@@ -111,41 +195,12 @@ async function loadBotProactiveMediaUrls(botId, photoURL, { allowCdnList = true 
     return cached.urls;
   }
 
-  const urls = new Set();
-
-  try {
-    const msgRows = await getQuery(
-      `SELECT m.message FROM \`messages\` m
-       INNER JOIN \`coversations\` c ON c.id = m.conversationId
-       WHERE c.botId = ?
-         AND m.sender = 'bot'
-         AND m.message LIKE '%/proactive/%'
-       ORDER BY m.id DESC
-       LIMIT 40`,
-      [id]
-    );
-    for (const row of msgRows || []) {
-      for (const u of extractUrlsFromMessage(row.message)) {
-        if (/\/proactive\//i.test(u)) urls.add(u);
-      }
-    }
-  } catch (_) {}
-
-  for (const u of onlyProactive(toPhotoUrlArray(photoURL))) {
-    urls.add(u);
-  }
-
-  // CDN list yavaş; yalnızca başka kaynak yoksa dene.
-  if (allowCdnList && urls.size === 0) {
-    try {
-      const listed = await listBunnyImageUrls(`proactive/${id}/`);
-      for (const u of listed) urls.add(u);
-    } catch (_) {}
-  }
-
-  const list = [...urls];
-  _proactiveUrlCache.set(id, { at: Date.now(), urls: list });
-  return list;
+  const batch = await loadBotProactiveMediaUrlsBatch(
+    [id],
+    new Map([[id, photoURL]]),
+    { allowCdnList }
+  );
+  return batch.get(id) || [];
 }
 
 /**
@@ -167,17 +222,30 @@ async function repairStoriesWithProactive(userId) {
   const usedMedia = await loadUsedMedia(userId);
   let changed = false;
 
+  const botIds = [...new Set(needsRepair.map((r) => Number(r.bot_id)).filter(Boolean))];
+  const botPhotoRows = botIds.length
+    ? await getQuery(
+        `SELECT id, photoURL FROM \`bots\` WHERE id IN (${botIds.map(() => '?').join(',')})`,
+        botIds
+      )
+    : [];
+  const photoByBotId = new Map(
+    (botPhotoRows || []).map((r) => [Number(r.id), r.photoURL])
+  );
+
+  const proactiveByBot = await loadBotProactiveMediaUrlsBatch(
+    botIds,
+    photoByBotId,
+    { allowCdnList: false }
+  );
+
+  // 1) Pick'leri sırayla hesapla (usedMedia stateful — aynı medya iki row'a
+  //    verilmesin). DB yazımı ertelenir; her row için ayrı UPDATE yerine tek
+  //    batch yapılır.
+  const updates = [];
   for (const row of needsRepair) {
     usedMedia.delete(String(row.media_url || ''));
-    const botRows = await getQuery(
-      'SELECT photoURL FROM `bots` WHERE id = ? LIMIT 1',
-      [row.bot_id]
-    );
-    const urls = await loadBotProactiveMediaUrls(
-      row.bot_id,
-      botRows?.[0]?.photoURL,
-      { allowCdnList: false }
-    );
+    const urls = proactiveByBot.get(Number(row.bot_id)) || [];
     const proactiveUrls = urls.filter((u) => /\/proactive\//i.test(u));
     if (!proactiveUrls.length) {
       // Proactive yoksa olduğu gibi bırak (yeni story üretip izlenmişleri sıfırlama).
@@ -192,20 +260,27 @@ async function repairStoriesWithProactive(userId) {
       usedMedia.add(String(row.media_url || ''));
       continue;
     }
-    try {
-      const ok = await query(
-        'UPDATE `user_feed_stories` SET `media_url` = ? WHERE id = ? LIMIT 1',
-        [pick, row.id]
-      );
-      if (ok) {
-        usedMedia.add(pick);
-        changed = true;
-      } else {
-        usedMedia.add(String(row.media_url || ''));
-      }
-    } catch (_) {
-      usedMedia.add(String(row.media_url || ''));
-    }
+    updates.push({ id: row.id, pick });
+    usedMedia.add(pick);
+  }
+
+  if (!updates.length) return false;
+
+  // 2) Tek batch UPDATE ... CASE — N ayrı round-trip yerine tek sorgu.
+  try {
+    const caseSql = updates.map(() => 'WHEN ? THEN ?').join(' ');
+    const ids = updates.map((u) => u.id);
+    const caseParams = [];
+    for (const u of updates) caseParams.push(u.id, u.pick);
+    const ok = await query(
+      'UPDATE `user_feed_stories` SET `media_url` = CASE `id` ' +
+        caseSql +
+        ` END WHERE id IN (${ids.map(() => '?').join(',')})`,
+      [...caseParams, ...ids]
+    );
+    changed = !!ok;
+  } catch (_) {
+    changed = false;
   }
   return changed;
 }
@@ -309,15 +384,17 @@ async function enforceMaxStoriesPerCharacter(userId) {
     if (!byBot.has(bid)) byBot.set(bid, []);
     byBot.get(bid).push(row.id);
   }
+  const excessIds = [];
   for (const ids of byBot.values()) {
     if (ids.length <= MAX_STORIES_PER_CHARACTER) continue;
-    const excess = ids.slice(0, ids.length - MAX_STORIES_PER_CHARACTER);
-    for (const id of excess) {
-      await query(
-        'UPDATE `user_feed_stories` SET `expires_at` = NOW() WHERE id = ? LIMIT 1',
-        [id]
-      ).catch(() => {});
-    }
+    excessIds.push(...ids.slice(0, ids.length - MAX_STORIES_PER_CHARACTER));
+  }
+  if (excessIds.length) {
+    const placeholders = excessIds.map(() => '?').join(',');
+    await query(
+      `UPDATE \`user_feed_stories\` SET \`expires_at\` = NOW() WHERE id IN (${placeholders})`,
+      excessIds
+    ).catch(() => {});
   }
 }
 
@@ -621,7 +698,7 @@ router.post('/create', middleware, upload.single('photo'), async (req, res) => {
     if (!authCheck.ok) {
       return res.status(authCheck.status).json(authCheck.json);
     }
-    if (!req.file?.buffer) {
+    if (!hasMulterPayload(req.file)) {
       return res.status(400).json({ success: false, msg: 'photo is required' });
     }
 
@@ -634,8 +711,12 @@ router.post('/create', middleware, upload.single('photo'), async (req, res) => {
     const remotePath = `stories/user/${userId}/${Date.now()}_${Math.random()
       .toString(36)
       .slice(2, 8)}.${ext}`;
+    const fileBuffer = await readMulterFileBuffer(req.file);
+    if (!fileBuffer) {
+      return res.status(400).json({ success: false, msg: 'photo is required' });
+    }
     const mediaUrl = await uploadBufferToBunny(
-      req.file.buffer,
+      fileBuffer,
       remotePath,
       req.file.mimetype || 'image/jpeg'
     );

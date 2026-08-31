@@ -5,6 +5,27 @@ const SUPPORTED_LANGS = [
   'tr', 'en', 'de', 'fr', 'pt', 'it', 'es', 'zh', 'ja', 'ru', 'hi', 'ko',
 ];
 
+// Zodiac / relationship katalogları statik — 30dk TTL.
+const TRAITS_CACHE_TTL_MS = 30 * 60 * 1000;
+const traitsTableCache = new Map();
+
+async function loadTraitsTableRows(table) {
+  const cached = traitsTableCache.get(table);
+  const isFresh =
+    cached && Date.now() - cached.cachedAt < TRAITS_CACHE_TTL_MS;
+  if (isFresh) return cached.rows;
+  const rows = await getQuery(
+    `SELECT id, slug, emoji, sort_order,
+            label_tr, label_en, label_de, label_fr, label_pt, label_it,
+            label_es, label_zh, label_ja, label_ru, label_hi, label_ko
+     FROM \`${table}\`
+     ORDER BY sort_order ASC, id ASC`,
+    []
+  );
+  traitsTableCache.set(table, { rows, cachedAt: Date.now() });
+  return rows;
+}
+
 function pickLabel(row, lang) {
   const key = `label_${lang}`;
   if (row[key]) return row[key];
@@ -22,14 +43,7 @@ function localizeRows(rows, lang) {
 }
 
 async function listTable(table) {
-  return getQuery(
-    `SELECT id, slug, emoji, sort_order,
-            label_tr, label_en, label_de, label_fr, label_pt, label_it,
-            label_es, label_zh, label_ja, label_ru, label_hi, label_ko
-     FROM \`${table}\`
-     ORDER BY sort_order ASC, id ASC`,
-    []
-  );
+  return loadTraitsTableRows(table);
 }
 
 function resolveLang(req) {

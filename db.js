@@ -11,7 +11,7 @@ const pool = mysql.createPool({
   password: process.env.DB_PASSWORD || '',
   database: process.env.DB_NAME || 'flywork1_friendify',
   waitForConnections: true,
-  connectionLimit: parseInt(process.env.DB_POOL_LIMIT, 10) || 10,
+  connectionLimit: parseInt(process.env.DB_POOL_LIMIT, 10) || 25,
   // 0 = sonsuz kuyruk: havuz doygunlukta yeni istekleri süresiz bekletip
   // art arda yavaş yanıt/timeout üretirdi. Sınırlı kuyrukla doygunlukta
   // hızlı-başarısız (ECONNREFUSED benzeri "Queue limit reached" hatası).

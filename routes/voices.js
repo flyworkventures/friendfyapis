@@ -2,12 +2,27 @@ const router = require('express').Router();
 const { getQuery } = require('../db');
 const middleware = require('../middleware/checkAuth');
 
+// Ses kataloğu nadiren değişir — 30dk TTL ile tekrarlayan sorguyu atla.
+const VOICES_CACHE_TTL_MS = 30 * 60 * 1000;
+let voicesRowsCache = null;
+let voicesRowsCachedAt = 0;
+
+async function loadVoiceRows() {
+  const isFresh =
+    voicesRowsCache && Date.now() - voicesRowsCachedAt < VOICES_CACHE_TTL_MS;
+  if (isFresh) return voicesRowsCache;
+  const rows = await getQuery(
+    'SELECT id, name, elevenlabs_id AS elevenlabsId, mp3_url AS mp3Url, gender FROM `voices` ORDER BY id ASC',
+    []
+  );
+  voicesRowsCache = rows;
+  voicesRowsCachedAt = Date.now();
+  return voicesRowsCache;
+}
+
 router.get('/list', middleware, async (req, res) => {
   try {
-    const rows = await getQuery(
-      'SELECT id, name, elevenlabs_id AS elevenlabsId, mp3_url AS mp3Url, gender FROM `voices` ORDER BY id ASC',
-      []
-    );
+    const rows = await loadVoiceRows();
 
     return res.status(200).json({
       success: true,

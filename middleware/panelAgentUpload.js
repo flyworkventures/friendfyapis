@@ -1,12 +1,9 @@
-const multer = require('multer');
+const { createMulterUpload } = require('../lib/multerUpload');
 
 const MAX_PHOTO_BYTES = Number(process.env.PANEL_AGENT_MAX_PHOTO_BYTES) || 8 * 1024 * 1024;
 const MAX_RIV_BYTES = Number(process.env.PANEL_AGENT_MAX_RIV_BYTES) || 25 * 1024 * 1024;
 
-const storage = multer.memoryStorage();
-
-const upload = multer({
-    storage,
+const upload = createMulterUpload({
     limits: {
         fileSize: Math.max(MAX_PHOTO_BYTES, MAX_RIV_BYTES),
         files: 5

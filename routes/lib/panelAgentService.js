@@ -1,4 +1,5 @@
 const { getQuery, query } = require('../../db');
+const { istLocalDayStartUtc } = require('./panelDateUtils');
 const {
     rowToPanelAgent,
     panelAgentBodyToDb,
@@ -323,15 +324,16 @@ async function buildAgentsAnalyseSummary() {
 
     let newAgentsToday = 0;
     if (await botsHasCreatedAtColumn()) {
+        const todayStart = istLocalDayStartUtc(0);
+        const tomorrowStart = istLocalDayStartUtc(-1);
         const todayRows = await getQuery(
             `
             SELECT COUNT(*) AS cnt FROM \`bots\`
             WHERE created_at IS NOT NULL
-              AND DATE(CONVERT_TZ(created_at, '+00:00', '+03:00')) = DATE(
-                  CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+03:00')
-              )
+              AND created_at >= ?
+              AND created_at < ?
             `,
-            []
+            [todayStart, tomorrowStart]
         );
         const todayRow = Array.isArray(todayRows) ? todayRows[0] : todayRows;
         newAgentsToday = Number(todayRow?.cnt) || 0;

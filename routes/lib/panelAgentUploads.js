@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const { uploadBufferToBunny } = require('../../lib/bunnyStorage');
+const { hasMulterPayload, readMulterFileBuffer } = require('../../lib/multerUpload');
 
 const PHOTO_MIMES = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
 const MAX_PHOTO_BYTES = Number(process.env.PANEL_AGENT_MAX_PHOTO_BYTES) || 8 * 1024 * 1024;
@@ -140,7 +141,7 @@ function assertPatchMediaIfProvided(body, files) {
 }
 
 function validatePhotoFile(file) {
-    if (!file?.buffer?.length) {
+    if (!hasMulterPayload(file)) {
         const err = new Error('Empty photo file');
         err.code = 'INVALID_FILE';
         throw err;
@@ -159,7 +160,7 @@ function validatePhotoFile(file) {
 }
 
 function validateRiveFile(file) {
-    if (!file?.buffer?.length) {
+    if (!hasMulterPayload(file)) {
         const err = new Error('Empty Rive file');
         err.code = 'INVALID_FILE';
         throw err;
@@ -210,8 +211,12 @@ async function uploadPanelAgentAssets(files, opts = {}) {
     for (let i = 0; i < photoFiles.length; i++) {
         validatePhotoFile(photoFiles[i]);
         const ext = extensionForPhoto(photoFiles[i].mimetype, photoFiles[i].originalname);
+        const buffer = await readMulterFileBuffer(photoFiles[i]);
+        if (!buffer) {
+            throw validationError('Empty photo file', 'INVALID_FILE');
+        }
         const url = await uploadBufferToBunny(
-            photoFiles[i].buffer,
+            buffer,
             `${base}/photo-${i + 1}.${ext}`,
             photoFiles[i].mimetype
         );
@@ -221,8 +226,12 @@ async function uploadPanelAgentAssets(files, opts = {}) {
     let riveAvatarUrl = null;
     if (riveFile) {
         validateRiveFile(riveFile);
+        const riveBuffer = await readMulterFileBuffer(riveFile);
+        if (!riveBuffer) {
+            throw validationError('Empty Rive file', 'INVALID_FILE');
+        }
         riveAvatarUrl = await uploadBufferToBunny(
-            riveFile.buffer,
+            riveBuffer,
             `${base}/avatar.riv`,
             'application/octet-stream'
         );

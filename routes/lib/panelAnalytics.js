@@ -1,6 +1,11 @@
 const { getQuery } = require('../../db');
 const { PANEL_TIMEZONE } = require('./panelUserMapper');
 const { buildAgentsAnalyseSummary } = require('./panelAgentService');
+const {
+    istLocalDayStartUtc,
+    istLocalDayKeyFromUtcDate,
+    istDayKeyDaysAgo,
+} = require('./panelDateUtils');
 
 const DAILY_RANGE_DAYS = Math.min(
     90,
@@ -8,67 +13,56 @@ const DAILY_RANGE_DAYS = Math.min(
 );
 
 async function fetchNewUsersDaily(days) {
+    const since = istLocalDayStartUtc(days);
     const rows = await getQuery(
         `
-        SELECT DATE(CONVERT_TZ(accountCreatedDate, '+00:00', '+03:00')) AS day_key,
-               COUNT(*) AS cnt
+        SELECT accountCreatedDate
         FROM \`users\`
-        WHERE accountCreatedDate IS NOT NULL
-          AND DATE(CONVERT_TZ(accountCreatedDate, '+00:00', '+03:00')) >= DATE(
-              CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+03:00')
-          ) - INTERVAL ? DAY
-        GROUP BY day_key
-        ORDER BY day_key ASC
+        WHERE accountCreatedDate >= ?
         `,
-        [days]
+        [since]
     );
     const map = new Map();
     for (const r of rows || []) {
-        const key =
-            r.day_key instanceof Date
-                ? r.day_key.toISOString().slice(0, 10)
-                : String(r.day_key).slice(0, 10);
-        map.set(key, Number(r.cnt) || 0);
+        const key = istLocalDayKeyFromUtcDate(r.accountCreatedDate);
+        if (!key) continue;
+        map.set(key, (map.get(key) || 0) + 1);
     }
     return map;
 }
 
 async function fetchActivityDaily(days) {
+    const since = istLocalDayStartUtc(days);
     const rows = await getQuery(
         `
-        SELECT day_key, COUNT(DISTINCT userId) AS cnt
-        FROM (
-            SELECT DATE(CONVERT_TZ(COALESCE(last_message_at, started_at), '+00:00', '+03:00')) AS day_key,
-                   userId
-            FROM \`coversations\`
-            WHERE COALESCE(last_message_at, started_at) IS NOT NULL
-              AND DATE(CONVERT_TZ(COALESCE(last_message_at, started_at), '+00:00', '+03:00')) >= DATE(
-                  CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+03:00')
-              ) - INTERVAL ? DAY
-        ) t
-        GROUP BY day_key
-        ORDER BY day_key ASC
+        SELECT userId, last_message_at, started_at
+        FROM \`coversations\`
+        WHERE last_message_at >= ?
+           OR (last_message_at IS NULL AND started_at >= ?)
         `,
-        [days]
+        [since, since]
     );
     const map = new Map();
+    const seenByDay = new Map();
+
     for (const r of rows || []) {
-        const key =
-            r.day_key instanceof Date
-                ? r.day_key.toISOString().slice(0, 10)
-                : String(r.day_key).slice(0, 10);
-        map.set(key, Number(r.cnt) || 0);
+        const ts = r.last_message_at || r.started_at;
+        const key = istLocalDayKeyFromUtcDate(ts);
+        const userId = r.userId;
+        if (!key || userId == null) continue;
+        if (!seenByDay.has(key)) seenByDay.set(key, new Set());
+        const seen = seenByDay.get(key);
+        if (seen.has(userId)) continue;
+        seen.add(userId);
+        map.set(key, (map.get(key) || 0) + 1);
     }
     return map;
 }
 
 function buildDailySeries(newUsersMap, activityMap, days) {
     const series = [];
-    const now = new Date();
     for (let i = days - 1; i >= 0; i--) {
-        const d = new Date(now);
-        d.setUTCDate(d.getUTCDate() - i);
-        const date = d.toISOString().slice(0, 10);
+        const date = istDayKeyDaysAgo(i);
         series.push({
             date,
             logins: activityMap.get(date) || 0,
@@ -84,27 +78,26 @@ async function buildAnalysePayload() {
     const [totalRow] = await getQuery('SELECT COUNT(*) AS total FROM `users`', []);
     const totalUsers = Number(totalRow?.total) || 0;
 
+    const todayStart = istLocalDayStartUtc(0);
+    const tomorrowStart = istLocalDayStartUtc(-1);
+
     const [newTodayRow] = await getQuery(
         `
         SELECT COUNT(*) AS cnt FROM \`users\`
-        WHERE accountCreatedDate IS NOT NULL
-          AND DATE(CONVERT_TZ(accountCreatedDate, '+00:00', '+03:00')) = DATE(
-              CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+03:00')
-          )
+        WHERE accountCreatedDate >= ?
+          AND accountCreatedDate < ?
         `,
-        []
+        [todayStart, tomorrowStart]
     );
     const newUsersToday = Number(newTodayRow?.cnt) || 0;
 
     const [activityTodayRow] = await getQuery(
         `
         SELECT COUNT(DISTINCT userId) AS cnt FROM \`coversations\`
-        WHERE COALESCE(last_message_at, started_at) IS NOT NULL
-          AND DATE(CONVERT_TZ(COALESCE(last_message_at, started_at), '+00:00', '+03:00')) = DATE(
-              CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+03:00')
-          )
+        WHERE (last_message_at >= ? AND last_message_at < ?)
+           OR (last_message_at IS NULL AND started_at >= ? AND started_at < ?)
         `,
-        []
+        [todayStart, tomorrowStart, todayStart, tomorrowStart]
     );
     const loginsToday = Number(activityTodayRow?.cnt) || 0;
 

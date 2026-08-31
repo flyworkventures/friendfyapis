@@ -11,6 +11,15 @@ async function tableExists(name) {
   return !!(rows && rows.length);
 }
 
+/** Satır başı -- yorumlarını kaldırır; CREATE TABLE gibi çok satırlı SQL korunur. */
+function stripSqlComments(raw) {
+  return raw
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('--'))
+    .join('\n')
+    .trim();
+}
+
 async function main() {
   if (await tableExists('referral_code_redemptions')) {
     console.log('⏭️  referral_code_redemptions zaten var');
@@ -18,15 +27,23 @@ async function main() {
   }
 
   const sqlPath = path.join(__dirname, 'sql', 'referral_code_redemptions.sql');
-  const sql = fs
-    .readFileSync(sqlPath, 'utf8')
+  const cleaned = stripSqlComments(fs.readFileSync(sqlPath, 'utf8'));
+  const statements = cleaned
     .split(';')
     .map((s) => s.trim())
-    .filter((s) => s && !s.startsWith('--'));
+    .filter(Boolean);
 
-  for (const stmt of sql) {
+  if (statements.length === 0) {
+    throw new Error('No SQL statements found in referral_code_redemptions.sql');
+  }
+
+  for (const stmt of statements) {
     const ok = await query(stmt);
     if (!ok) throw new Error(`SQL failed: ${stmt.slice(0, 80)}…`);
+  }
+
+  if (!(await tableExists('referral_code_redemptions'))) {
+    throw new Error('referral_code_redemptions tablosu oluşturulamadı');
   }
 
   console.log('✅ referral_code_redemptions oluşturuldu');

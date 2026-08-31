@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS `referral_code_redemptions` (
   `is_self_claim` TINYINT(1) NOT NULL DEFAULT 0,
   `granted_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_referral_code` (`code`),
   UNIQUE KEY `uq_referral_redeemer` (`redeemed_by_user_id`),
   KEY `idx_referral_code` (`code`),
   KEY `idx_referral_owner` (`code_owner_user_id`)

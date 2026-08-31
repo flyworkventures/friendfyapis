@@ -202,9 +202,8 @@ router.post('/claim-free-trial', middleware, async (req, res) => {
 
 /**
  * Referans kodu gir → 3 gün freeTrial.
- * - Kendi kodu kullanılabilir (self claim; kod arkadaşlar için "kullanılmış" olmaz)
- * - Başkasının henüz kullanılmamış kodu kullanılabilir (kod yanar)
- * - Kullanıcı başına tek redeem
+ * - Her kod yalnızca 1 kez kullanılabilir (self claim dahil).
+ * - Kullanıcı başına tek redeem.
  */
 router.post('/redeem-referral-code', middleware, async (req, res) => {
     try {
@@ -220,6 +219,17 @@ router.post('/redeem-referral-code', middleware, async (req, res) => {
                 success: false,
                 code: 'INVALID_CODE',
                 msg: 'Invalid referral code format'
+            });
+        }
+
+        const redemptionTable = await getQuery(
+            "SHOW TABLES LIKE 'referral_code_redemptions'"
+        );
+        if (!redemptionTable || redemptionTable.length === 0) {
+            return res.status(503).json({
+                success: false,
+                code: 'MIGRATION_REQUIRED',
+                msg: 'Run scripts/apply_referral_redemptions.js'
             });
         }
 
@@ -251,18 +261,16 @@ router.post('/redeem-referral-code', middleware, async (req, res) => {
         const ownerId = normalizeUserId(owner.id);
         const isSelfClaim = ownerId === gate.jwtUserId;
 
-        if (!isSelfClaim) {
-            const used = await getQuery(
-                'SELECT id FROM `referral_code_redemptions` WHERE `code` = ? AND `is_self_claim` = 0 LIMIT 1',
-                [code]
-            );
-            if (used && used.length > 0) {
-                return res.status(409).json({
-                    success: false,
-                    code: 'CODE_ALREADY_USED',
-                    msg: 'This referral code has already been used'
-                });
-            }
+        const used = await getQuery(
+            'SELECT id FROM `referral_code_redemptions` WHERE `code` = ? LIMIT 1',
+            [code]
+        );
+        if (used && used.length > 0) {
+            return res.status(409).json({
+                success: false,
+                code: 'CODE_ALREADY_USED',
+                msg: 'This referral code has already been used'
+            });
         }
 
         const redeemers = await getQuery(
@@ -288,6 +296,7 @@ router.post('/redeem-referral-code', middleware, async (req, res) => {
             [code, ownerId, gate.jwtUserId, isSelfClaim ? 1 : 0]
         );
         if (!insertOk) {
+            console.error('redeem-referral-code: redemption insert failed');
             return res.status(500).json({
                 success: false,
                 code: 'REDEEM_INSERT_FAILED',
@@ -328,6 +337,14 @@ router.post('/redeem-referral-code', middleware, async (req, res) => {
             });
         }
         if (error && error.code === 'ER_DUP_ENTRY') {
+            const dupKey = String(error.message || '');
+            if (dupKey.includes('uq_referral_code') || dupKey.includes("'code'")) {
+                return res.status(409).json({
+                    success: false,
+                    code: 'CODE_ALREADY_USED',
+                    msg: 'This referral code has already been used'
+                });
+            }
             return res.status(409).json({
                 success: false,
                 code: 'ALREADY_REDEEMED',

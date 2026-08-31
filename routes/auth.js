@@ -265,6 +265,7 @@ function mapGuestUserRow(row, fallback = {}) {
         gender: row.gender || fallback.gender || 'male',
         hobbies: row.hobbies ?? null,
         photoURL: row.photoURL ?? null,
+        referralCode: row.referral_code ?? row.referralCode ?? null,
         notificationPreferences: parseNotificationPreferences(
             row.notification_preferences ?? row.notificationPreferences
         ),
@@ -1156,6 +1157,46 @@ router.post('/get-login-streak', middleware, async (req, res) => {
         });
     } catch (error) {
         console.error('get-login-streak error:', error);
+        return res.status(500).json({
+            success: false,
+            msg: 'Server error',
+            error: error.message,
+        });
+    }
+});
+
+router.post('/register-push-token', middleware, async (req, res) => {
+    try {
+        const { userId, playerId } = req.body || {};
+
+        if (!userId) {
+            return res.status(400).json({
+                success: false,
+                msg: 'User ID is required',
+            });
+        }
+
+        const authCheck = assertJwtMatchesUserId(req, userId);
+        if (!authCheck.ok) {
+            return res.status(authCheck.status).json(authCheck.json);
+        }
+
+        const token = playerId == null ? null : String(playerId).trim();
+        if (token && token.length > 128) {
+            return res.status(400).json({
+                success: false,
+                msg: 'Invalid playerId',
+            });
+        }
+
+        await query(
+            'UPDATE `users` SET `onesignal_player_id` = ? WHERE id = ? LIMIT 1',
+            [token || null, userId]
+        );
+
+        return res.status(200).json({ success: true });
+    } catch (error) {
+        console.error('register-push-token error:', error);
         return res.status(500).json({
             success: false,
             msg: 'Server error',

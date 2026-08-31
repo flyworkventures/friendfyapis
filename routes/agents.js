@@ -529,9 +529,22 @@ routes.post('/get-system-agents', middleware, async (req, res) => {
 
 routes.post('/get-random-template-agent', middleware, async (req, res) => {
     try {
-        const rows = await getQuery(
-            "SELECT * FROM `bots` WHERE system = 2 ORDER BY RAND() LIMIT 1",
+        const countRows = await getQuery(
+            'SELECT COUNT(*) AS c FROM `bots` WHERE system = 2',
             []
+        );
+        const total = Number(countRows?.[0]?.c) || 0;
+        if (total === 0) {
+            return res.status(404).json({
+                success: false,
+                code: "TEMPLATE_NOT_FOUND",
+                msg: "No template agent found for system=2"
+            });
+        }
+        const offset = Math.floor(Math.random() * total);
+        const rows = await getQuery(
+            'SELECT * FROM `bots` WHERE system = 2 ORDER BY id ASC LIMIT 1 OFFSET ?',
+            [offset]
         );
         if (!rows || rows.length === 0) {
             return res.status(404).json({
@@ -967,6 +980,8 @@ routes.post('/update-agent', middleware, async (req, res) => {
 });
 
 // Son 15 gün içerisinde eklenen botları çeker
+const RECENT_BOTS_LIMIT = 100;
+
 routes.post('/get-recent-bots', middleware, async (req, res) => {
     try {
         const lang = normalizeLang(req.body?.lang);
@@ -975,11 +990,9 @@ routes.post('/get-recent-bots', middleware, async (req, res) => {
         fifteenDaysAgo.setDate(fifteenDaysAgo.getDate() - 15);
         const dateString = fifteenDaysAgo.toISOString().slice(0, 19).replace('T', ' ');
         
-        // Son 15 gün içerisinde eklenen botları çek
-        // Not: Eğer created_at kolonu yoksa, created, date_created vb. kolon ismini kullanın
         const recentBots = await getQuery(
-            "SELECT * FROM `bots` WHERE created_at >= ? AND system != 2 ORDER BY created_at DESC", 
-            [dateString]
+            'SELECT * FROM `bots` WHERE created_at >= ? AND system != 2 ORDER BY created_at DESC LIMIT ?',
+            [dateString, RECENT_BOTS_LIMIT]
         );
         
         if (recentBots.length === 0) {
