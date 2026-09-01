@@ -184,7 +184,12 @@ router.post('/get-messages',middleware, async(req,res)=>{
       // eskisi var mı" sinyali — asıl sayfaya dahil edilmiyor.
       const hasMore = rows.length > limit;
       const messages = hasMore ? rows.slice(1) : rows;
-      return res.status(200).json({ messages, hasMore });
+      const pinRow = await getQuery(
+        'SELECT `pinned_message_id` FROM `coversations` WHERE id = ? LIMIT 1',
+        [conversationId],
+      );
+      const pinnedMessageId = pinRow?.[0]?.pinned_message_id ?? null;
+      return res.status(200).json({ messages, hasMore, pinnedMessageId });
     }
 
     // Savunma amaçlı üst sınır: limit parametresi hiç gönderilmezse bile
@@ -239,7 +244,7 @@ router.post('/listen-messages',middleware, async(req,res)=>{
     // afterMessageId hiç gönderilmezse (eski client) savunma amaçlı üst sınır.
     const LEGACY_LISTEN_CAP = 1000;
 
-   let convData = await getQuery("SELECT `current_chat_state` FROM `coversations` WHERE id = ?",[conversationId]);
+   let convData = await getQuery("SELECT `current_chat_state`, `pinned_message_id` FROM `coversations` WHERE id = ?",[conversationId]);
    let messages;
    const scheduledFilterJoin = 'AND (m.`scheduled_at` IS NULL OR m.`scheduled_at` <= NOW())';
    const scheduledFilterPlain = 'AND (`scheduled_at` IS NULL OR `scheduled_at` <= NOW())';
@@ -304,7 +309,8 @@ router.post('/listen-messages',middleware, async(req,res)=>{
 
    return res.status(200).json({
     "conversation_state": chatState,
-    "messages": messages
+    "messages": messages,
+    "pinnedMessageId": convData?.[0]?.pinned_message_id ?? null,
    })
 })
 
@@ -322,7 +328,8 @@ router.post('/get-conversations', middleware, async (req, res) => {
          AND EXISTS (
            SELECT 1 FROM \`messages\` m WHERE m.conversationId = c.id LIMIT 1
          )
-       ORDER BY COALESCE(c.last_message_at, c.started_at, c.id) DESC`,
+       ORDER BY c.is_pinned DESC,
+                COALESCE(c.pinned_at, c.last_message_at, c.started_at, c.id) DESC`,
       [userId]
     );
 
@@ -380,7 +387,8 @@ router.post('/search-conversations', middleware, async (req, res) => {
          AND EXISTS (
            SELECT 1 FROM \`messages\` m WHERE m.conversationId = c.id LIMIT 1
          )
-       ORDER BY COALESCE(c.last_message_at, c.started_at, c.id) DESC`,
+       ORDER BY c.is_pinned DESC,
+                COALESCE(c.pinned_at, c.last_message_at, c.started_at, c.id) DESC`,
       [userId]
     );
 
@@ -747,6 +755,64 @@ router.post('/send-message',middleware,async (req,res)=>{
    }
 })
 
+/** Sohbet içinde tek mesaj sabitle / kaldır. */
+router.post('/toggle-pin-message', middleware, async (req, res) => {
+  try {
+    const messageId = Number(req.body?.messageId);
+    const conversationId = req.body?.conversationId;
+    const userId = jwtUserId(req);
+
+    if (!userId || !conversationId || !Number.isFinite(messageId) || messageId <= 0) {
+      return res.status(400).json({
+        success: false,
+        msg: 'messageId and conversationId required',
+      });
+    }
+
+    const owned = await getQuery(
+      `SELECT c.id, c.pinned_message_id
+       FROM \`coversations\` c
+       WHERE c.id = ? AND c.userId = ?
+       LIMIT 1`,
+      [conversationId, userId],
+    );
+    const conv = owned?.[0];
+    if (!conv) {
+      return res.status(404).json({
+        success: false,
+        msg: 'Conversation not found or unauthorized',
+      });
+    }
+
+    const msgRow = await getQuery(
+      `SELECT id FROM \`messages\`
+       WHERE id = ? AND conversationId = ?
+         AND (scheduled_at IS NULL OR scheduled_at <= NOW())
+       LIMIT 1`,
+      [messageId, conversationId],
+    );
+    if (!msgRow?.[0]) {
+      return res.status(404).json({ success: false, msg: 'Message not found' });
+    }
+
+    const currentPinned = Number(conv.pinned_message_id) || 0;
+    const nextPinned = currentPinned === messageId ? null : messageId;
+
+    await query(
+      'UPDATE `coversations` SET `pinned_message_id` = ? WHERE id = ? AND userId = ? LIMIT 1',
+      [nextPinned, conversationId, userId],
+    );
+
+    return res.status(200).json({
+      success: true,
+      pinnedMessageId: nextPinned,
+    });
+  } catch (error) {
+    console.error('toggle-pin-message error:', error?.message || error);
+    return res.status(500).json({ success: false, msg: 'Server error' });
+  }
+});
+
 /** Kullanıcı kendi metin mesajını düzenler (AI yeniden tetiklenmez). */
 router.post('/edit-message', middleware, async (req, res) => {
   try {
@@ -848,6 +914,11 @@ router.post('/delete-message', middleware, async (req, res) => {
     if (ok !== true) {
       return res.status(500).json({ success: false, msg: 'SQL' });
     }
+
+    await query(
+      'UPDATE `coversations` SET `pinned_message_id` = NULL WHERE id = ? AND pinned_message_id = ? LIMIT 1',
+      [conversationId, messageId],
+    ).catch(() => {});
 
     // Conversation lastMessage'ı yenile.
     const latest = await getQuery(
@@ -1569,6 +1640,50 @@ router.post('/report-conversation', middleware, async (req, res) => {
       msg: "Server error", 
       success: false 
     });
+  }
+});
+
+// Delete Conversation
+router.post('/toggle-pin-conversation', middleware, async (req, res) => {
+  try {
+    const { conversationId, userId } = req.body;
+
+    if (!conversationId || !userId) {
+      return res.status(400).json({
+        msg: 'Missing required fields',
+        success: false,
+      });
+    }
+
+    const rows = await getQuery(
+      'SELECT id, is_pinned FROM `coversations` WHERE id = ? AND userId = ? LIMIT 1',
+      [conversationId, userId],
+    );
+
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({
+        msg: 'Conversation not found or unauthorized',
+        success: false,
+      });
+    }
+
+    const currentlyPinned = rows[0].is_pinned === 1 || rows[0].is_pinned === true;
+    const nextPinned = currentlyPinned ? 0 : 1;
+    const pinnedAt = nextPinned ? new Date() : null;
+
+    await getQuery(
+      'UPDATE `coversations` SET `is_pinned` = ?, `pinned_at` = ? WHERE id = ? AND userId = ? LIMIT 1',
+      [nextPinned, pinnedAt, conversationId, userId],
+    );
+
+    return res.status(200).json({
+      success: true,
+      isPinned: nextPinned === 1,
+      pinnedAt: pinnedAt ? pinnedAt.toISOString() : null,
+    });
+  } catch (error) {
+    console.error('toggle-pin-conversation error:', error);
+    return res.status(500).json({ msg: 'Server error', success: false });
   }
 });
 
