@@ -301,14 +301,23 @@ async function loadUsedMedia(userId) {
   return new Set((rows || []).map((r) => String(r.media_url)));
 }
 
+// Bot gender değerleri karışık (TR + EN): "erkek"/"kadın"/"female"/…
+// oppositeGender EN döndürdüğü için birebir eşleşme çoğu botu kaçırıyordu.
+const _GENDER_SYNONYMS = {
+  male: ['male', 'man', 'erkek'],
+  female: ['female', 'woman', 'kadın', 'kadin'],
+};
+
 async function loadCandidateBots(targetGender) {
   let rows;
-  if (targetGender) {
+  const syn = targetGender ? _GENDER_SYNONYMS[targetGender] : null;
+  if (syn && syn.length) {
+    const ph = syn.map(() => '?').join(',');
     rows = await getQuery(
       `SELECT id, name, gender, photoURL FROM \`bots\`
-       WHERE system IN (1, 2) AND LOWER(gender) = ?
+       WHERE system IN (1, 2) AND LOWER(gender) IN (${ph})
        ORDER BY id ASC`,
-      [targetGender]
+      syn
     );
   } else {
     rows = await getQuery(
@@ -318,15 +327,15 @@ async function loadCandidateBots(targetGender) {
     );
   }
 
-  // Feed hızı için: yalnızca proactive görseller — profil foto story olmasın.
-  const bots = [];
-  for (const b of rows || []) {
-    const all = toPhotoUrlArray(b.photoURL);
-    const proactive = onlyProactive(all);
-    if (!proactive.length) continue;
-    bots.push({ ...b, photoURLs: proactive });
-  }
-  return bots;
+  // Aday = tüm sistem botları. Story medyası aşağıda loadBotProactiveMediaUrls
+  // ile YALNIZCA /proactive/ görsellerden seçilir → profil fotoğrafı asla story
+  // olmaz. Eski hâli burada photoURL'de /proactive/ şart koşuyordu; ama hiçbir
+  // botun photoURL'inde proactive URL olmadığından aday listesi HER ZAMAN boş
+  // kalıyor ve hiç karakter story'si üretilmiyordu (feed boş görünüyordu).
+  return (rows || []).map((b) => ({
+    ...b,
+    photoURLs: toPhotoUrlArray(b.photoURL),
+  }));
 }
 
 async function insertFeedStory({
