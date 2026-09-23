@@ -1,0 +1,26 @@
+{
+  "capturedAt": "2026-09-23T13:07:47.150Z",
+  "user": {
+    "id": 1936,
+    "username": "Guestfd4dc0",
+    "email": "guest_fd4dc08c0c7dd802@guest.local",
+    "country": "",
+    "accountCreatedDate": "2026-06-30T16:28:20.000Z",
+    "guest_device_id": null,
+    "appleUserIdentifier": null,
+    "revenuecat_customer_id": null,
+    "onesignal_player_id": null,
+    "phoneNumber": null
+  },
+  "bots": [
+    {
+      "id": 327,
+      "name": "Арма",
+      "system": 0,
+      "character": "Arkadaş canlısı, kibar ve pozitif bir sohbet arkadaşı. Nazik, saygılı ve ölçülü konuşur; gündelik, güvenli ve keyifli sohbetlerden hoşlanır.",
+      "created_at": "2026-09-23T12:53:15.000Z"
+    }
+  ],
+  "convCount": 1,
+  "reportCount": 0
+}

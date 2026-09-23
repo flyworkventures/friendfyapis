@@ -2,6 +2,7 @@ const routes = require('express').Router();
 const middleware = require('../middleware/checkAuth')
 const { getQuery , query, insertQuery} = require('../db')
 const { normalizeLang, localizeAgents, localizeAgentRow } = require('./lib/agentLocalization');
+const { moderateAgentContent } = require('../lib/contentModeration');
 
 // Sistem karakter kataloğu (bots system IN (1,2)) hemen hemen hiç değişmeyen
 // referans veri ama her app açılışında sorgulanıyordu. 5dk TTL ile
@@ -657,6 +658,27 @@ routes.post('/create-custom-agent', middleware, async (req, res) => {
             });
         }
 
+        // UGC moderasyonu: uygunsuz isim/persona ile karakter oluşturmayı engelle.
+        const moderation = await moderateAgentContent({
+            name: parsedName.value,
+            character,
+            interests,
+            interestsType,
+            characterTags,
+            speakingStyle,
+        });
+        if (!moderation.ok) {
+            console.warn(
+                `[agents] create-custom-agent moderation block (${moderation.reason}` +
+                `${moderation.term ? ':' + moderation.term : ''}${moderation.categories ? ':' + moderation.categories.join(',') : ''})`
+            );
+            return res.status(400).json({
+                success: false,
+                code: 'CONTENT_BLOCKED',
+                msg: 'Bu içerik topluluk kurallarına uygun değil. Lütfen karakterin ismini ve açıklamasını düzenleyin.'
+            });
+        }
+
         const normalizedInterests = JSON.stringify(normalizeArrayLike(interests));
         const normalizedInterestsType = JSON.stringify(normalizeArrayLike(interestsType));
         const normalizedCharacterTags = JSON.stringify(normalizeArrayLike(characterTags));
@@ -814,6 +836,27 @@ routes.post('/update-agent', middleware, async (req, res) => {
                 });
             }
             resolvedName = parsedName.value;
+        }
+
+        // UGC moderasyonu: düzenlemede de uygunsuz isim/persona'yı engelle.
+        const moderation = await moderateAgentContent({
+            name: resolvedName,
+            character,
+            interests,
+            interestsType,
+            characterTags,
+            speakingStyle,
+        });
+        if (!moderation.ok) {
+            console.warn(
+                `[agents] update-agent moderation block (${moderation.reason}` +
+                `${moderation.term ? ':' + moderation.term : ''}${moderation.categories ? ':' + moderation.categories.join(',') : ''})`
+            );
+            return res.status(400).json({
+                success: false,
+                code: 'CONTENT_BLOCKED',
+                msg: 'Bu içerik topluluk kurallarına uygun değil. Lütfen karakterin ismini ve açıklamasını düzenleyin.'
+            });
         }
 
         // Kendi custom agent (system=0): yalnızca şu anki kullanıcı (JWT) sahibi olmalı — şablon creatorId ile ilgisi yok
