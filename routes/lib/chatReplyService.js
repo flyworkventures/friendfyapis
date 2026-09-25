@@ -3,7 +3,15 @@ const FormData = require('form-data');
 const { getQuery, query, pool } = require('../../db');
 const { localizeName } = require('./nameLocalization');
 const { uploadBufferToBunny } = require('../../lib/bunnyStorage');
+const { moderateOutput } = require('../../lib/contentModeration');
 const { hasActivePremiumAccess } = require('./dailyUsageLimits');
+
+// AI cevabı moderasyondan geçmezse (jailbreak vb.) gösterilecek güvenli red.
+function safeRefusalText(lang) {
+  const l = String(lang || 'en').toLowerCase().split(/[-_]/)[0];
+  if (l === 'tr') return 'Bu konuda konuşmak istemiyorum, hadi başka bir şeyden bahsedelim.';
+  return "I'd rather not talk about that — let's chat about something else.";
+}
 
 /** Ücretsiz kullanıcı: her karakterden en fazla 1 AI foto */
 const FREE_PHOTOS_PER_CHARACTER = 1;
@@ -1138,7 +1146,7 @@ async function generateCharacterTextReply(conversationId, lang, extraDirective) 
     return null;
   }
 
-  const bubbles = applyMultiBubblePolicy(
+  let bubbles = applyMultiBubblePolicy(
     hasExtraDirective
       ? [enforceCompactReplyStyle(raw)].filter(Boolean)
       : parseMultiMessageReply(raw)
@@ -1147,6 +1155,18 @@ async function generateCharacterTextReply(conversationId, lang, extraDirective) 
     console.error('[chatReply] parsed empty bubbles for conversation', conversationId);
     return null;
   }
+
+  // OUTPUT MODERASYON (son kalkan): prompt jailbreak'lense bile uygunsuz cevap
+  // kullanıcıya ulaşmasın. Flagged ise tüm cevabı güvenli redle değiştir.
+  try {
+    const mod = await moderateOutput(bubbles.join('\n'));
+    if (!mod.ok) {
+      console.warn(
+        `[chatReply] OUTPUT blocked (conv ${conversationId}): ${(mod.categories || []).join(',')}`
+      );
+      bubbles = [safeRefusalText(lang)];
+    }
+  } catch (_) {}
 
   await saveBotRepliesSequence(conversationId, bubbles);
   maybeRefreshConversationMemory(conversationId, lang).catch((e) => {
