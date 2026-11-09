@@ -26,6 +26,7 @@ const {
   jwtUserId,
 } = require('./lib/dailyUsageLimits');
 const { assertJwtMatchesUserId } = require('./lib/assertJwtUserId');
+const { loadUnreadInfo } = require('./lib/conversationUnread');
 const { scheduleProactivePush } = require('../services/oneSignalPush');
 const { insertScheduledInboxNotification } = require('./lib/notificationInbox');
 
@@ -358,10 +359,12 @@ router.post('/get-conversations', middleware, async (req, res) => {
       );
       botsById = new Map(botsRows.map((b) => [b.id, b]));
     }
+    const unreadById = await loadUnreadInfo(convData.map((c) => c.id));
     const responseData = convData.map((conv) => {
       const botRow = botsById.get(conv.botId);
+      const unread = unreadById.get(conv.id);
       return {
-        conversationData: conv,
+        conversationData: unread ? { ...conv, ...unread } : conv,
         // localizeBotName satır içinde mutasyon yapıyor — aynı bot'a sahip
         // birden fazla konuşma varsa paylaşılan objeyi bozmamak için kopyala.
         botData: botRow ? localizeBotName({ ...botRow }, lang) : null,
@@ -377,6 +380,35 @@ router.post('/get-conversations', middleware, async (req, res) => {
   }
 });
 
+
+router.post('/mark-conversation-read', middleware, async (req, res) => {
+  try {
+    const { userId, conversationId } = req.body || {};
+    const gate = assertJwtMatchesUserId(req, userId);
+    if (!gate.ok) {
+      return res.status(gate.status).json(gate.json);
+    }
+    const convId = Number(conversationId);
+    if (!Number.isInteger(convId) || convId <= 0) {
+      return res.status(400).json({ success: false, msg: 'conversationId is required' });
+    }
+    const rows = await getQuery(
+      'SELECT id FROM `coversations` WHERE id = ? AND userId = ? LIMIT 1',
+      [convId, userId]
+    );
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ success: false, msg: 'Conversation not found' });
+    }
+    await query(
+      'UPDATE `coversations` SET `last_read_at` = NOW() WHERE id = ? AND userId = ?',
+      [convId, userId]
+    );
+    return res.status(200).json({ success: true, conversationId: convId, unread_count: 0 });
+  } catch (error) {
+    console.error('mark-conversation-read error:', error);
+    return res.status(500).json({ success: false, msg: 'Server error' });
+  }
+});
 
 router.post('/search-conversations', middleware, async (req, res) => {
   try {
