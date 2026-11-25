@@ -5,12 +5,22 @@ const UserModel = require('../models/user_model');
 const bcrypt = require('bcrypt')
 const JWT = require('jsonwebtoken')
 const { getQuery , query, transaction} = require('../db')
+
+// MySQL '0000-00-00' gibi sıfır tarihler geçersiz bir Date nesnesi olarak
+// gelir (truthy); `.toISOString()` "Invalid time value" fırlatıp yanıtı 500
+// yapıyordu (ör. profil güncelleme DB'ye yazıp hata dönüyordu).
+function toIsoOrNull(value) {
+    if (value == null || value === '') return null;
+    const d = value instanceof Date ? value : new Date(value);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
 const {
     normalizeMembership,
     mergeMembershipsDbWithClient
 } = require('./lib/membershipsSync');
 const { assertJwtMatchesUserId } = require('./lib/assertJwtUserId');
 const { allocateUniqueReferralCode } = require('./lib/referralCode');
+const { serializeOnboardingAnswers } = require('./lib/onboardingAnswers');
 
 // Token süreleri: access uzun (uygulama güncellemesine kadar sorunsuz kullanım)
 const ACCESS_TOKEN_EXPIRY = '365d';   // 1 yıl
@@ -77,7 +87,6 @@ router.post('/signup', [
             })
         }
 
-        console.log("Email: " + email + " Password: " + password)
         let sqlQuery = await getQuery("SELECT * FROM `users` WHERE email = ?", [email]);
 
         if (sqlQuery.length > 0) {
@@ -87,12 +96,38 @@ router.post('/signup', [
             })
 
         } else {
-            let hashedPassword = await bcrypt.hash(password, 10);
+            // E-posta ile kayıt: onboarding'deki profil bilgileri ve cevaplar da
+            // (`country` kolonu NOT NULL olduğu için boş değere düşer.)
+            // (userModel) sosyal kayıttaki gibi saklanır.
+            let parsedUser = req.body.userModel || {};
+            if (typeof parsedUser === 'string') {
+                try { parsedUser = JSON.parse(parsedUser); } catch (_) { parsedUser = {}; }
+            }
+            const hashedPassword = await bcrypt.hash(password, 10);
             const referralCode = await allocateUniqueReferralCode();
-            await query("INSERT INTO `users` (`email`, `password`, `token`, `accountCreatedDate`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `referral_code`) VALUES ( ?,?,?,?,?,?,?,?,?,?,?,?);",[ email,hashedPassword, null, null, null, null, null, credential, null, null, null, referralCode])
-            
+            const signupUsername = String(parsedUser.username || '').trim().slice(0, 20) || null;
+            const birthdate = parsedUser.birthdate ? formatDateForMySQL(parsedUser.birthdate) : null;
+            const hobbies = serializeHobbiesForDb(parsedUser.hobbies);
+            await query(
+                "INSERT INTO `users` (`username`, `email`, `password`, `token`, `memberships`, `ownAgents`, `verificated`, `credential`, `refreshToken`, `phoneNumber`, `lastLogins`, `country`, `gender`, `birthdate`, `hobbies`, `referral_code`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                [signupUsername, email, hashedPassword, null, null, null, "1", credential, null, null, null, parsedUser.counrty || parsedUser.country || '', parsedUser.gender || null, birthdate, hobbies, referralCode]
+            );
+
             const insertedRows = await getQuery('SELECT id, email FROM `users` WHERE email = ? LIMIT 1', [email]);
             const newUser = insertedRows[0];
+            if (!newUser) {
+                return res.status(500).json({ msg: "User could not be created" });
+            }
+
+            const onboardingAnswers = serializeOnboardingAnswers(parsedUser);
+            if (onboardingAnswers) {
+                try {
+                    await query('UPDATE `users` SET onboarding_answers = ? WHERE id = ?', [onboardingAnswers, newUser.id]);
+                } catch (e) {
+                    console.warn('[signup:email] onboarding_answers write failed:', e.message);
+                }
+            }
+
             const token = signAccessTokenForUser(newUser);
             const refreshToken = signRefreshTokenForUser(newUser);
             return res.json({
@@ -170,6 +205,18 @@ router.post('/signup', [
 
             const insertedRows = await getQuery('SELECT id, email FROM `users` WHERE email = ? LIMIT 1', [userEmail]);
             const newUser = insertedRows[0];
+
+            // Onboarding tercih cevapları ayrı yazılır: kolon henüz yoksa
+            // (migration çalışmadıysa) kayıt yine de başarılı olur.
+            const onboardingAnswers = serializeOnboardingAnswers(parsedUser);
+            if (onboardingAnswers && newUser) {
+                try {
+                    await query('UPDATE `users` SET onboarding_answers = ? WHERE id = ?', [onboardingAnswers, newUser.id]);
+                } catch (e) {
+                    console.warn('[signup] onboarding_answers write failed:', e.message);
+                }
+            }
+
             const token = signAccessTokenForUser(newUser);
             const refreshToken = signRefreshTokenForUser(newUser);
             return res.json({ token, refreshToken });
@@ -250,12 +297,8 @@ function mapGuestUserRow(row, fallback = {}) {
         email: row.email || fallback.email,
         token: fallback.token ?? row.token ?? null,
         refreshToken: fallback.refreshToken ?? row.refreshToken ?? null,
-        accountCreatedDate: row.accountCreatedDate
-            ? new Date(row.accountCreatedDate).toISOString()
-            : fallback.accountCreatedDate,
-        birthdate: row.birthdate
-            ? new Date(row.birthdate).toISOString()
-            : fallback.birthdate,
+        accountCreatedDate: toIsoOrNull(row.accountCreatedDate) ?? fallback.accountCreatedDate,
+        birthdate: toIsoOrNull(row.birthdate) ?? fallback.birthdate,
         memberships: row.memberships ?? null,
         ownAgents: row.ownAgents ? row.ownAgents : [],
         verificated: Number(row.verificated ?? 1),
@@ -474,12 +517,8 @@ router.post('/guest-login', async (req, res) => {
             user: mapGuestUserRow(userRow, {
                 token,
                 refreshToken,
-                accountCreatedDate: userRow.accountCreatedDate
-                    ? new Date(userRow.accountCreatedDate).toISOString()
-                    : nowIso,
-                birthdate: userRow.birthdate
-                    ? new Date(userRow.birthdate).toISOString()
-                    : defaultBirthdateIso,
+                accountCreatedDate: toIsoOrNull(userRow.accountCreatedDate) ?? nowIso,
+                birthdate: toIsoOrNull(userRow.birthdate) ?? defaultBirthdateIso,
                 gender: userRow.gender || 'male',
             })
         });
@@ -868,12 +907,8 @@ router.post('/update-profile', middleware, async (req, res) => {
             success: true,
             user: {
                 ...row,
-                birthdate: row.birthdate
-                    ? new Date(row.birthdate).toISOString()
-                    : null,
-                accountCreatedDate: row.accountCreatedDate
-                    ? new Date(row.accountCreatedDate).toISOString()
-                    : row.accountCreatedDate,
+                birthdate: toIsoOrNull(row.birthdate) ?? null,
+                accountCreatedDate: toIsoOrNull(row.accountCreatedDate) ?? row.accountCreatedDate,
                 notificationPreferences: parseNotificationPreferences(
                     row.notification_preferences ?? row.notificationPreferences
                 ),
@@ -1128,6 +1163,68 @@ router.post('/record-login-streak', middleware, async (req, res) => {
             msg: 'Server error',
             error: error.message,
         });
+    }
+});
+
+// Gizemli karakter görevleri: 7 gün üst üste giriş, 50 mesaj, 4 görüntülü
+// görüşme. Her görev tamamlanınca karakterin bir bölgesi açılır.
+const MYSTERY_GOALS = { streak: 7, messages: 50, videoCalls: 4 };
+
+function longestRun(dateSet) {
+    const sorted = [...dateSet].sort();
+    let best = 0;
+    let run = 0;
+    let prev = null;
+    for (const key of sorted) {
+        run = prev && addDays(prev, 1) === key ? run + 1 : 1;
+        if (run > best) best = run;
+        prev = key;
+    }
+    return best;
+}
+
+router.post('/mystery-progress', middleware, async (req, res) => {
+    try {
+        const { userId, day } = req.body || {};
+        if (!userId) {
+            return res.status(400).json({ success: false, msg: 'User ID is required' });
+        }
+        const authCheck = assertJwtMatchesUserId(req, userId);
+        if (!authCheck.ok) {
+            return res.status(authCheck.status).json(authCheck.json);
+        }
+
+        const todayKey = parseDayKey(day) || toDateKey(new Date());
+        const dateSet = await loadUserStreakDates(userId, addDays(todayKey, -365));
+        const currentStreak = consecutiveEndingOn(dateSet, todayKey);
+        // Hedefe bir kez ulaşıldıysa bölge açık kalır (seri bozulsa da).
+        const streak = longestRun(dateSet) >= MYSTERY_GOALS.streak
+            ? MYSTERY_GOALS.streak
+            : currentStreak;
+
+        const [counts] = await getQuery(
+            `SELECT
+                SUM(m.message_type <> 'call_log') AS messages,
+                SUM(m.message_type = 'call_log'
+                    AND JSON_UNQUOTE(JSON_EXTRACT(m.message, '$.kind')) = 'video') AS videoCalls
+             FROM messages m
+             JOIN coversations c ON c.id = m.conversationId
+             WHERE c.userId = ? AND m.sender = 'user'`,
+            [userId]
+        );
+
+        return res.status(200).json({
+            success: true,
+            goals: MYSTERY_GOALS,
+            progress: {
+                streak: Math.min(streak, MYSTERY_GOALS.streak),
+                messages: Number(counts?.messages) || 0,
+                videoCalls: Number(counts?.videoCalls) || 0,
+            },
+        });
+    } catch (error) {
+        console.error('mystery-progress error:', error);
+        return res.status(500).json({ success: false, msg: 'Server error' });
     }
 });
 
