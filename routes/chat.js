@@ -1273,6 +1273,13 @@ router.post('/send-audio-message', middleware, upload.single('file'), async (req
     }
     const lang = normalizeLang(req.body?.lang);
     const sender = String(req.body?.sender || 'user').trim() || 'user';
+    // İstemci kayıt süresini gönderir; balonda 0:00 yerine süre görünür.
+    const rawDurationSec = Number(req.body?.durationSec);
+    const durationSec = Number.isFinite(rawDurationSec)
+      ? Math.min(Math.max(Math.round(rawDurationSec), 0), 600)
+      : 0;
+    const voiceLastMessage =
+      durationSec > 0 ? `voice_message|${durationSec}` : 'voice_message';
     const randomId = getRandomName();
 
     console.log(`[send-audio-message] conversation=${conversation} size=${fileBuffer.length} mime=${mime}`);
@@ -1294,6 +1301,7 @@ router.post('/send-audio-message', middleware, upload.single('file'), async (req
     const initialPayload = JSON.stringify({
       text: '',
       url: CDNFILEURL,
+      ...(durationSec > 0 ? { durationSec } : {}),
     });
 
     const insertResult = await getQuery(
@@ -1307,7 +1315,7 @@ router.post('/send-audio-message', middleware, upload.single('file'), async (req
 
     await query(
       'UPDATE `coversations` SET `lastMessage` = ?, `last_message_at` = NOW() WHERE id = ? LIMIT 1',
-      ['voice_message', conversation]
+      [voiceLastMessage, conversation]
     );
 
     // Typing'i hemen aç; STT arka planda sürerken client polling tutarlı kalsın.
@@ -1333,6 +1341,7 @@ router.post('/send-audio-message', middleware, upload.single('file'), async (req
         const payload = JSON.stringify({
           text: transcript,
           url: CDNFILEURL,
+          ...(durationSec > 0 ? { durationSec } : {}),
         });
 
         await query('UPDATE `messages` SET `message` = ? WHERE id = ? LIMIT 1', [
@@ -1341,7 +1350,7 @@ router.post('/send-audio-message', middleware, upload.single('file'), async (req
         ]);
         await query(
           'UPDATE `coversations` SET `lastMessage` = ?, `last_message_at` = NOW() WHERE id = ? LIMIT 1',
-          ['voice_message', conversation]
+          [voiceLastMessage, conversation]
         );
 
         try {
@@ -1732,6 +1741,10 @@ router.post('/toggle-pin-conversation', middleware, async (req, res) => {
 router.post('/delete-conversation', middleware, async (req, res) => {
   try {
     const { conversationId, userId } = req.body;
+    // false: yalnızca mesajlar silinir; konuşma satırı ve hafıza özeti
+    // (memory_summary) kalır. Eski istemciler göndermez → tamamen silinir.
+    const resetMemory =
+      req.body.resetMemory !== false && req.body.resetMemory !== 'false';
 
     if (!conversationId || !userId) {
       return res.status(400).json({ 
@@ -1759,11 +1772,14 @@ router.post('/delete-conversation', middleware, async (req, res) => {
       [conversationId]
     );
 
-    // Delete the conversation
-    await getQuery(
-      "DELETE FROM `coversations` WHERE id = ?",
-      [conversationId]
-    );
+    // Hafıza konuşma satırında tutulur: satır silinince karakterin bu
+    // sohbetten öğrendikleri de gider.
+    if (resetMemory) {
+      await getQuery(
+        "DELETE FROM `coversations` WHERE id = ?",
+        [conversationId]
+      );
+    }
 
     res.status(200).json({ 
       msg: "Conversation deleted successfully", 

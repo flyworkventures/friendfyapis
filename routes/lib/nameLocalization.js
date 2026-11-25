@@ -114,18 +114,24 @@ function findNameEntry(name) {
     );
 }
 
+// entry → kanonik isim (bots.name), ör. { tr: 'Ayça', ... } → 'Luna'.
+const ENTRY_TO_CANONICAL = new Map(
+    Object.entries(NAME_MAP).map(([key, entry]) => [entry, key])
+);
+
 /**
- * Sistem karakteri ismini hedef dile göre döndürür.
+ * Sistem karakteri ismini döndürür. Karakterler her dilde TEK isimle görünür
+ * (ör. Luna her dilde Luna; TR'de "Ayça" değil). [lang] bilerek yok sayılır;
+ * yerelleşmiş bir varyant gelirse (Ayça, 露娜) kanonik isme çevrilir.
  * Haritada olmayan isimler (ör. kullanıcı karakterleri) olduğu gibi döner.
- * Zaten yerelleşmiş bir varyant gelse bile (Kayra → es:Cora) doğru dile çevrilir.
  */
+// eslint-disable-next-line no-unused-vars
 function localizeName(name, lang) {
     const raw = String(name || '').trim();
     if (!raw) return raw;
     const entry = findNameEntry(raw);
     if (!entry) return raw;
-    const l = normalizeLang(lang);
-    return entry[l] || entry.en || raw;
+    return ENTRY_TO_CANONICAL.get(entry) || raw;
 }
 
 function escapeRegExp(s) {
@@ -133,8 +139,8 @@ function escapeRegExp(s) {
 }
 
 /**
- * Açıklama metnindeki tüm dil varyantı isimleri hedef dildeki isimle değiştirir.
- * Örn. TR'de "Alaric, biraz..." → "Alp, biraz..."
+ * Açıklama metnindeki tüm dil varyantı isimleri kanonik isimle değiştirir.
+ * Örn. "Alp, biraz..." → "Alaric, biraz..."
  */
 function rewriteNamesInText(text, canonicalName, lang) {
     const rawText = String(text || '');
