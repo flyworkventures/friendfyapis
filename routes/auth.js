@@ -424,14 +424,19 @@ router.post('/guest-login', async (req, res) => {
             const birthdateForDb = onboarding.birthdate
                 ? formatDateForMySQL(onboarding.birthdate)
                 : formatDateForMySQL(defaultBirthdateIso);
-            const hobbies = serializeHobbiesForDb(onboarding.hobbies);
+            // `hobbies` ve `country` NOT NULL: boş değerlere düşür.
+            const hobbies = serializeHobbiesForDb(onboarding.hobbies) ?? '[]';
+            const country = String(onboarding.country || '').trim().slice(0, 64);
 
             try {
                 const referralCode = await allocateUniqueReferralCode();
-                await query(
-                    "INSERT INTO `users` (`username`, `email`, `password`, `token`, `accountCreatedDate`, `birthdate`, `memberships`, `ownAgents`, `verificated`, `credential`, `guest_device_id`, `refreshToken`, `phoneNumber`, `lastLogins`, `gender`, `hobbies`, `referral_code`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-                    [username, email, null, null, nowIso, birthdateForDb, null, null, 1, "guest", normalizedDeviceId, null, null, null, gender, hobbies, referralCode]
+                const inserted = await query(
+                    "INSERT INTO `users` (`username`, `email`, `password`, `token`, `accountCreatedDate`, `birthdate`, `memberships`, `ownAgents`, `verificated`, `credential`, `guest_device_id`, `refreshToken`, `phoneNumber`, `lastLogins`, `gender`, `hobbies`, `country`, `referral_code`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                    [username, email, null, null, nowIso, birthdateForDb, null, null, 1, "guest", normalizedDeviceId, null, null, null, gender, hobbies, country, referralCode]
                 );
+                if (inserted !== true) {
+                    console.error('[guest-login] user insert failed');
+                }
             } catch (insertErr) {
                 // Race: aynı deviceId ile paralel insert → mevcut kaydı al.
                 const raceRows = await getQuery(

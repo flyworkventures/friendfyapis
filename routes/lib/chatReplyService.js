@@ -6,6 +6,28 @@ const { uploadBufferToBunny } = require('../../lib/bunnyStorage');
 const { moderateOutput } = require('../../lib/contentModeration');
 const { hasActivePremiumAccess } = require('./dailyUsageLimits');
 
+/**
+ * Kullanıcı bir mesaja yanıt verdiyse, karakterin cevabının İLK balonu o
+ * kullanıcı mesajını alıntılar (Figma "Yanıtla – Gönderildi").
+ * conversationId → kullanıcının yanıt mesajı id'si; ilk bot kaydında tüketilir.
+ */
+const pendingReplyQuote = new Map();
+
+async function insertBotMessage(conversationId, message, messageType) {
+  const replyTo = pendingReplyQuote.get(conversationId);
+  if (replyTo) {
+    pendingReplyQuote.delete(conversationId);
+    return query(
+      "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`, `reply_to_message_id`) VALUES (?, ?, ?, NOW(), ?, ?);",
+      [conversationId, 'bot', message, messageType, replyTo]
+    );
+  }
+  return query(
+    "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
+    [conversationId, 'bot', message, messageType]
+  );
+}
+
 // AI cevabı moderasyondan geçmezse (jailbreak vb.) gösterilecek güvenli red.
 function safeRefusalText(lang) {
   const l = String(lang || 'en').toLowerCase().split(/[-_]/)[0];
@@ -1075,10 +1097,7 @@ async function saveBotRepliesSequence(conversationId, texts) {
   const saved = [];
   for (let i = 0; i < bubbles.length; i++) {
     const reply = bubbles[i];
-    const inserted = await query(
-      "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
-      [conversationId, 'bot', reply, 'text']
-    );
+    const inserted = await insertBotMessage(conversationId, reply, 'text');
     if (inserted !== true) break;
 
     saved.push(reply);
@@ -1508,10 +1527,7 @@ async function saveBotVoiceReply(conversationId, text, audioUrl) {
   if (!reply || !audioUrl) return false;
   const durationSec = estimateSpeechDurationSec(reply);
   const payload = JSON.stringify({ text: reply, url: audioUrl, durationSec });
-  const inserted = await query(
-    "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
-    [conversationId, 'bot', payload, 'voice']
-  );
+  const inserted = await insertBotMessage(conversationId, payload, 'voice');
   if (inserted !== true) return false;
   // Mesaj listesi önizlemesi: voice_message|<saniye>
   await query(
@@ -2395,10 +2411,7 @@ async function generateCharacterPhotoReply(conversationId, lang, userMessageText
     date: new Date().toISOString()
   });
 
-  const inserted = await query(
-    "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
-    [conversationId, 'bot', payload, 'image']
-  );
+  const inserted = await insertBotMessage(conversationId, payload, 'image');
   if (inserted !== true) return null;
 
   await query(
@@ -2414,6 +2427,19 @@ async function generateCharacterPhotoReply(conversationId, lang, userMessageText
  * @param {{ callInviteAllowed?: boolean }} [opts]
  */
 async function generateCharacterReply(conversationId, lang, userMessageText, opts = {}) {
+  const replyTo = Number(opts.replyToMessageId);
+  if (Number.isFinite(replyTo) && replyTo > 0) {
+    pendingReplyQuote.set(conversationId, replyTo);
+  }
+  try {
+    return await _generateCharacterReply(conversationId, lang, userMessageText, opts);
+  } finally {
+    // Cevap kaydedilemediyse bekleyen alıntı sonraki mesaja sızmasın.
+    pendingReplyQuote.delete(conversationId);
+  }
+}
+
+async function _generateCharacterReply(conversationId, lang, userMessageText, opts = {}) {
   const callAllowed = opts.callInviteAllowed !== false;
   // Arama isteği sesli mesajdan önce: "sesli ara" ≠ "sesli mesaj".
   if (userWantsVideoCall(userMessageText)) {
