@@ -21,6 +21,7 @@ const {
 } = require('./lib/chatReplyService');
 const { normalizeLang } = require('./lib/agentLocalization');
 const { localizeName } = require('./lib/nameLocalization');
+const { normalizeVoiceBuffer } = require('./lib/voiceNormalize');
 const {
   enforceDailySendLimit,
   jwtUserId,
@@ -710,20 +711,21 @@ router.post('/send-message',middleware,async (req,res)=>{
     const replyId = Number(replyToMessageId);
     const hasReply = Number.isFinite(replyId) && replyId > 0;
 
-    let result;
+    // insertQuery → yeni mesajın id'si; karakterin cevabı bu mesajı alıntılar.
+    let userMessageId;
     if (hasReply) {
-      result = await query(
+      userMessageId = await insertQuery(
         "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`, `reply_to_message_id`) VALUES (?, ?, ?, NOW(), ?, ?);",
         [conversationId, "user", message, resolvedType, replyId]
       );
     } else {
-      result = await query(
+      userMessageId = await insertQuery(
         "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
         [conversationId, "user", message, resolvedType]
       );
     }
 
-    if (result !== true) {
+    if (userMessageId == null) {
       return res.status(500).json({
         msg: "SQL",
         success: false
@@ -765,6 +767,8 @@ router.post('/send-message',middleware,async (req,res)=>{
       ).catch(() => {});
       const callInviteAllowed = req.body?.callInviteAllowed;
       generateCharacterReply(conversationId, lang, message, {
+        // Kullanıcı bir mesaja yanıt verdiyse karakter de onun mesajını alıntılar.
+        replyToMessageId: hasReply ? userMessageId : undefined,
         callInviteAllowed:
           callInviteAllowed === false || callInviteAllowed === 'false'
             ? false
@@ -1256,17 +1260,26 @@ router.post('/send-audio-message', middleware, upload.single('file'), async (req
       return res.status(usage.status).json(usage.body);
     }
 
-    const fileBuffer = await readMulterFileBuffer(req.file);
+    let fileBuffer = await readMulterFileBuffer(req.file);
     if (!fileBuffer) {
       return res.status(400).json({ error: 'Ses dosyası okunamadı.' });
     }
-    const mime = String(req.file.mimetype || 'audio/m4a').toLowerCase();
-    const ext =
+    let mime = String(req.file.mimetype || 'audio/m4a').toLowerCase();
+    let ext =
       mime.includes('webm') ? 'webm'
       : mime.includes('wav') ? 'wav'
       : mime.includes('mpeg') || mime.includes('mp3') ? 'mp3'
       : 'm4a';
-    const fileName = req.file.originalname || `${Date.now()}.${ext}`;
+    // Mikrofon kaydı kısık çıkıyor; yüklemeden önce ses seviyesini normalize et.
+    const norm = await normalizeVoiceBuffer(fileBuffer, ext);
+    if (norm.normalized) {
+      fileBuffer = norm.buffer;
+      ext = norm.ext;
+      mime = norm.mime;
+    }
+    const fileName = norm.normalized
+      ? `${Date.now()}.${ext}`
+      : req.file.originalname || `${Date.now()}.${ext}`;
     const conversation = req.body.conversation || req.body.conversationId;
     if (!conversation) {
       return res.status(400).json({ error: 'conversation required' });
@@ -1282,7 +1295,7 @@ router.post('/send-audio-message', middleware, upload.single('file'), async (req
       durationSec > 0 ? `voice_message|${durationSec}` : 'voice_message';
     const randomId = getRandomName();
 
-    console.log(`[send-audio-message] conversation=${conversation} size=${fileBuffer.length} mime=${mime}`);
+    console.log(`[send-audio-message] conversation=${conversation} size=${fileBuffer.length} mime=${mime} normalized=${norm.normalized}`);
 
     const CDNURL = `https://storage.bunnycdn.com/fakefriendstorage/${randomId}.${ext}`;
     const CDNFILEURL = `https://fakefriend.b-cdn.net/${randomId}.${ext}`;

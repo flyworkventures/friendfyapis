@@ -1028,34 +1028,41 @@ const RECENT_BOTS_LIMIT = 100;
 routes.post('/get-recent-bots', middleware, async (req, res) => {
     try {
         const lang = normalizeLang(req.body?.lang);
-        // Son 15 günün tarihini hesapla
-        const fifteenDaysAgo = new Date();
-        fifteenDaysAgo.setDate(fifteenDaysAgo.getDate() - 15);
-        const dateString = fifteenDaysAgo.toISOString().slice(0, 19).replace('T', ' ');
-        
-        const recentBots = await getQuery(
-            'SELECT * FROM `bots` WHERE created_at >= ? AND system != 2 ORDER BY created_at DESC LIMIT ?',
-            [dateString, RECENT_BOTS_LIMIT]
-        );
-        
-        if (recentBots.length === 0) {
+        // Anasayfa "Son üretilen karakterler": yalnızca bu kullanıcının kendi
+        // oluşturduğu karakterler (en yeni önce). Başka kullanıcıların
+        // karakterleri kimseye gösterilmez.
+        const userId = await resolveJwtSubjectUserId(req);
+        if (!userId) {
+            return res.status(200).json({ msg: 'No user', success: true, count: 0, data: [] });
+        }
+
+        const ownBots = (await fetchFriendCreateUserAgents(userId))
+            .slice()
+            .sort((a, b) => {
+                const ta = new Date(a.created_at || 0).getTime() || 0;
+                const tb = new Date(b.created_at || 0).getTime() || 0;
+                return tb - ta || Number(b.id) - Number(a.id);
+            })
+            .slice(0, RECENT_BOTS_LIMIT);
+
+        if (ownBots.length === 0) {
             return res.status(200).json({
-                "msg": "Son 15 günde eklenen bot bulunamadı",
+                "msg": "Kullanıcının oluşturduğu karakter yok",
                 "success": true,
                 "data": []
             });
         }
 
-        const withPhotos = recentBots.map(attachPhotoUrls);
+        const withPhotos = ownBots.map(attachPhotoUrls);
         const localized = await localizeAgents(withPhotos, lang);
-        
+
         return res.status(200).json({
-            "msg": "Son 15 günde eklenen botlar başarıyla getirildi",
+            "msg": "Kullanıcının karakterleri getirildi",
             "success": true,
             "count": localized.length,
             "data": localized
         });
-        
+
     } catch (error) {
         console.log("Error getting recent bots:", error);
         res.status(500).json({

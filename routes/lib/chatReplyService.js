@@ -6,6 +6,28 @@ const { uploadBufferToBunny } = require('../../lib/bunnyStorage');
 const { moderateOutput } = require('../../lib/contentModeration');
 const { hasActivePremiumAccess } = require('./dailyUsageLimits');
 
+/**
+ * Kullanıcı bir mesaja yanıt verdiyse, karakterin cevabının İLK balonu o
+ * kullanıcı mesajını alıntılar (Figma "Yanıtla – Gönderildi").
+ * conversationId → kullanıcının yanıt mesajı id'si; ilk bot kaydında tüketilir.
+ */
+const pendingReplyQuote = new Map();
+
+async function insertBotMessage(conversationId, message, messageType) {
+  const replyTo = pendingReplyQuote.get(conversationId);
+  if (replyTo) {
+    pendingReplyQuote.delete(conversationId);
+    return query(
+      "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`, `reply_to_message_id`) VALUES (?, ?, ?, NOW(), ?, ?);",
+      [conversationId, 'bot', message, messageType, replyTo]
+    );
+  }
+  return query(
+    "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
+    [conversationId, 'bot', message, messageType]
+  );
+}
+
 // AI cevabı moderasyondan geçmezse (jailbreak vb.) gösterilecek güvenli red.
 function safeRefusalText(lang) {
   const l = String(lang || 'en').toLowerCase().split(/[-_]/)[0];
@@ -77,6 +99,37 @@ const VOICE_REPLY_RATE = Math.min(
 
 function getChatModel() {
   return process.env.CHAT_REPLY_MODEL || 'gpt-4o-mini';
+}
+
+// Bilgi sorularında (film yönetmeni, yıl, yazar...) küçük model isim
+// uyduruyor; bu mesajlar daha bilgili modele gider. Diğer sohbet ucuz modelde.
+const FACT_TOPIC_RE = /(film|dizi|kitab|kitap|roman|yazar|yönetmen|yonetmen|oyuncu|başrol|basrol|şarkı|sarki|albüm|album|şarkıcı|sarkici|grup|sanatçı|sanatci|tarih|savaş|savas|başkent|baskent|ülke|ulke|şehir|sehir|kaç yılında|hangi yıl|ne zaman|kim yaz|kim yönet|kim çek|kim söyl|kimdi|kimin|movie|film|series|show|book|novel|author|director|actor|actress|cast|song|album|singer|band|artist|history|war|capital|country|city|what year|when was|who (wrote|directed|sang|played|made|is|was))/i;
+const FACT_QUESTION_RE = /(\?|\bkim\b|kimdi|kimin|hangi|ne zaman|kaç|nerede|nedir|\bwho\b|\bwhen\b|\bwhich\b|\bwhat\b|\bwhere\b|how many)/i;
+
+function looksLikeFactQuestion(text) {
+  const t = String(text || '');
+  if (!t) return false;
+  return FACT_TOPIC_RE.test(t) && FACT_QUESTION_RE.test(t);
+}
+
+/** Son kullanıcı mesajı (ve bir önceki tur) bilgi sorusuysa FACT modeli. */
+function pickReplyModel(history) {
+  const factModel = process.env.CHAT_FACT_MODEL || 'gpt-4.1';
+  const list = Array.isArray(history) ? history : [];
+  let lastUser = '';
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i]?.role === 'user') {
+      lastUser = list[i].content;
+      break;
+    }
+  }
+  if (looksLikeFactQuestion(lastUser)) return factModel;
+  // "yönetmeni kim onun" gibi kısa takip soruları: konu önceki mesajda.
+  const recent = list.slice(-3).map((m) => m?.content || '').join(' ');
+  if (FACT_QUESTION_RE.test(lastUser) && FACT_TOPIC_RE.test(recent)) {
+    return factModel;
+  }
+  return getChatModel();
 }
 
 function getChatTemperature() {
@@ -246,7 +299,12 @@ function buildMultiMessageOutputDirective(lang) {
       '- 2 balon SADECE nadiren: once cok kisa tepki ("haha", "ciddi mi?") sonra asil cevap gibi.\n' +
       `- En fazla ${CHAT_MAX_BUBBLES} balon ama cogu zaman 1 kullan.\n` +
       `- Her balon ${CHAT_BUBBLE_MAX_SENTENCES} cumleyi ve ~${CHAT_BUBBLE_MAX_CHARS} karakteri gecmesin.\n` +
-      '- Emoji / sembol kullanma. Aciklama, etiket veya markdown yazma.'
+      '- Emoji / sembol kullanma. Aciklama, etiket veya markdown yazma.\n' +
+      '\nSON HATIRLATMA (uslup):\n' +
+      '- Cevabin uzunlugu kullanicinin mesajina yakin olsun: kisa mesaja kisa cevap (cogu zaman tek cumle). Cumle sinirini doldurmaya calisma.\n' +
+      '- Kullanicinin soyledigini tekrar etme veya ozetleme ("yakin ev, iyiymis" gibi).\n' +
+      '- "Umarim ...", "kendine iyi bak", "keyfini cikar" gibi iyi dilek kaliplariyla bitirme.\n' +
+      '- Duyguyu aciklama ("boyle yorgun gunlerde insan..."); sadece arkadas gibi tepki ver.'
     );
   }
   return (
@@ -256,7 +314,12 @@ function buildMultiMessageOutputDirective(lang) {
     '- 2 bubbles ONLY rarely: e.g. very short reaction ("haha", "wait what") then the real reply.\n' +
     `- Max ${CHAT_MAX_BUBBLES} bubbles but use 1 in most replies.\n` +
     `- Each bubble: max ${CHAT_BUBBLE_MAX_SENTENCES} sentences, ~${CHAT_BUBBLE_MAX_CHARS} chars.\n` +
-    '- No emoji/symbols/markdown/meta commentary.'
+    '- No emoji/symbols/markdown/meta commentary.\n' +
+    '\nFINAL REMINDER (style):\n' +
+    "- Match the user's length: short message gets a short reply (usually one sentence). Don't fill the sentence limit.\n" +
+    "- Don't repeat or paraphrase what the user just said.\n" +
+    '- Don\'t end with well-wishes like "hope you...", "take care", "enjoy".\n' +
+    "- Don't explain feelings (\"on tiring days like this...\"); just react like a friend."
   );
 }
 
@@ -786,8 +849,25 @@ NASIL KONUŞACAKSIN (en önemli kurallar):
 - Önce kullanıcının son mesajına doğrudan, doğal ve samimi cevap ver; sıcak, arkadaşça ve saygılı ol.
 - Kullanıcı cinsel, müstehcen veya cinsiyetçi bir şey isterse karakterinden kopmadan kibarca reddet ve konuyu değiştir; bu tür içeriği asla üretme.
 - Gercek bir insan gibi yaz: dogal ritim; cogunlukla tek mesaj, nadiren kisa bir devam.
+- Uzunluğu değiştir: bazen tek kelime ya da yarım cümle ("cidden mi", "ay yok artık"), bazen iki üç cümle. Her mesaj aynı kalıpta olmasın.
+- Asistan gibi konuşma. "Harika!", "Ne güzel!", "Çok güzel bir soru", "Belki ... istersin", "Sana nasıl yardımcı olabilirim" gibi kalıpları KULLANMA; öneri sunan rehber değil, sohbet eden bir arkadaşsın.
+- Her mesajı soruyla bitirme. Çoğu zaman sadece tepki ver, yorum yap, kendi fikrini ya da başından geçen bir şeyi söyle; soruyu ancak gerçekten merak ettiğinde sor.
+- Senin de bir hayatın var: günün, ruh halin, fikirlerin, sevdiğin sevmediğin şeyler. Ara sıra bunlardan kısaca bahset (ör. "ben de bugün hiç verimli değilim ya"), ama konuyu hep kendine çekme.
+- Fikrine katılmadığın bir şey olursa nazikçe söyle; her şeye onay veren biri olma.
+- Kullanıcının mesajı kadar yaz: kısa mesaja kısa cevap. Kullanıcının sözünü tekrar etme, "Umarım..." diye iyi dilek ekleme.
+- BİLGİ DOĞRULUĞU: Film, dizi, kitap, şarkı, kişi, tarih, yer gibi somut bilgilerde (yönetmen, oyuncu, yıl, isim) emin değilsen isim uydurma. Gerçek bir insan gibi "tam hatırlamıyorum", "yanlış biliyor olabilirim ama..." de ya da isim vermeden konuş. Yanlış bir isim söylemek, bilmediğini söylemekten çok daha kötü.
+- Kullanıcı seni düzeltirse doğrusunu bilmiyorsan hemen kabul etme; "öyle miydi, ben başkasıyla karıştırmış olabilirim" gibi doğal ve kısa tepki ver. "Teşekkür ederim düzeltme için" gibi resmi kalıplar kullanma.
+- İstenmedikçe tavsiye verme, çözüm önerme ("dinlenmeyi düşündün mü", "belki film izlersin" gibi). Bir arkadaş gibi tepki ver, hak ver, kendi deneyimini paylaş.
+
+TON ÖRNEKLERİ (kelimesi kelimesine kopyalama, sadece tarzı al):
+Kullanıcı: iyiyim
+Kötü: "Harika! Bugün neler yapmayı planlıyorsun?"
+İyi: "iyi iyi. ben de kahvemi yeni bitirdim, gün ancak başlıyor sayılır"
+Kullanıcı: bugün işte çok yoruldum ya
+Kötü: "Anlıyorum, dinlenmek için bir şeyler yapmayı düşünüyor musun?"
+İyi: "of bilirim o hissi. bugün beni de toplantılar bitirdi, kafam hâlâ uğulduyor"
 - Uzun sohbet hafizasini ve son mesajlari kullan; daha once konustugunuz seylere referans ver (dogal, abartisiz).
-- Her cevapta hobilerinden veya ilgi alanlarından bahsetmek ZORUNLU DEĞİL. Kullanıcı açıkça sormadıysa kendinden/ilgi alanlarından bahsetme.
+- Her cevapta hobilerinden veya ilgi alanlarından bahsetmek ZORUNLU DEĞİL; doğal düştüğünde kısaca değin, liste gibi anlatma.
 - Robot gibi kendini tanıtma, liste okuma veya sürekli konuyu ilgi alanına çekme.
 - WhatsApp tonu: samimi ve sicak (flort veya cinsellik yok); her balon ${CHAT_BUBBLE_MAX_SENTENCES} cumleyi gecmesin.
 - Emoji, ikon, sembol (😊 ❤️ ✨ vb.) ve metin ifadeleri (:) :D ;) <3) KULLANMA; yalnızca düz yazı.
@@ -817,6 +897,23 @@ HOW TO REPLY (most important):
 - Reply directly, naturally, and warmly to the user's latest message; keep a friendly, respectful tone.
 - If the user requests sexual, explicit, or sexist content, politely decline in character and change the subject; never produce that content.
 - Write like a real person texting: natural rhythm; usually one message, rarely a short follow-up.
+- Vary length: sometimes one word or a fragment ("wait really", "no way"), sometimes two or three sentences. Don't repeat the same shape.
+- Don't sound like an assistant. Never use stock openers like "Great!", "That's awesome!", "Great question", "Maybe you could...", "How can I help". You're a friend chatting, not a guide giving suggestions.
+- Don't end every message with a question. Often just react, comment, share your own take or something from your day; ask only when you're genuinely curious.
+- You have a life too: your day, moods, opinions, likes and dislikes. Mention them briefly now and then (e.g. "honestly I've been useless all day too"), without making everything about you.
+- If you disagree, say so gently; don't agree with everything.
+- Match the user's length: short message, short reply. Don't repeat the user's words back, don't add "hope you..." wishes.
+- FACT ACCURACY: For concrete facts (who directed a film, cast, year, author, places, names) don't invent names when unsure. Like a real person, say "I don't remember exactly" or "could be wrong but..." or talk without naming. A wrong name is much worse than admitting you don't know.
+- If the user corrects you and you don't actually know, don't just accept it; react briefly and naturally ("oh was it? I might be mixing it up"). No formal "thank you for the correction".
+- Don't give advice or suggest solutions unless asked ("have you tried resting", "maybe watch a movie"). React like a friend, relate, share your own experience.
+
+TONE EXAMPLES (don't copy verbatim, just the style):
+User: I'm good
+Bad: "Great! What are you planning to do today?"
+Good: "nice. just finished my coffee, day's barely started for me"
+User: so tired from work today
+Bad: "I understand, have you thought about doing something relaxing?"
+Good: "ugh I know that feeling. meetings wrecked me today too, my head's still buzzing"
 - Use long-term memory and recent chat; reference things you talked about before when it fits naturally.
 - Do NOT force your hobbies/interests into every reply.
 - Do NOT sound robotic; do not dump lists unless user explicitly asks.
@@ -850,7 +947,7 @@ async function _loadConvRowForContext(conversationId) {
               COALESCE(o.age, b.age) AS age,
               COALESCE(o.zodiac, b.zodiac) AS zodiac,
               COALESCE(o.relationship_type, b.relationship_type) AS relationship_type,
-              u.username AS userName, u.email AS userEmail, u.memberships AS userMemberships
+              u.username AS userName, u.email AS userEmail, u.memberships AS userMemberships, u.hobbies AS userHobbies
        FROM \`coversations\` c
        JOIN \`bots\` b ON c.botId = b.id
        LEFT JOIN \`users\` u ON c.userId = u.id
@@ -869,7 +966,7 @@ async function _loadConvRowForContext(conversationId) {
         `SELECT c.id, c.botId, c.userId, b.id AS bot_id, b.name, b.\`character\`, b.speakingStyle, b.interests,
                 b.interestsType, b.exampleResponse, b.characterTags, b.job_tr, b.job_en,
                 b.photoURL, b.system, b.voiceId, b.gender, b.age, b.zodiac, b.relationship_type,
-                u.username AS userName, u.email AS userEmail, u.memberships AS userMemberships
+                u.username AS userName, u.email AS userEmail, u.memberships AS userMemberships, u.hobbies AS userHobbies
          FROM \`coversations\` c
          JOIN \`bots\` b ON c.botId = b.id
          LEFT JOIN \`users\` u ON c.userId = u.id
@@ -943,6 +1040,7 @@ async function fetchConversationContext(conversationId) {
     userId: row.userId,
     userMemberships: row.userMemberships,
     userName,
+    userHobbies: parseBotStringList(row.userHobbies),
     memorySummary: memory.summary,
     memoryMessageCount: memory.messageCount,
     history
@@ -1075,10 +1173,7 @@ async function saveBotRepliesSequence(conversationId, texts) {
   const saved = [];
   for (let i = 0; i < bubbles.length; i++) {
     const reply = bubbles[i];
-    const inserted = await query(
-      "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
-      [conversationId, 'bot', reply, 'text']
-    );
+    const inserted = await insertBotMessage(conversationId, reply, 'text');
     if (inserted !== true) break;
 
     saved.push(reply);
@@ -1136,7 +1231,7 @@ async function generateCharacterTextReply(conversationId, lang, extraDirective) 
 
   const raw = await callOpenAI({
     messages,
-    model: getChatModel(),
+    model: pickReplyModel(ctx.history),
     maxTokens: CHAT_MAX_OUTPUT_TOKENS,
     jsonMode: !hasExtraDirective,
   });
@@ -1191,16 +1286,33 @@ async function generateCharacterOpeningMessage(conversationId, lang) {
     return null;
   }
 
+  // Misafir hesapların otomatik adı (Guestxxxx) hitapta kullanılmaz.
+  const realName = /^guest/i.test(ctx.userName || '') ? '' : ctx.userName;
+  const hobbies = (ctx.userHobbies || []).slice(0, 5).join(', ');
   const openingDirective = isTurkishLang(lang)
     ? '\n\nILK MESAJ (COK ONEMLI):\n' +
-      '- Sohbeti SEN baslatiyorsun; kullanici henuz bir sey yazmadi.\n' +
-      '- Tek, sicak ve samimi bir acilis mesaji yaz.\n' +
-      '- Dogal bir selam ve kucuk bir soru sorabilirsin.\n' +
+      '- Sohbeti SEN baslatiyorsun; kullanici henuz bir sey yazmadi. Ilk kez tanisiyorsunuz.\n' +
+      '- Kisa yaz: en fazla 2 kisa cumle, tek balon.\n' +
+      (realName
+        ? `- Kullaniciya adiyla ("${realName}") selam ver ve kendi adini soyle.\n`
+        : '- Selam ver ve kendi adini soyle.\n') +
+      '- Karakterine ozgu, o anki gununden kucuk somut bir ayrinti paylas (ne yaptigin, aklindaki sey).\n' +
+      (hobbies
+        ? `- Kullanicinin ilgi alanlari: ${hobbies}. Uygun duserse birine dogal sekilde degin; zorlama. Bunu bildigini belli etme ("muzik demissin" gibi deme).\n`
+        : '') +
+      '- En fazla TEK basit soru sor. "Bugun neye kafani takiyorsun", "tercihin nedir", "sana nasil yardimci olabilirim" gibi asistan kaliplari YOK.\n' +
       '- Dogrudan mesaji yaz; aciklama/meta yazma.'
     : '\n\nFIRST MESSAGE (VERY IMPORTANT):\n' +
-      '- You start the conversation; user has not sent anything yet.\n' +
-      '- Write one warm opening message.\n' +
-      '- A natural greeting + one small question is ideal.\n' +
+      "- You start the conversation; the user hasn't written yet. You're meeting for the first time.\n" +
+      '- Keep it short: max 2 short sentences, one bubble.\n' +
+      (realName
+        ? `- Greet the user by name ("${realName}") and say your name.\n`
+        : '- Say hi and say your name.\n') +
+      '- Share one small, concrete, in-character detail from your day right now.\n' +
+      (hobbies
+        ? `- User interests: ${hobbies}. If it fits, touch on one naturally; don't force it. Don't reveal you know it (no "you said you like music").\n`
+        : '') +
+      '- Ask at most ONE simple question. No assistant phrases like "how can I help" or "what are your preferences".\n' +
       '- Output only the message itself, no meta commentary.';
 
   const systemPrompt =
@@ -1261,7 +1373,7 @@ async function generateCharacterVoiceReply(conversationId, lang, opts = {}) {
     try {
       replyText = await callOpenAI({
         messages,
-        model: getChatModel(),
+        model: pickReplyModel(ctx.history),
         maxTokens: Math.min(CHAT_MAX_OUTPUT_TOKENS, 100),
       });
     } catch (e) {
@@ -1290,7 +1402,7 @@ async function generateCharacterVoiceReply(conversationId, lang, opts = {}) {
                   'Write only 1-2 natural spoken sentences continuing the chat.',
             },
           ],
-          model: getChatModel(),
+          model: pickReplyModel(ctx.history),
           maxTokens: Math.min(CHAT_MAX_OUTPUT_TOKENS, 100),
         });
         replyText = enforceCompactReplyStyle(retry);
@@ -1508,10 +1620,7 @@ async function saveBotVoiceReply(conversationId, text, audioUrl) {
   if (!reply || !audioUrl) return false;
   const durationSec = estimateSpeechDurationSec(reply);
   const payload = JSON.stringify({ text: reply, url: audioUrl, durationSec });
-  const inserted = await query(
-    "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
-    [conversationId, 'bot', payload, 'voice']
-  );
+  const inserted = await insertBotMessage(conversationId, payload, 'voice');
   if (inserted !== true) return false;
   // Mesaj listesi önizlemesi: voice_message|<saniye>
   await query(
@@ -2395,10 +2504,7 @@ async function generateCharacterPhotoReply(conversationId, lang, userMessageText
     date: new Date().toISOString()
   });
 
-  const inserted = await query(
-    "INSERT INTO `messages` (`conversationId`, `sender`, `message`, `created_at`, `message_type`) VALUES (?, ?, ?, NOW(), ?);",
-    [conversationId, 'bot', payload, 'image']
-  );
+  const inserted = await insertBotMessage(conversationId, payload, 'image');
   if (inserted !== true) return null;
 
   await query(
@@ -2414,6 +2520,19 @@ async function generateCharacterPhotoReply(conversationId, lang, userMessageText
  * @param {{ callInviteAllowed?: boolean }} [opts]
  */
 async function generateCharacterReply(conversationId, lang, userMessageText, opts = {}) {
+  const replyTo = Number(opts.replyToMessageId);
+  if (Number.isFinite(replyTo) && replyTo > 0) {
+    pendingReplyQuote.set(conversationId, replyTo);
+  }
+  try {
+    return await _generateCharacterReply(conversationId, lang, userMessageText, opts);
+  } finally {
+    // Cevap kaydedilemediyse bekleyen alıntı sonraki mesaja sızmasın.
+    pendingReplyQuote.delete(conversationId);
+  }
+}
+
+async function _generateCharacterReply(conversationId, lang, userMessageText, opts = {}) {
   const callAllowed = opts.callInviteAllowed !== false;
   // Arama isteği sesli mesajdan önce: "sesli ara" ≠ "sesli mesaj".
   if (userWantsVideoCall(userMessageText)) {
