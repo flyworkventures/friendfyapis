@@ -2,6 +2,7 @@ const axios = require('axios');
 const FormData = require('form-data');
 const { getQuery, query, pool } = require('../../db');
 const { localizeName } = require('./nameLocalization');
+const { companionNicknameFor } = require('./onboardingAnswers');
 const { uploadBufferToBunny } = require('../../lib/bunnyStorage');
 const { moderateOutput } = require('../../lib/contentModeration');
 const { hasActivePremiumAccess } = require('./dailyUsageLimits');
@@ -758,7 +759,8 @@ function buildSystemPrompt(bot, userName, lang, memorySummary = '') {
     lang && (systemFlag === 1 || systemFlag === 2)
       ? localizeName(bot?.name, lang)
       : bot?.name;
-  const name = localizedName || bot?.name || 'Karakter';
+  const nickname = String(bot?.nickname || '').trim();
+  const name = nickname || localizedName || bot?.name || 'Karakter';
   const character = String(bot?.character || '').trim();
   const speakingStyle = String(bot?.speakingStyle || '').trim();
   const job = String(bot?.job_tr || bot?.job_en || '').trim();
@@ -947,7 +949,7 @@ async function _loadConvRowForContext(conversationId) {
               COALESCE(o.age, b.age) AS age,
               COALESCE(o.zodiac, b.zodiac) AS zodiac,
               COALESCE(o.relationship_type, b.relationship_type) AS relationship_type,
-              u.username AS userName, u.email AS userEmail, u.memberships AS userMemberships, u.hobbies AS userHobbies
+              u.username AS userName, u.email AS userEmail, u.memberships AS userMemberships, u.hobbies AS userHobbies, u.onboarding_answers AS userOnboardingAnswers
        FROM \`coversations\` c
        JOIN \`bots\` b ON c.botId = b.id
        LEFT JOIN \`users\` u ON c.userId = u.id
@@ -966,7 +968,7 @@ async function _loadConvRowForContext(conversationId) {
         `SELECT c.id, c.botId, c.userId, b.id AS bot_id, b.name, b.\`character\`, b.speakingStyle, b.interests,
                 b.interestsType, b.exampleResponse, b.characterTags, b.job_tr, b.job_en,
                 b.photoURL, b.system, b.voiceId, b.gender, b.age, b.zodiac, b.relationship_type,
-                u.username AS userName, u.email AS userEmail, u.memberships AS userMemberships, u.hobbies AS userHobbies
+                u.username AS userName, u.email AS userEmail, u.memberships AS userMemberships, u.hobbies AS userHobbies, u.onboarding_answers AS userOnboardingAnswers
          FROM \`coversations\` c
          JOIN \`bots\` b ON c.botId = b.id
          LEFT JOIN \`users\` u ON c.userId = u.id
@@ -1032,10 +1034,13 @@ async function fetchConversationContext(conversationId) {
     })
     .filter(Boolean);
 
+  const botId = row.bot_id ?? row.botId;
   return {
     bot: {
       ...row,
-      id: row.bot_id ?? row.botId,
+      id: botId,
+      // Kullanıcının onboarding'de bu karaktere verdiği isim.
+      nickname: companionNicknameFor(row.userOnboardingAnswers, botId),
     },
     userId: row.userId,
     userMemberships: row.userMemberships,
@@ -2173,7 +2178,8 @@ function inferPhotoSceneHeuristic(rawText, gender = 'unknown') {
 /** gpt-image-1 için üretilen görselin oranı: portre. */
 const PROACTIVE_IMAGE_SIZE = process.env.PROACTIVE_IMAGE_SIZE || '1024x1536';
 const PROACTIVE_IMAGE_QUALITY = process.env.PROACTIVE_IMAGE_QUALITY || 'medium';
-const PROACTIVE_IMAGE_MODEL = process.env.PROACTIVE_IMAGE_MODEL || 'gpt-image-1';
+const PROACTIVE_IMAGE_MODEL = process.env.PROACTIVE_IMAGE_MODEL || 'gpt-image-1.5';
+const PROACTIVE_IMAGE_INPUT_FIDELITY = process.env.PROACTIVE_IMAGE_INPUT_FIDELITY || 'high';
 
 /**
  * Karakterin mevcut fotosunu referans alarak kullanıcı isteğine uygun yeni bir
@@ -2249,6 +2255,8 @@ async function generateProactivePhoto(referenceUrl, scenePrompt, persona = {}) {
         `no bikini/swimwear focus, no sexual pose, no bedroom intimacy, no cleavage focus, PG-13 only. ` +
         `No text, watermark, logo, or writing in the image.`
     );
+    // Yüz kimliği referansa sadık kalsın (varsayılan 'low' yüzü değiştiriyordu).
+    form.append('input_fidelity', PROACTIVE_IMAGE_INPUT_FIDELITY);
     form.append('size', PROACTIVE_IMAGE_SIZE);
     form.append('quality', PROACTIVE_IMAGE_QUALITY);
     form.append('n', '1');

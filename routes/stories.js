@@ -100,6 +100,15 @@ function extractUrlsFromMessage(raw) {
  * `/proactive/` URL'leri. CDN klasör listesi yalnızca cache miss ve
  * DB'de hiç URL yoksa (yavaş) çağrılır.
  */
+// Yeni Figma portreleriyle üretilmeye başlanan görseller (2026-11-27). Bundan
+// eski proactive dosyaları karakterin eski görünümünü taşıdığı için story
+// havuzuna alınmaz. Dosya adı `<Date.now()>_<rand>.png` biçiminde.
+const STORY_MEDIA_MIN_TS = Number(process.env.STORY_MEDIA_MIN_TS || 1795769566174);
+function isFreshProactiveUrl(u) {
+  const mm = /\/proactive\/(?:\d+\/)?(\d{13})_/i.exec(String(u || ''));
+  return !!mm && Number(mm[1]) >= STORY_MEDIA_MIN_TS;
+}
+
 const _proactiveUrlCache = new Map(); // botId -> { at, urls }
 
 async function loadBotProactiveMediaUrlsBatch(
@@ -151,7 +160,7 @@ async function loadBotProactiveMediaUrlsBatch(
       if (count >= 40) continue;
       msgCountByBot.set(bid, count + 1);
       for (const u of extractUrlsFromMessage(row.message)) {
-        if (/\/proactive\//i.test(u)) urlsByBot.get(bid).add(u);
+        if (isFreshProactiveUrl(u)) urlsByBot.get(bid).add(u);
       }
     }
   } catch (_) {}
@@ -160,7 +169,7 @@ async function loadBotProactiveMediaUrlsBatch(
   for (const id of missing) {
     const urls = urlsByBot.get(id);
     for (const u of onlyProactive(toPhotoUrlArray(photoByBotId.get(id)))) {
-      urls.add(u);
+      if (isFreshProactiveUrl(u)) urls.add(u);
     }
     if (allowCdnList && urls.size === 0) {
       cdnPromises.push(
@@ -174,7 +183,7 @@ async function loadBotProactiveMediaUrlsBatch(
   const cdnResults = await Promise.all(cdnPromises);
   for (const { id, listed } of cdnResults) {
     const urls = urlsByBot.get(id);
-    for (const u of listed) urls.add(u);
+    for (const u of listed) if (isFreshProactiveUrl(u)) urls.add(u);
   }
 
   for (const id of missing) {

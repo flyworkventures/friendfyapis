@@ -20,7 +20,7 @@ const {
 } = require('./lib/membershipsSync');
 const { assertJwtMatchesUserId } = require('./lib/assertJwtUserId');
 const { allocateUniqueReferralCode } = require('./lib/referralCode');
-const { serializeOnboardingAnswers } = require('./lib/onboardingAnswers');
+const { serializeOnboardingAnswers, parseOnboardingAnswers } = require('./lib/onboardingAnswers');
 
 // Token süreleri: access uzun (uygulama güncellemesine kadar sorunsuz kullanım)
 const ACCESS_TOKEN_EXPIRY = '365d';   // 1 yıl
@@ -491,6 +491,18 @@ router.post('/guest-login', async (req, res) => {
             if (onboarding.birthdate) {
                 updates.push('`birthdate` = ?');
                 params.push(formatDateForMySQL(onboarding.birthdate));
+            }
+            // Kayıt soruları cevapları (AI arkadaş ismi dahil): mevcutla birleştir.
+            if (onboarding.answers && typeof onboarding.answers === 'object') {
+                const incoming = serializeOnboardingAnswers({ onboardingAnswers: onboarding.answers });
+                if (incoming) {
+                    const merged = {
+                        ...(parseOnboardingAnswers(userRow.onboarding_answers) || {}),
+                        ...JSON.parse(incoming),
+                    };
+                    updates.push('`onboarding_answers` = ?');
+                    params.push(JSON.stringify(merged));
+                }
             }
             if (updates.length) {
                 params.push(userRow.id);
@@ -1187,6 +1199,39 @@ function longestRun(dateSet) {
     }
     return best;
 }
+
+// Onboarding'de AI arkadaşa verilen isim: users.onboarding_answers içine
+// companionName + companionAgentId olarak birleştirilir. Sohbet talimatı ve
+// uygulama bu karakteri bu isimle gösterir.
+router.post('/companion-nickname', middleware, async (req, res) => {
+    try {
+        const { userId, agentId, name } = req.body || {};
+        if (!userId) {
+            return res.status(400).json({ success: false, msg: 'User ID is required' });
+        }
+        const authCheck = assertJwtMatchesUserId(req, userId);
+        if (!authCheck.ok) {
+            return res.status(authCheck.status).json(authCheck.json);
+        }
+        const botId = Number(agentId);
+        const nickname = String(name || '').trim().slice(0, 25);
+        if (!Number.isInteger(botId) || botId <= 0 || !nickname) {
+            return res.status(400).json({ success: false, msg: 'agentId and name are required' });
+        }
+        const rows = await getQuery('SELECT onboarding_answers FROM `users` WHERE id = ? LIMIT 1', [userId]);
+        if (!rows?.length) {
+            return res.status(404).json({ success: false, msg: 'User not found' });
+        }
+        const answers = parseOnboardingAnswers(rows[0].onboarding_answers) || {};
+        answers.companionName = nickname;
+        answers.companionAgentId = botId;
+        await query('UPDATE `users` SET onboarding_answers = ? WHERE id = ?', [JSON.stringify(answers), userId]);
+        return res.status(200).json({ success: true, companionName: nickname, companionAgentId: botId });
+    } catch (error) {
+        console.error('companion-nickname error:', error);
+        return res.status(500).json({ success: false, msg: 'Server error' });
+    }
+});
 
 router.post('/mystery-progress', middleware, async (req, res) => {
     try {

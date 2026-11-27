@@ -49,6 +49,10 @@ function serializeOnboardingAnswers(parsedUser) {
         if (name) out.companionName = name;
     }
 
+    // Onboarding'de eşleşen karakter; companionName bu karaktere takma ad olur.
+    const agentId = Number(raw.companionAgentId);
+    if (Number.isInteger(agentId) && agentId > 0) out.companionAgentId = agentId;
+
     for (const key of MULTI_KEYS) {
         const list = cleanSlugList(raw[key]);
         if (list && list.length) out[key] = list;
@@ -81,4 +85,21 @@ function parseOnboardingAnswers(raw) {
     return null;
 }
 
-module.exports = { serializeOnboardingAnswers, parseOnboardingAnswers };
+/**
+ * Kullanıcının bu karaktere verdiği takma ad (yoksa null).
+ * @param {unknown} rawAnswers users.onboarding_answers
+ * @param {number|string} botId
+ */
+function companionNicknameFor(rawAnswers, botId) {
+    const a = parseOnboardingAnswers(rawAnswers);
+    if (!a) return null;
+    const name = typeof a.companionName === 'string' ? a.companionName.trim() : '';
+    if (!name) return null;
+    return Number(a.companionAgentId) === Number(botId) ? name.slice(0, 25) : null;
+}
+
+module.exports = {
+    serializeOnboardingAnswers,
+    parseOnboardingAnswers,
+    companionNicknameFor,
+};

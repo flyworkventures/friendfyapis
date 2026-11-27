@@ -19,6 +19,10 @@ const pool = mysql.createPool({
   enableKeepAlive: true,
   connectTimeout: parseInt(process.env.DB_CONNECT_TIMEOUT_MS, 10) || 10000,
   dateStrings: ['DATE'],
+  // Veritabanı saatleri kendi saat diliminde (SYSTEM = +03:00) döndürür.
+  // Varsayılan 'local' bunları Node sürecinin saat dilimiyle yorumlar; sunucu
+  // UTC'de çalışınca mesaj saatleri 3 saat kayıyor, gece yarısı tarih şaşıyordu.
+  timezone: process.env.DB_TIMEZONE || '+03:00',
 });
 
 async function testConnection() {
